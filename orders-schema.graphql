@@ -1,7 +1,7 @@
 extend schema
   @link(
     url: "https://specs.apollo.dev/federation/v2.10"
-    import: ["@key", "@tag", "@shareable"]
+    import: ["@key", "@tag", "@shareable", @authenticated]
   )
   @link(
     url: "https://specs.apollo.dev/connect/v0.1"
@@ -16,7 +16,7 @@ type Query {
   """
   Get a specific order by id. Meant to be used for a detailed view of an order
   """
-  order(id: ID!): Order
+  order(id: ID!): Order @authenticated
     @connect(
       source: "api"
       http: { GET: "/orders/{$args.id}" }
