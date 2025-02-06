@@ -132,7 +132,7 @@ type ProductVariant @key(fields: "id") {
 """
 A user account in our system
 """
-type User @key(fields: "id") {
+type User @key(fields: "id", resolvable: false) {
   id: ID!
 }
 
