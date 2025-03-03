@@ -24,6 +24,8 @@ type Query {
       id
       buyer: { id: $.customerId }
       items: $.variantIds { id: $ }
+      orderTotal
+      orderDate
       """
       entity: true
     )
@@ -48,6 +50,16 @@ type Order @key(fields: "id") {
   product and which size/color/feature was bought
   """
   items: [ProductVariant!]!
+
+  """
+  The total cost of the order
+  """
+  orderTotal: Float
+  
+  """
+  The date the oder was made
+  """
+  orderDate: String
 }
 
 type User @key(fields: "id", resolvable: false) {
