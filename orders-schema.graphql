@@ -24,7 +24,7 @@ type Query {
       id
       buyer: { id: $.customerId }
       items: $.variantIds { id: $ }
-      orderTotal
+      total
       orderDate
       """
       entity: true
@@ -54,10 +54,10 @@ type Order @key(fields: "id") {
   """
   The total cost of the order
   """
-  orderTotal: Float
+  total: Float
   
   """
-  The date the oder was made
+  The date the order was made
   """
   orderDate: String
 }
