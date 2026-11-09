@@ -12,9 +12,10 @@ homepage:
   enabled: false
 
 cors:
-  origins:
-    - https://studio.apollographql.com
-  allow_credentials: true
+  policies:
+    - origins:
+        - https://studio.apollographql.com
+      allow_credentials: true
 
 # This would make debugging easier, but should be a per subgraph basis for production
 include_subgraph_errors:
@@ -40,5 +41,11 @@ authentication:
 
 authorization:
   require_authentication: false
-  preview_directives:
-    enabled: true
+
+## MCP connectors (Tickets)
+connectors:
+  preview_connect_v0_5: true
+  sources:
+    # <subgraph>.<source>. Replaces @source(http.baseURL); the path comes from @source(mcp.path).
+    tickets.tickets:
+      override_url: ${env.TICKETS_MCP_URL}

@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Rover
         run: |
-          curl -sSL https://rover.apollo.dev/nix/v0.27.0-preview.0 | sh
+          curl -sSL https://rover.apollo.dev/nix/v1.0.1 | sh
           echo "$HOME/.rover/bin" >> $GITHUB_PATH
 
       - name: Rover Subgraph Publish Products

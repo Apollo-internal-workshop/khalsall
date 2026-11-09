@@ -1,0 +1,886 @@
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use jsonpath_rust::JsonPathInst;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::MeterProvider;
+use parking_lot::Mutex;
+use paste::paste;
+use serde_json::Value;
+
+use crate::Configuration;
+use crate::metrics::meter_provider;
+use crate::uplink::license_enforcement::LicenseState;
+
+type InstrumentMap = HashMap<String, (u64, HashMap<String, opentelemetry::Value>)>;
+
+pub(crate) struct Metrics {
+    _instruments: Vec<opentelemetry::metrics::ObservableGauge<u64>>,
+}
+
+struct InstrumentData {
+    data: InstrumentMap,
+    meter: Meter,
+}
+
+impl Default for InstrumentData {
+    fn default() -> Self {
+        InstrumentData {
+            meter: meter_provider().meter("apollo/router"),
+            data: Default::default(),
+        }
+    }
+}
+
+impl Metrics {
+    pub(crate) fn new(configuration: &Configuration, license_state: &LicenseState) -> Metrics {
+        let mut data = InstrumentData::default();
+
+        // Env variables and unit tests don't mix.
+        data.populate_cli_instrument();
+        data.populate_config_instruments(
+            configuration
+                .validated_yaml
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
+        data.populate_license_instrument(license_state);
+        data.populate_user_plugins_instrument(configuration);
+
+        data.into()
+    }
+}
+
+impl InstrumentData {
+    fn get_first_key_from_path(
+        attributes: &mut HashMap<String, opentelemetry::Value>,
+        attr_name: &str,
+        path: &str,
+        value: &Value,
+    ) {
+        if let Ok(json_path) = JsonPathInst::from_str(path) {
+            let value_at_path = json_path.find_slice(value).into_iter().next();
+            if let Some(Value::Object(children)) = value_at_path.as_deref()
+                && let Some(first_key) = children.keys().next()
+            {
+                attributes.insert(attr_name.to_string(), first_key.clone().into());
+            }
+        }
+    }
+
+    fn get_value_from_path(
+        attributes: &mut HashMap<String, opentelemetry::Value>,
+        attr_name: &str,
+        path: &str,
+        value: &Value,
+    ) {
+        let attr_name = attr_name.to_string();
+        match JsonPathInst::from_str(path)
+            .expect("json path must be valid")
+            .find_slice(value)
+            .into_iter()
+            .next()
+            .as_deref()
+        {
+            // If the value is an object we can only state that it is set, but not what it is set to.
+            Some(Value::Object(_value)) => {
+                attributes.insert(attr_name, true.into());
+            }
+            Some(Value::Array(value)) if !value.is_empty() => {
+                attributes.insert(attr_name, true.into());
+            }
+            // Scalars can be logged as is.
+            Some(Value::Number(value)) if value.is_f64() => {
+                attributes.insert(attr_name, value.as_f64().expect("checked, qed").into());
+            }
+            Some(Value::Number(value)) if value.is_i64() => {
+                attributes.insert(attr_name, value.as_i64().expect("checked, qed").into());
+            }
+            // Note that we convert u64 to i64 because opentelemetry does not support u64 as an attribute.
+            Some(Value::Number(value)) => {
+                attributes.insert(
+                    attr_name,
+                    (value.as_u64().expect("checked, qed") as i64).into(),
+                );
+            }
+            Some(Value::String(value)) => {
+                attributes.insert(attr_name, value.clone().into());
+            }
+            Some(Value::Bool(value)) => {
+                attributes.insert(attr_name, (*value).into());
+            }
+
+            // If the value is not set we don't specify the attribute.
+            None => {
+                attributes.insert(attr_name, false.into());
+            }
+
+            _ => {}
+        };
+    }
+
+    pub(crate) fn populate_config_instruments(&mut self, yaml: &serde_json::Value) {
+        /// This macro will query the config json for a primary metric and optionally metric attributes.
+        ///
+        /// The reason we use jsonpath_rust is that jsonpath_lib has correctness issues and looks abandoned.
+        /// We should consider converting the rest of the codebase to use jsonpath_rust.
+        ///
+        /// Example usage:
+        /// ```rust,ignore
+        /// populate_config_instrument!(
+        ///     apollo.router.config.authorization, // The metric name
+        ///     "$.authorization", // The path into the config
+        ///     opt.require_authentication, // The name of the attribute
+        ///     "$[?(@.require_authentication == true)]" // The path for the attribute relative to the metric
+        /// );
+        /// ```
+        macro_rules! populate_config_instrument {
+            ($($metric:ident).+, $path:literal) => {
+                let instrument_name = stringify!($($metric).+).to_string();
+                self.data.entry(instrument_name.clone()).or_insert_with(|| {
+                    if JsonPathInst::from_str($path).expect("json path must be valid").find_slice(yaml).first().is_some() {
+                        (1, HashMap::new())
+                    }
+                    else {
+                        (0, HashMap::new())
+                    }
+                });
+            };
+            ($($metric:ident).+, $path:literal, $($($attr:ident).+, $attr_path:literal),+) => {
+                let instrument_name = stringify!($($metric).+).to_string();
+                self.data.entry(instrument_name).or_insert_with(|| {
+                    if let Some(value) = JsonPathInst::from_str($path).expect("json path must be valid").find_slice(yaml).first() {
+                        paste!{
+                            let mut attributes = HashMap::new();
+                            $(
+                            let attr_name = stringify!([<$($attr __ )+>]).to_string();
+                            Self::get_value_from_path(&mut attributes, &attr_name, $attr_path, value);)+
+                            (1, attributes)
+                        }
+                    }
+                    else {
+                        paste!{
+                            let mut attributes = HashMap::new();
+                            $(
+                                let attr_name = stringify!([<$($attr __ )+>]).to_string();
+                                attributes.insert(attr_name, false.into());
+                            )+
+                            (0, attributes)
+                        }
+                    }
+                });
+
+            };
+        }
+
+        populate_config_instrument!(
+            apollo.router.config.defer,
+            "$.supergraph[?(@.defer_support == true)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.incremental_planner,
+            "$.supergraph.query_planning.incremental_planner[?(@.enabled == true)]",
+            opt.beam_width,
+            "$[?(@.beam_width)]",
+            opt.fuel,
+            "$[?(@.fuel)]",
+            opt.timeout,
+            "$[?(@.timeout)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.authentication.jwt,
+            "$.authentication[?(@..jwt)]",
+            opt.on_error,
+            "$.router.jwt.on_error"
+        );
+        populate_config_instrument!(
+            apollo.router.config.authentication.aws.sigv4,
+            "$.authentication[?(@.subgraph..aws_sig_v4)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.authorization,
+            "$.authorization",
+            opt.require_authentication,
+            "$[?(@.require_authentication == true)]",
+            opt.directives,
+            "$.directives[?(@.enabled == true)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.coprocessor,
+            "$.coprocessor",
+            opt.router.request,
+            "$.router.request",
+            opt.router.response,
+            "$.router.response",
+            // Note that supergraph is not supported yet so these will always be empty
+            opt.supergraph.request,
+            "$.supergraph.response",
+            opt.supergraph.response,
+            "$.supergraph.request",
+            opt.subgraph.request,
+            "$.subgraph..request",
+            opt.subgraph.response,
+            "$.subgraph..response"
+        );
+        populate_config_instrument!(
+            apollo.router.config.rhai,
+            "$.rhai",
+            opt.scripts,
+            "$[?(@.scripts)]",
+            opt.main,
+            "$[?(@.main)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.persisted_queries,
+            "$.persisted_queries[?(@.enabled == true)]",
+            opt.log_unknown,
+            "$[?(@.log_unknown == true)]",
+            opt.safelist.require_id,
+            "$[?(@.safelist.require_id == true)]",
+            opt.safelist.enabled,
+            "$[?(@.safelist.enabled == true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.subscriptions,
+            "$.subscription[?(@.enabled == true)]",
+            opt.mode.passthrough,
+            "$.mode.passthrough",
+            opt.mode.callback,
+            "$.mode.callback",
+            opt.deduplication,
+            "$[?(@.enable_deduplication == true)]",
+            opt.max_opened,
+            "$[?(@.max_opened_subscriptions)]",
+            opt.queue_capacity,
+            "$[?(@.queue_capacity)]",
+            opt.reconnect,
+            "$.mode.passthrough..max_reconnect_attempts[?(@ > 0)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.limits,
+            "$.limits.router",
+            opt.operation.max_depth,
+            "$[?(@.max_depth)]",
+            opt.operation.max_aliases,
+            "$[?(@.max_aliases)]",
+            opt.operation.max_height,
+            "$[?(@.max_height)]",
+            opt.operation.max_root_fields,
+            "$[?(@.max_root_fields)]",
+            opt.operation.warn_only,
+            "$[?(@.warn_only)]",
+            opt.parser.max_recursion,
+            "$[?(@.parser_max_recursion)]",
+            opt.parser.max_tokens,
+            "$[?(@.parser_max_tokens)]",
+            opt.request.max_size,
+            "$[?(@.http_max_request_bytes)]",
+            opt.request.http1_max_headers,
+            "$[?(@.http1_max_request_headers)]",
+            opt.request.http1_max_buf_size,
+            "$[?(@.http1_max_request_buf_size)]",
+            opt.request.http2_max_headers_list_bytes,
+            "$[?(@.http2_max_headers_list_bytes)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.apq,
+            "$.apq[?(@.enabled==true)]",
+            opt.router.cache.redis,
+            "$.router.cache.redis",
+            opt.router.cache.in_memory,
+            "$.router.cache.in_memory",
+            opt.subgraph,
+            "$.subgraph..enabled[?(@ == true)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.tls,
+            "$.tls",
+            opt.router.tls.server,
+            "$.supergraph",
+            opt.router.tls.subgraph.ca_override,
+            "$[?(@.subgraph..certificate_authorities)]",
+            opt.router.tls.subgraph.client_authentication,
+            "$.subgraph..client_authentication"
+        );
+        populate_config_instrument!(
+            apollo.router.config.traffic_shaping,
+            "$.traffic_shaping",
+            opt.router.timeout,
+            "$$[?(@.router.timeout)]",
+            opt.router.rate_limit,
+            "$.router.global_rate_limit",
+            opt.subgraph.timeout,
+            "$[?(@.all.timeout || @.subgraphs..timeout)]",
+            opt.subgraph.rate_limit,
+            "$[?(@.all.global_rate_limit || @.subgraphs..global_rate_limit)]",
+            opt.subgraph.http2,
+            "$[?(@.all.http2 == 'enable' || @.all.http2 == 'http2only' || @.subgraphs..http2 == 'enable' || @.subgraphs..http2 == 'http2only')]",
+            opt.subgraph.compression,
+            "$[?(@.all.compression || @.subgraphs..compression)]",
+            opt.subgraph.deduplicate_query,
+            "$[?(@.all.deduplicate_query == true || @.subgraphs..deduplicate_query == true)]"
+        );
+        // Presence of the block is the whole of the feature switch: every subgraph and connector
+        // source is protected as soon as `circuit_breaker` is configured at all, with the
+        // apollo-qos defaults where nothing overrides them. So `circuit_breaker: {}` counts.
+        populate_config_instrument!(
+            apollo.router.config.circuit_breaker,
+            "$.circuit_breaker",
+            opt.subgraph.all,
+            "$[?(@.all)]",
+            opt.subgraph.subgraphs,
+            "$[?(@.subgraphs)]",
+            opt.connector.all,
+            "$[?(@.connector.all)]",
+            opt.connector.sources,
+            "$[?(@.connector.sources)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.response_cache,
+            "$.response_cache",
+            opt.enabled,
+            "$[?(@.enabled)]",
+            opt.debug,
+            "$[?(@.debug)]",
+            opt.subgraph.enabled,
+            "$[?(@.subgraph.all.enabled)]",
+            opt.subgraph.redis.required_to_start,
+            "$[?(@.subgraph.all.redis.required_to_start || @.subgraph.subgraphs..redis.required_to_start)]",
+            opt.subgraph.enabled,
+            "$[?(@.subgraph.subgraphs..enabled)]",
+            opt.subgraph.ttl,
+            "$[?(@.subgraph.all.ttl || @.subgraph.subgraphs..ttl)]",
+            opt.subgraph.invalidation.enabled,
+            "$[?(@.subgraph.all.invalidation.enabled || @.subgraph.subgraphs..invalidation.enabled)]",
+            opt.connector.enabled,
+            // Connector caching is "on" for a deployment when storage is configured AND at least
+            // one source is not disabled. `enabled` defaults to on (a missing flag means enabled,
+            // see `ConnectorCacheConfiguration::is_source_enabled`), so we can't key on `enabled`
+            // alone the way subgraph does — a redis-only config with `enabled` omitted still
+            // caches. `enabled != false` matches both the omitted and `true` cases while excluding
+            // an explicit `enabled: false`; the `sources..enabled == true` arm then re-includes a
+            // source that overrides a disabled `all` block, which `is_source_enabled` honors.
+            "$[?((@.connector.all.redis || @.connector.sources..redis) && (@.connector.all.enabled != false || @.connector.sources..enabled == true))]",
+            opt.connector.ttl,
+            "$[?(@.connector.all.ttl || @.connector.sources..ttl)]",
+            opt.connector.cache_key_headers,
+            // `cache_key_headers` is required wherever connector caching applies, so presence is
+            // not the interesting signal — non-emptiness is. An empty list is the documented
+            // "no header partitions the cache key" opt-out, so indexing `[0]` records whether a
+            // deployment actually partitions on headers or deliberately opted out.
+            "$[?(@.connector.all.cache_key_headers[0] || @.connector.sources..cache_key_headers[0])]",
+            opt.connector.invalidation.enabled,
+            "$[?(@.connector.all.invalidation.enabled || @.connector.sources..invalidation.enabled)]"
+        );
+        populate_config_instrument!(
+            apollo.router.config.telemetry,
+            "$..telemetry[?(@..endpoint || @.metrics.prometheus.enabled == true)]",
+            opt.metrics.otlp,
+            "$..metrics.otlp[?(@.endpoint)]",
+            opt.metrics.prometheus,
+            "$..metrics.prometheus[?(@.enabled==true)]",
+            opt.tracing.otlp,
+            "$..tracing.otlp[?(@.enabled==true)]",
+            opt.tracing.datadog,
+            "$..tracing.datadog[?(@.enabled==true)]",
+            opt.tracing.datadog.enable_span_mapping,
+            "$..tracing.datadog[?(@.enable_span_mapping==true)]",
+            opt.tracing.datadog.fixed_span_names,
+            "$..tracing.datadog[?(@.fixed_span_names==true)]",
+            opt.tracing.datadog.resource_mapping,
+            "$..tracing.datadog.resource_mapping",
+            opt.tracing.datadog.span_metrics,
+            "$..tracing.datadog.span_metrics",
+            opt.tracing.datadog.sampler,
+            "$..tracing.datadog.sampler",
+            opt.tracing.common.preview_datadog_agent_sampling,
+            "$..tracing.common[?(@.preview_datadog_agent_sampling==true)]",
+            opt.tracing.propagation.datadog,
+            "$..tracing.propagation[?(@.datadog==true)]",
+            opt.events,
+            "$..events",
+            opt.events.router,
+            "$..events.router",
+            opt.events.supergraph,
+            "$..events.supergraph",
+            opt.events.subgraph,
+            "$..events.subgraph",
+            opt.events.connector,
+            "$..events.connector",
+            opt.instruments,
+            "$..instruments",
+            opt.instruments.router,
+            "$..instruments.router",
+            opt.instruments.supergraph,
+            "$..instruments.supergraph",
+            opt.instruments.subgraph,
+            "$..instruments.subgraph",
+            opt.instruments.connector,
+            "$..instruments.connector",
+            opt.instruments.graphql,
+            "$..instruments.graphql",
+            opt.instruments.default_attribute_requirement_level,
+            "$..instruments.default_attribute_requirement_level",
+            opt.spans,
+            "$..spans",
+            opt.spans.default_attribute_requirement_level,
+            "$..spans.default_attribute_requirement_level",
+            opt.spans.router,
+            "$..spans.router",
+            opt.spans.subgraph,
+            "$..spans.subgraph",
+            opt.spans.supergraph,
+            "$..spans.supergraph",
+            opt.tracing.common.sampler,
+            "$..tracing.common.sampler"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.batching,
+            "$.batching[?(@.enabled == true)]",
+            opt.mode,
+            "$.mode"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.file_uploads.multipart,
+            "$.preview_file_uploads[?(@.enabled == true)].protocols.multipart[?(@.enabled == true)]",
+            opt.limits.max_file_size,
+            "$.limits.max_file_size",
+            opt.limits.max_files,
+            "$.limits.max_files",
+            opt.limits.max_overhead_size,
+            "$.limits.max_overhead_size"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.demand_control,
+            "$.demand_control[?(@.enabled == true)]",
+            opt.mode,
+            "$.mode"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.apollo_telemetry_options,
+            "$.telemetry.apollo",
+            opt.signature_normalization_algorithm,
+            "$.signature_normalization_algorithm",
+            opt.metrics_reference_mode,
+            "$.metrics_reference_mode",
+            opt.errors.extended_error_metrics,
+            "$.errors.extended_error_metrics",
+            opt.field_level_instrumentation_sampler,
+            "$.field_level_instrumentation_sampler",
+            opt.tracing.batch_processor.scheduled_delay,
+            "$.tracing.batch_processor.scheduled_delay",
+            opt.tracing.batch_processor.max_concurrent_exports,
+            "$.tracing.batch_processor.max_concurrent_exports",
+            opt.tracing.batch_processor.max_export_batch_size,
+            "$.tracing.batch_processor.max_export_batch_size",
+            opt.tracing.batch_processor.max_export_timeout,
+            "$.tracing.batch_processor.max_export_timeout",
+            opt.tracing.batch_processor.max_queue_size,
+            "$.tracing.batch_processor.max_queue_size",
+            opt.tracing.throttle,
+            "$.tracing.throttle",
+            opt.metrics.otlp.batch_processor.scheduled_delay,
+            "$.metrics.otlp.batch_processor.scheduled_delay",
+            opt.metrics.otlp.batch_processor.max_export_timeout,
+            "$.metrics.otlp.batch_processor.max_export_timeout",
+            opt.metrics.usage_reports.batch_processor.scheduled_delay,
+            "$.metrics.usage_reports.batch_processor.scheduled_delay",
+            opt.metrics
+                .usage_reports
+                .batch_processor
+                .max_concurrent_exports,
+            "$.metrics.usage_reports.batch_processor.max_concurrent_exports",
+            opt.metrics.usage_reports.batch_processor.max_export_timeout,
+            "$.metrics.usage_reports.batch_processor.max_export_timeout"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.connectors,
+            "$.connectors",
+            opt.debug_extensions,
+            "$[?(@.debug_extensions == true)]",
+            opt.expose_sources_in_context,
+            "$[?(@.expose_sources_in_context == true)]",
+            opt.max_requests_per_operation_per_source,
+            "$[?(@.max_requests_per_operation_per_source)]",
+            opt.source.config,
+            "$[?(@.sources..['$config'])]",
+            opt.source.override_url,
+            "$[?(@.sources..override_url)]",
+            opt.source.max_requests_per_operation,
+            "$[?(@.sources..max_requests_per_operation)]",
+            opt.source.mcp_sessions,
+            "$[?(@.sources..mcp.sessions == 'auto')]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_type_conditioned_fetching,
+            "$.experimental_type_conditioned_fetching[?(@==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_hoist_orphan_errors,
+            "$.experimental_hoist_orphan_errors[?(@.all.enabled==true || @.subgraphs..enabled==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.log_on_broken_pipe,
+            "$.supergraph.log_on_broken_pipe[?(@==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_plans_limit,
+            "$.supergraph.query_planning.experimental_plans_limit"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_paths_limit,
+            "$.supergraph.query_planning.experimental_paths_limit"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_cooperative_cancellation,
+            "$.supergraph.query_planning.experimental_cooperative_cancellation"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_prewarm_query_plan_cache,
+            "$.persisted_queries.experimental_prewarm_query_plan_cache[?(@.on_startup==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_local_field_metrics,
+            "$.telemetry.apollo.experimental_local_field_metrics[?(@==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.response_trace_id,
+            "$.telemetry.exporters.tracing.response_trace_id[?(@.enabled==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.otlp_endpoint,
+            "$.telemetry.apollo.otlp_endpoint"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.http2,
+            "$.traffic_shaping[?(@.all.http2 == 'enable' || @.all.http2 == 'http2only' || @.subgraphs..http2 == 'enable' || @.subgraphs..http2 == 'http2only')]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_http2_keep_alive_interval,
+            "$..experimental_http2_keep_alive_interval"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_http2_keep_alive_timeout,
+            "$..experimental_http2_keep_alive_timeout"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.otlp_tracing_protocol,
+            "$.telemetry.apollo.otlp_tracing_protocol"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.otlp_metrics_protocol,
+            "$.telemetry.apollo.otlp_metrics_protocol"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.experimental_mock_subgraphs,
+            "$.experimental_mock_subgraphs"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.expose_query_plan,
+            "$[?(@.expose_query_plan==true)]"
+        );
+
+        populate_config_instrument!(
+            apollo.router.config.supergraph.validate_default_values,
+            "$.supergraph[?(@.validate_default_values == false)]"
+        );
+
+        // We need to update the entry we just made because the selected strategy is a named object in the config.
+        // The jsonpath spec doesn't include a utility for getting the keys out of an object, so we do it manually.
+        if let Some((_, demand_control_attributes)) =
+            self.data.get_mut("apollo.router.config.demand_control")
+        {
+            Self::get_first_key_from_path(
+                demand_control_attributes,
+                "opt.strategy",
+                "$.demand_control[?(@.enabled == true)].strategy",
+                yaml,
+            );
+        }
+    }
+
+    fn populate_cli_instrument(&mut self) {
+        fn mutex_is_some(mutex: &Mutex<Option<String>>) -> opentelemetry::Value {
+            if cfg!(test) {
+                true.into()
+            } else {
+                mutex.lock().is_some().into()
+            }
+        }
+        fn atomic_is_true(atomic: &AtomicBool) -> opentelemetry::Value {
+            if cfg!(test) {
+                true.into()
+            } else {
+                atomic.load(Ordering::Relaxed).into()
+            }
+        }
+        fn mutex_string(mutex: &Mutex<Option<String>>) -> opentelemetry::Value {
+            if cfg!(test) {
+                "test".into()
+            } else {
+                mutex.lock().clone().unwrap_or_default().into()
+            }
+        }
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "opt.apollo.key".to_string(),
+            mutex_is_some(&crate::services::APOLLO_KEY),
+        );
+        attributes.insert(
+            "opt.apollo.graph_ref".to_string(),
+            mutex_is_some(&crate::services::APOLLO_GRAPH_REF),
+        );
+        attributes.insert(
+            "opt.apollo.license".to_string(),
+            atomic_is_true(&crate::executable::APOLLO_ROUTER_LICENCE_IS_SET),
+        );
+        attributes.insert(
+            "opt.apollo.license.path".to_string(),
+            atomic_is_true(&crate::executable::APOLLO_ROUTER_LICENCE_PATH_IS_SET),
+        );
+        attributes.insert(
+            "opt.apollo.graph_artifact_reference".to_string(),
+            mutex_is_some(&crate::executable::APOLLO_ROUTER_GRAPH_ARTIFACT_REFERENCE),
+        );
+        attributes.insert(
+            "opt.apollo.license.source".to_string(),
+            mutex_string(&crate::executable::APOLLO_ROUTER_LICENSE_SOURCE),
+        );
+        attributes.insert(
+            "opt.apollo.supergraph.urls".to_string(),
+            atomic_is_true(&crate::executable::APOLLO_ROUTER_SUPERGRAPH_URLS_IS_SET),
+        );
+        attributes.insert(
+            "opt.apollo.supergraph.path".to_string(),
+            atomic_is_true(&crate::executable::APOLLO_ROUTER_SUPERGRAPH_PATH_IS_SET),
+        );
+        attributes.insert(
+            "opt.apollo.dev".to_string(),
+            atomic_is_true(&crate::executable::APOLLO_ROUTER_DEV_MODE),
+        );
+        attributes.insert(
+            "opt.security.recursive_selections".to_string(),
+            crate::services::query_parsing::recursive_selections_limit::recursive_selections_check_enabled().into(),
+        );
+        attributes.insert(
+            "opt.security.non_local_selections".to_string(),
+            crate::query_planner::query_planner_service::non_local_selections_check_enabled()
+                .into(),
+        );
+
+        self.data
+            .insert("apollo.router.config.env".to_string(), (1, attributes));
+    }
+
+    pub(crate) fn populate_license_instrument(&mut self, license_state: &LicenseState) {
+        self.data.insert(
+            "apollo.router.lifecycle.license".to_string(),
+            (
+                1,
+                [(
+                    "license.state".to_string(),
+                    license_state.to_string().into(),
+                )]
+                .into(),
+            ),
+        );
+    }
+
+    pub(crate) fn populate_user_plugins_instrument(&mut self, configuration: &Configuration) {
+        self.data.insert(
+            "apollo.router.config.custom_plugins".to_string(),
+            (
+                configuration
+                    .document_section("plugins")
+                    .and_then(|plugins| plugins.as_object())
+                    .map(|plugins| {
+                        plugins
+                            .keys()
+                            .filter(|k| !k.starts_with("cloud_router."))
+                            .count()
+                    })
+                    .unwrap_or_default() as u64,
+                [].into(),
+            ),
+        );
+    }
+}
+
+impl From<InstrumentData> for Metrics {
+    fn from(data: InstrumentData) -> Self {
+        Metrics {
+            _instruments: data
+                .data
+                .into_iter()
+                .map(|(metric_name, (value, attributes))| {
+                    let attributes: Vec<_> = attributes
+                        .into_iter()
+                        .map(|(k, v)| KeyValue::new(k.trim_end_matches("__").replace("__", "."), v))
+                        .collect();
+                    data.meter
+                        .u64_observable_gauge(metric_name)
+                        .with_callback(move |observer| {
+                            observer.observe(value, &attributes);
+                        })
+                        .build()
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use rust_embed::RustEmbed;
+    use serde_json::json;
+
+    use crate::configuration::metrics::InstrumentData;
+    use crate::configuration::metrics::Metrics;
+    use crate::metrics::FutureMetricsExt;
+    use crate::uplink::license_enforcement::LicenseLimits;
+    use crate::uplink::license_enforcement::LicenseState;
+
+    #[derive(RustEmbed)]
+    #[folder = "src/configuration/testdata/metrics"]
+    struct Asset;
+
+    #[tokio::test]
+    async fn test_metrics() {
+        // Each config file needs to be tested in isolation to avoid callback accumulation
+        // across iterations (observable gauge callbacks persist until provider shutdown)
+        for file_name in Asset::iter() {
+            let file_name_owned = file_name.to_string();
+            async {
+                let source = Asset::get(&file_name_owned).expect("test file must exist");
+                let input = std::str::from_utf8(&source.data)
+                    .expect("expected utf8")
+                    .to_string();
+                let yaml = &serde_yaml::from_str::<serde_json::Value>(&input)
+                    .expect("config must be valid yaml");
+
+                let mut data = InstrumentData::default();
+                data.populate_config_instruments(yaml);
+                let _metrics: Metrics = data.into();
+                assert_non_zero_metrics_snapshot!(file_name_owned);
+            }
+            .with_metrics()
+            .await;
+        }
+    }
+
+    /// Production reads usage gauges from the document that parsing retains. For every fixture,
+    /// that document must drive the same gauges as the document startup migrates the file to.
+    /// Parsing uses no environment overrides, such as `APOLLO_USAGE_REPORTING_INGRESS_URL`, so the
+    /// shell running the test cannot change either side.
+    #[test]
+    fn parsed_configuration_keeps_usage_telemetry_meaning() {
+        for file_name in Asset::iter() {
+            let source = Asset::get(&file_name).expect("test file must exist");
+            let input = std::str::from_utf8(&source.data).expect("expected utf8");
+            let migrated = crate::configuration::upgrade::upgrade_configuration(
+                &serde_yaml::from_str(input).expect("config must be valid yaml"),
+                false,
+                crate::configuration::upgrade::UpgradeMode::current_minor(),
+            )
+            .expect("the fixture migrates");
+            let parsed = crate::configuration::parse_without_inputs(
+                input,
+                crate::configuration::Migration::WithinMajor,
+            )
+            .unwrap_or_else(|error| panic!("{file_name}: {error}"));
+
+            let mut from_document = InstrumentData::default();
+            from_document.populate_config_instruments(&migrated);
+            let mut from_parsed = InstrumentData::default();
+            from_parsed.populate_config_instruments(
+                parsed
+                    .validated_yaml
+                    .as_ref()
+                    .expect("parsing retains the document"),
+            );
+            assert_eq!(from_parsed.data, from_document.data, "{file_name}");
+        }
+    }
+
+    #[test]
+    fn test_env_metrics() {
+        let mut data = InstrumentData::default();
+        data.populate_cli_instrument();
+        let _metrics: Metrics = data.into();
+        assert_non_zero_metrics_snapshot!();
+    }
+
+    #[test]
+    fn test_license_warn() {
+        let mut data = InstrumentData::default();
+        data.populate_license_instrument(&LicenseState::LicensedWarn {
+            limits: Some(LicenseLimits::default()),
+        });
+        let _metrics: Metrics = data.into();
+        assert_non_zero_metrics_snapshot!();
+    }
+
+    #[test]
+    fn test_license_halt() {
+        let mut data = InstrumentData::default();
+        data.populate_license_instrument(&LicenseState::LicensedHalt {
+            limits: Some(LicenseLimits::default()),
+        });
+        let _metrics: Metrics = data.into();
+        assert_non_zero_metrics_snapshot!();
+    }
+
+    #[test]
+    fn test_custom_plugin() {
+        let configuration = crate::Configuration {
+            validated_yaml: Some(json!({ "plugins": { "name": "test" } })),
+            ..Default::default()
+        };
+        let mut data = InstrumentData::default();
+        data.populate_user_plugins_instrument(&configuration);
+        let _metrics: Metrics = data.into();
+        assert_non_zero_metrics_snapshot!();
+    }
+
+    #[test]
+    fn test_ignore_cloud_router_plugins() {
+        let configuration = crate::Configuration {
+            validated_yaml: Some(json!({
+                "plugins": { "name": "test", "cloud_router.": "test" }
+            })),
+            ..Default::default()
+        };
+        let mut data = InstrumentData::default();
+        data.populate_user_plugins_instrument(&configuration);
+        let _metrics: Metrics = data.into();
+        assert_non_zero_metrics_snapshot!();
+    }
+}

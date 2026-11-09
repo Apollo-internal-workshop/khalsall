@@ -1,0 +1,2993 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use apollo_compiler::name;
+use apollo_federation::query_plan::requires_selection;
+use apollo_federation::query_plan::serializable_document::SerializableDocument;
+use futures::StreamExt;
+use http::Method;
+use serde_json_bytes::json;
+use tokio_stream::wrappers::ReceiverStream;
+use tower::ServiceExt;
+
+use super::DeferredNode;
+use super::Depends;
+use super::FlattenNode;
+use super::OperationKind;
+use super::PlanNode;
+use super::Primary;
+use super::QueryPlan;
+use crate::Configuration;
+use crate::Context;
+use crate::MockedSubgraphs;
+use crate::TestHarness;
+use crate::apollo_studio_interop::UsageReporting;
+use crate::configuration::HoistOrphanErrors;
+use crate::configuration::subgraph::SubgraphConfiguration;
+use crate::graphql;
+use crate::json_ext::Path;
+use crate::json_ext::PathElement;
+use crate::layers::unconstrained_buffer::UnconstrainedBuffer;
+use crate::plugin::test::MockSubgraph;
+use crate::query_planner;
+use crate::query_planner::fetch::FetchNode;
+use crate::services::SubgraphResponse;
+use crate::services::SubgraphServices;
+use crate::services::connector_service::ConnectorServices;
+use crate::services::fetch_service::FetchService;
+use crate::services::subgraph;
+use crate::services::supergraph;
+use crate::spec::Query;
+use crate::spec::Schema;
+
+macro_rules! test_query_plan {
+    () => {
+        include_str!("testdata/query_plan.json")
+    };
+}
+
+macro_rules! test_schema {
+    () => {
+        include_str!("testdata/schema.graphql")
+    };
+}
+
+/// The common part of supergraph schema shared by every test schema below
+/// (directives, scalars, and the `link__Purpose` enum). Tests append a
+/// `enum join__Graph { ... }` block plus their type definitions; use
+/// [`supergraph_schema`] to glue the pieces together.
+const SUPERGRAPH_SCHEMA_COMMON: &str = r#"schema
+    @link(url: "https://specs.apollo.dev/link/v1.0")
+    @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+{
+    query: Query
+}
+
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+scalar join__FieldSet
+scalar link__Import
+
+enum link__Purpose {
+    SECURITY
+    EXECUTION
+}
+"#;
+
+/// Glue the federation boilerplate with the test-specific schema body
+/// (graph enum + type definitions).
+fn supergraph_schema(body: &str) -> String {
+    format!("{SUPERGRAPH_SCHEMA_COMMON}{body}")
+}
+
+/// Default test harness config: include subgraph errors, coercion errors off.
+fn default_config() -> serde_json::Value {
+    serde_json::json!({ "include_subgraph_errors": { "all": true } })
+}
+
+/// Config with `enable_result_coercion_errors=true`, so missing/invalid
+/// values surface in `response.errors` with `RESPONSE_VALIDATION_FAILED`.
+fn coercion_errors_config() -> serde_json::Value {
+    serde_json::json!({
+        "include_subgraph_errors": { "all": true },
+        "supergraph": { "enable_result_coercion_errors": true },
+    })
+}
+
+/// Run a single GraphQL request against a mocked supergraph and return
+/// the response as a JSON value. Bundles the `TestHarness` →
+/// `supergraph::Request::fake_builder` → `oneshot` plumbing that every
+/// test in this file would otherwise repeat verbatim.
+async fn run_query(
+    schema: &str,
+    subgraphs: MockedSubgraphs,
+    query: &str,
+    config: serde_json::Value,
+) -> serde_json::Value {
+    let service = TestHarness::builder()
+        .configuration_json(config)
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .build()
+        .unwrap();
+
+    let mut stream = service.oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    serde_json::to_value(&response).unwrap()
+}
+
+/// Assert on the **full** set of user-visible diagnostics in a supergraph
+/// response: both `response.errors` and `extensions.valueCompletion`. Use
+/// this instead of filter-and-check-inclusion so that any unexpected
+/// extra (or missing, or duplicated) emission shows up as a test failure.
+fn assert_response_diagnostics(
+    value: &serde_json::Value,
+    expected_errors: serde_json::Value,
+    expected_value_completion: serde_json::Value,
+) {
+    let actual_errors = value["errors"].clone();
+    let actual_errors = if actual_errors.is_null() {
+        serde_json::json!([])
+    } else {
+        actual_errors
+    };
+    let actual_value_completion = value["extensions"]["valueCompletion"].clone();
+    let actual_value_completion = if actual_value_completion.is_null() {
+        serde_json::json!([])
+    } else {
+        actual_value_completion
+    };
+    assert_eq!(
+        actual_errors, expected_errors,
+        "response.errors mismatch (actual on left, expected on right)"
+    );
+    assert_eq!(
+        actual_value_completion, expected_value_completion,
+        "extensions.valueCompletion mismatch (actual on left, expected on right)"
+    );
+}
+
+/// Bare mock services keyed by subgraph name, buffered like the production stack but
+/// without its layers.
+fn subgraph_services(graphs: Vec<(String, subgraph::BoxCloneService)>) -> SubgraphServices {
+    SubgraphServices {
+        services: Arc::new(
+            graphs
+                .into_iter()
+                .map(|(name, service)| {
+                    (
+                        name,
+                        UnconstrainedBuffer::new(service, crate::layers::DEFAULT_BUFFER_SIZE),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[test]
+fn query_plan_from_json() {
+    let query_plan: PlanNode = serde_json::from_str(test_query_plan!()).unwrap();
+    insta::assert_debug_snapshot!(query_plan);
+}
+
+#[test]
+fn service_usage() {
+    assert_eq!(
+        serde_json::from_str::<PlanNode>(test_query_plan!())
+            .unwrap()
+            .service_usage()
+            .collect::<Vec<_>>(),
+        vec!["product", "books", "product", "books", "product"]
+    );
+}
+
+#[tokio::test]
+async fn fetch_includes_operation_name() {
+    let query_plan: QueryPlan = QueryPlan {
+        root: serde_json::from_str(test_query_plan!()).unwrap(),
+        formatted_query_plan: Default::default(),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+
+    let succeeded: Arc<AtomicBool> = Default::default();
+    let inner_succeeded = Arc::clone(&succeeded);
+
+    let (mock_products_service, mut handle) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        let matches =
+            req.subgraph_request.body().operation_name == Some("topProducts_product_0".into());
+        inner_succeeded.store(matches, Ordering::SeqCst);
+        responder.send_response(SubgraphResponse::fake_builder().build());
+    });
+
+    let (sender, _) = tokio::sync::mpsc::channel(10);
+
+    let schema = Arc::new(Schema::parse(test_schema!(), &Default::default()).unwrap());
+    let ssf = subgraph_services(vec![(
+        "product".into(),
+        mock_products_service.boxed_clone(),
+    )]);
+    let sf = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let _response = query_plan
+        .execute(
+            &Context::new(),
+            &sf,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    crate::plugin::test::await_mock_driver(driver).await;
+    assert!(succeeded.load(Ordering::SeqCst), "incorrect operation name");
+}
+
+#[tokio::test]
+async fn fetch_makes_post_requests() {
+    let query_plan: QueryPlan = QueryPlan {
+        root: serde_json::from_str(test_query_plan!()).unwrap(),
+        formatted_query_plan: Default::default(),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+
+    let succeeded: Arc<AtomicBool> = Default::default();
+    let inner_succeeded = Arc::clone(&succeeded);
+
+    let (mock_products_service, mut handle) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        let matches = req.subgraph_request.method() == Method::POST;
+        inner_succeeded.store(matches, Ordering::SeqCst);
+        responder.send_response(SubgraphResponse::fake_builder().build());
+    });
+
+    let (sender, _) = tokio::sync::mpsc::channel(10);
+
+    let schema = Arc::new(Schema::parse(test_schema!(), &Default::default()).unwrap());
+    let ssf = subgraph_services(vec![(
+        "product".into(),
+        mock_products_service.boxed_clone(),
+    )]);
+    let sf = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let _response = query_plan
+        .execute(
+            &Context::new(),
+            &sf,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    crate::plugin::test::await_mock_driver(driver).await;
+    assert!(
+        succeeded.load(Ordering::SeqCst),
+        "subgraph requests must be http post"
+    );
+}
+
+#[tokio::test]
+async fn subfetch_trace_logs_operation_and_variables() {
+    let _guard = crate::test_harness::tracing_test::dispatcher_guard();
+
+    let entities_query = "query($representations:[_Any!]!){_entities(representations:$representations){...on User{name}}}";
+    let subgraphs = MockedSubgraphs(
+        [(
+            "user",
+            MockSubgraph::builder()
+                .with_json(
+                    serde_json::json! {{"query":"{currentUser{__typename id}}"}},
+                    serde_json::json! {{"data": {"currentUser": { "__typename": "User", "id": "0" }}}},
+                )
+                .with_json(
+                    serde_json::json! {{
+                        "query": entities_query,
+                        "variables": {"representations":[{"__typename": "User", "id":"0"}]}
+                    }},
+                    serde_json::json! {{"data": {"_entities": [{ "name": "Ada" }]}}},
+                )
+                .build(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let service = TestHarness::builder()
+        .schema(include_str!("../testdata/orga_supergraph.graphql"))
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let context = Context::new();
+    context.extensions().with_lock(|lock| {
+        lock.insert(crate::services::router::ClientRequestAccepts {
+            multipart_defer: true,
+            ..Default::default()
+        })
+    });
+    let request = supergraph::Request::fake_builder()
+        .context(context)
+        .query("query { currentUser { id ...@defer { name } } }")
+        .build()
+        .unwrap();
+    let mut stream = service.oneshot(request).await.unwrap();
+    while stream.next_response().await.is_some() {}
+
+    assert!(crate::test_harness::tracing_test::logs_contain(
+        r#"subgraph fetch to user: operation = 'query($representations: [_Any!]!) { _entities(representations: $representations) { ... on User { name } } }', variables = {"representations": Array([Object({"__typename": String("User"), "id": String("0")})])}, response:"#
+    ));
+}
+
+#[tokio::test]
+async fn defer() {
+    // plan for { t { x ... @defer { y } }}
+    let query_plan: QueryPlan = QueryPlan {
+        formatted_query_plan: Default::default(),
+        root: Some(Arc::new(PlanNode::Defer {
+            primary: Primary {
+                subselection: Some("{ t { x } }".to_string()),
+                node: Some(Box::new(PlanNode::Fetch(FetchNode {
+                    service_name: "X".into(),
+                    requires: vec![],
+                    variable_usages: vec![],
+                    operation: SerializableDocument::from_string("{ t { id __typename x } }"),
+                    operation_name: Some("t".into()),
+                    operation_kind: OperationKind::Query,
+                    id: Some("fetch1".into()),
+                    input_rewrites: None,
+                    output_rewrites: None,
+                    context_rewrites: None,
+                    schema_aware_hash: Default::default(),
+                    authorization: Default::default(),
+                }))),
+            },
+            deferred: vec![DeferredNode {
+                depends: vec![Depends {
+                    id: "fetch1".into(),
+                }],
+                label: None,
+                query_path: Path(vec![PathElement::Key("t".to_string(), None)]),
+                subselection: Some("{ y }".to_string()),
+                node: Some(Arc::new(PlanNode::Flatten(FlattenNode {
+                    path: Path(vec![PathElement::Key("t".to_string(), None)]),
+                    node: Box::new(PlanNode::Fetch(FetchNode {
+                        service_name: "Y".into(),
+                        requires: vec![requires_selection::Selection::InlineFragment(
+                            requires_selection::InlineFragment {
+                                conditions: vec![],
+                                type_condition: Some(name!("T")),
+                                selections: vec![
+                                    requires_selection::Selection::Field(
+                                        requires_selection::Field {
+                                            alias: None,
+                                            name: name!("id"),
+                                            selections: Vec::new(),
+                                        },
+                                    ),
+                                    requires_selection::Selection::Field(
+                                        requires_selection::Field {
+                                            alias: None,
+                                            name: name!("__typename"),
+                                            selections: Vec::new(),
+                                        },
+                                    ),
+                                ],
+                            },
+                        )],
+                        variable_usages: vec![],
+                        operation: SerializableDocument::from_string(
+                            "query($representations:[_Any!]!){_entities(representations:$representations){...on T{y}}}",
+                        ),
+                        operation_name: None,
+                        operation_kind: OperationKind::Query,
+                        id: Some("fetch2".into()),
+                        input_rewrites: None,
+                        output_rewrites: None,
+                        context_rewrites: None,
+                        schema_aware_hash: Default::default(),
+                        authorization: Default::default(),
+                    })),
+                }))),
+            }],
+        })),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+
+    let (mock_x_service, mut handle_x) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_x = tokio::spawn(async move {
+        let (_req, responder) = handle_x.next_request().await.unwrap();
+        responder.send_response(
+            SubgraphResponse::fake_builder()
+                .data(serde_json::json! {{
+                    "t": {"id": 1234, "__typename": "T", "x": "X"}
+                }})
+                .build(),
+        );
+    });
+
+    let (mock_y_service, mut handle_y) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_y = tokio::spawn(async move {
+        let (_req, responder) = handle_y.next_request().await.unwrap();
+        responder.send_response(
+            SubgraphResponse::fake_builder()
+                .data(serde_json::json! {{
+                    "_entities": [{"y": "Y", "__typename": "T"}]
+                }})
+                .build(),
+        );
+    });
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(10);
+
+    let schema = include_str!("testdata/defer_schema.graphql");
+    let schema = Arc::new(Schema::parse(schema, &Default::default()).unwrap());
+    let ssf = subgraph_services(vec![
+        ("X".into(), mock_x_service.boxed_clone()),
+        ("Y".into(), mock_y_service.boxed_clone()),
+    ]);
+    let sf = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let response = query_plan
+        .execute(
+            &Context::new(),
+            &sf,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    // primary response
+    assert_eq!(
+        serde_json::to_value(&response).unwrap(),
+        serde_json::json! {{"data":{"t":{"id":1234,"__typename":"T","x":"X"}}}}
+    );
+
+    let response = ReceiverStream::new(receiver).next().await.unwrap();
+
+    // deferred response
+    assert_eq!(
+        serde_json::to_value(&response).unwrap(),
+        // the primary response appears there because the deferred response gets data from it
+        // unneeded parts are removed in response formatting
+        serde_json::json! {{"data":{"t":{"y":"Y","__typename":"T","id":1234,"x":"X"}},"path":["t"]}}
+    );
+    crate::plugin::test::await_mock_driver(driver_x).await;
+    crate::plugin::test::await_mock_driver(driver_y).await;
+}
+
+#[tokio::test]
+async fn defer_if_condition() {
+    let query = r#"
+        query Me($shouldDefer: Boolean) {
+            me {
+              id
+              ... @defer(if: $shouldDefer) {
+                name
+                username
+              }
+            }
+          }"#;
+
+    let schema = Arc::new(
+        Schema::parse(
+            include_str!("testdata/defer_clause.graphql"),
+            &Configuration::default(),
+        )
+        .unwrap(),
+    );
+
+    let root: Option<Arc<PlanNode>> =
+        serde_json::from_str(include_str!("testdata/defer_clause_plan.json")).unwrap();
+
+    let query_plan = QueryPlan {
+        root,
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(
+            Query::parse(
+                query,
+                Some("Me"),
+                &schema,
+                &Configuration::fake_builder().build().unwrap(),
+            )
+            .unwrap(),
+        ),
+        formatted_query_plan: None,
+        estimated_size: Default::default(),
+    };
+
+    let mocked_accounts = MockSubgraph::builder()
+        // defer if true
+        .with_json(
+            serde_json::json! {{"query":"query Me__accounts__0{me{__typename id}}", "operationName":"Me__accounts__0"}},
+            serde_json::json! {{"data": {"me": {"__typename": "User", "id": "1"}}}},
+        )
+        .with_json(
+            serde_json::json! {{"query":"query Me__accounts__1($representations:[_Any!]!){_entities(representations:$representations){...on User{name username}}}", "operationName":"Me__accounts__1", "variables":{"representations":[{"__typename":"User","id":"1"}]}}},
+            serde_json::json! {{"data": {"_entities": [{"name": "Ada Lovelace", "username": "@ada"}]}}},
+        )
+        // defer if false
+        .with_json(serde_json::json! {{"query": "query Me__accounts__2{me{id name username}}", "operationName":"Me__accounts__2"}},
+        serde_json::json! {{"data": {"me": {"id": "1", "name": "Ada Lovelace", "username": "@ada"}}}},
+    )
+        .build();
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(10);
+    let mut receiver_stream = ReceiverStream::new(receiver);
+
+    let ssf = subgraph_services(vec![("accounts".into(), mocked_accounts.boxed_clone())]);
+    let fetch_service = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let defer_primary_response = query_plan
+        .execute(
+            &Context::new(),
+            &fetch_service,
+            &Arc::new(
+                http::Request::builder()
+                    .body(
+                        graphql::Request::fake_builder()
+                            .variables(json!({ "shouldDefer": true }).as_object().unwrap().clone())
+                            .build(),
+                    )
+                    .unwrap(),
+            ),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    // shouldDefer: true
+    insta::assert_json_snapshot!(defer_primary_response);
+    let deferred_response = receiver_stream.next().await.unwrap();
+    insta::assert_json_snapshot!(deferred_response);
+    assert!(receiver_stream.next().await.is_none());
+
+    // shouldDefer: not provided, should default to true
+    let (default_sender, default_receiver) = tokio::sync::mpsc::channel(10);
+    let mut default_receiver_stream = ReceiverStream::new(default_receiver);
+    let default_primary_response = query_plan
+        .execute(
+            &Context::new(),
+            &fetch_service,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            default_sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    assert_eq!(defer_primary_response, default_primary_response);
+    assert_eq!(
+        deferred_response,
+        default_receiver_stream.next().await.unwrap()
+    );
+    assert!(default_receiver_stream.next().await.is_none());
+
+    // shouldDefer: false, only 1 response
+    let (sender, no_defer_receiver) = tokio::sync::mpsc::channel(10);
+    let mut no_defer_receiver_stream = ReceiverStream::new(no_defer_receiver);
+    let defer_disabled = query_plan
+        .execute(
+            &Context::new(),
+            &fetch_service,
+            &Arc::new(
+                http::Request::builder()
+                    .body(
+                        graphql::Request::fake_builder()
+                            .variables(json!({ "shouldDefer": false }).as_object().unwrap().clone())
+                            .build(),
+                    )
+                    .unwrap(),
+            ),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+    insta::assert_json_snapshot!(defer_disabled);
+    assert!(no_defer_receiver_stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn dependent_mutations() {
+    let schema = include_str!("../testdata/a_b_supergraph.graphql");
+
+    let query_plan: QueryPlan = QueryPlan {
+        // generated from:
+        // mutation {
+        //   mutationA {
+        //     mutationB
+        //   }
+        // }
+        formatted_query_plan: Default::default(),
+        root: serde_json::from_str(
+            r#"{
+                "kind": "Sequence",
+                "nodes": [
+                    {
+                        "kind": "Fetch",
+                        "serviceName": "A",
+                        "variableUsages": [],
+                        "operation": "mutation{mutationA{__typename}}",
+                        "operationKind": "mutation"
+                    },
+                    {
+                        "kind": "Flatten",
+                        "path": [
+                            "mutationA"
+                        ],
+                        "node": {
+                            "kind": "Fetch",
+                            "serviceName": "B",
+                            "variableUsages": [],
+                            "operation": "mutation{...on Mutation{mutationB}}",
+                            "operationKind": "mutation"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap(),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+
+    let (mock_a_service, mut handle_a) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_a = tokio::spawn(async move {
+        let (_req, responder) = handle_a.next_request().await.unwrap();
+        responder.send_response(SubgraphResponse::fake_builder().build());
+    });
+
+    // the first fetch returned null, so there should never be a call to B
+    let (mock_b_service, mut handle_b) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_b = tokio::spawn(async move {
+        if handle_b.next_request().await.is_some() {
+            panic!("service B should not be called");
+        }
+    });
+
+    let schema = Arc::new(Schema::parse(schema, &Default::default()).unwrap());
+    let ssf = subgraph_services(vec![
+        ("A".into(), mock_a_service.boxed_clone()),
+        ("B".into(), mock_b_service.boxed_clone()),
+    ]);
+    let sf = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let (sender, _) = tokio::sync::mpsc::channel(10);
+    let _response = query_plan
+        .execute(
+            &Context::new(),
+            &sf,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+    crate::plugin::test::await_mock_driver(driver_a).await;
+    drop(sf);
+    crate::plugin::test::await_mock_driver(driver_b).await;
+}
+
+#[tokio::test]
+async fn alias_renaming() {
+    let schema = r#"schema
+      @link(url: "https://specs.apollo.dev/link/v1.0")
+      @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+    {
+      query: Query
+    }
+
+    directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+    directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+    directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+    directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+    directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+    directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+    directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+    interface I
+      @join__type(graph: S1)
+      @join__type(graph: S2)
+    {
+      id: String!
+    }
+
+    scalar join__FieldSet
+
+    enum join__Graph {
+      S1 @join__graph(name: "S1", url: "http://localhost/s1")
+      S2 @join__graph(name: "S2", url: "http://localhost/s2")
+    }
+
+    scalar link__Import
+
+    enum link__Purpose {
+      """
+      `SECURITY` features provide metadata necessary to securely resolve fields.
+      """
+      SECURITY
+
+      """
+      `EXECUTION` features provide metadata necessary for operation execution.
+      """
+      EXECUTION
+    }
+
+    type Query
+      @join__type(graph: S1)
+      @join__type(graph: S2)
+    {
+      testQuery(id: String!): I @join__field(graph: S1)
+    }
+
+    type T1 implements I
+      @join__implements(graph: S1, interface: "I")
+      @join__implements(graph: S2, interface: "I")
+      @join__type(graph: S1, key: "id", resolvable: false)
+      @join__type(graph: S2, key: "id")
+    {
+      id: String!
+      foo: Test @join__field(graph: S2)
+    }
+
+    type T2 implements I
+      @join__implements(graph: S1, interface: "I")
+      @join__implements(graph: S2, interface: "I")
+      @join__type(graph: S1, key: "id", resolvable: false)
+      @join__type(graph: S2, key: "id")
+    {
+      id: String!
+      bar: Test @join__field(graph: S2)
+    }
+
+    type Test
+      @join__type(graph: S2)
+    {
+      field: String!
+    }"#;
+
+    let query = "query test($tId: String!) {
+            testQuery(id: $tId) {
+            ... on T1 {
+            foo {
+                field
+            }
+            }
+            ... on T2 {
+            foo: bar {
+                field
+            }
+            }
+        }
+        }";
+
+    let subgraphs = MockedSubgraphs([
+        ("S1", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query":
+            "query test__S1__0($tId:String!){testQuery(id:$tId){__typename ...on T1{__typename id}...on T2{__typename id}}}",
+            "operationName": "test__S1__0", "variables":{"tId":"1"}}},
+            serde_json::json!{{"data": {
+                "testQuery": {
+                    "__typename": "T1",
+                    "id": "T1",
+                }
+            } }}
+        ).with_json(
+            serde_json::json!{{"query":
+            "query test__S1__0($tId:String!){testQuery(id:$tId){__typename ...on T1{__typename id}...on T2{__typename id}}}",
+            "operationName": "test__S1__0", "variables":{"tId":"2"}}},
+            serde_json::json!{{"data": {
+                "testQuery": {
+                    "__typename": "T2",
+                    "id": "T2",
+                }
+            } }}
+        ).build()),
+        ("S2", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query":
+            "query test__S2__1($representations:[_Any!]!){_entities(representations:$representations){...on T1{foo{field}}...on T2{foo__alias_0:bar{field}}}}",
+            "operationName": "test__S2__1", "variables":{"representations":[{
+                "__typename": "T1",
+                "id": "T1",
+            }]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "foo": {
+                        "field": "aaa"
+                    }
+                }]
+            } }}
+        ).with_json(
+            serde_json::json!{{"query":
+            "query test__S2__1($representations:[_Any!]!){_entities(representations:$representations){...on T1{foo{field}}...on T2{foo__alias_0:bar{field}}}}",
+            "operationName": "test__S2__1", "variables":{"representations":[{
+                "__typename": "T2",
+                "id": "T2",
+            }]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "foo__alias_0": {
+                        "field": "bbb"
+                    }
+                }]
+            } }}
+        ).build()),
+        ].into_iter().collect());
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                // TODO(@goto-bus-stop): need to update the mocks and remove this, #6013
+                "generate_query_fragments": false,
+            }
+        }))
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "1"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "2"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn missing_fields_in_requires() {
+    let schema = r#"schema
+    @link(url: "https://specs.apollo.dev/link/v1.0")
+    @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+  {
+    query: Query
+  }
+
+  directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+  directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+  directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+  directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+  directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+  directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+  directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+  type Details
+    @join__type(graph: SUB1)
+    @join__type(graph: SUB2)
+  {
+    enabled: Boolean
+  }
+
+  scalar join__FieldSet
+
+  enum join__Graph {
+    SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+    SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+  }
+
+  scalar link__Import
+
+  enum link__Purpose {
+    """
+    `SECURITY` features provide metadata necessary to securely resolve fields.
+    """
+    SECURITY
+
+    """
+    `EXECUTION` features provide metadata necessary for operation execution.
+    """
+    EXECUTION
+  }
+
+  type Query
+    @join__type(graph: SUB1)
+    @join__type(graph: SUB2)
+  {
+    stuff: Stuff @join__field(graph: SUB1)
+  }
+
+  type Stuff
+    @join__type(graph: SUB1, key: "id")
+    @join__type(graph: SUB2, key: "id", extension: true)
+  {
+    id: ID
+    details: [Details] @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+    aDetailsIsEnabled: Boolean @join__field(graph: SUB2, requires: "details { enabled }")
+  }"#;
+
+    let query = "query {
+        stuff {
+          id
+          aDetailsIsEnabled
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs([
+        ("sub1", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query": "{stuff{__typename id details{enabled}}}",}},
+            serde_json::json!{{"data": {
+                "stuff": {
+                  "__typename": "Stuff",
+                  "id": "1",
+                  "details": [{
+                    "enabled": true
+                  },
+                  null,
+                  {
+                    "enabled": false
+                  }]
+                }
+            } }}
+        ).build()),
+        ("sub2", MockSubgraph::builder().with_json(
+            serde_json::json!{{
+                "query": "query($representations:[_Any!]!){_entities(representations:$representations){...on Stuff{aDetailsIsEnabled}}}",
+                "variables":{"representations": [
+                    {
+                        "__typename": "Stuff",
+                        "id": "1",
+                        "details": [
+                            {
+                                "enabled": true
+                            },
+                            null,
+                            {
+                                "enabled": false
+                            }
+                        ]
+                    }
+                ]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "aDetailsIsEnabled": true
+                }]
+            } }}
+        ).build()),
+        ].into_iter().collect());
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({"include_subgraph_errors": { "all": true } }))
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "1"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn missing_typename_and_fragments_in_requires() {
+    let schema = r#"schema
+    @link(url: "https://specs.apollo.dev/link/v1.0")
+    @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+  {
+    query: Query
+  }
+
+  directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+  directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+  directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+  directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+  directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+  directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+  directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+  scalar join__FieldSet
+
+  enum join__Graph {
+    SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+    SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+  }
+
+  scalar link__Import
+
+  enum link__Purpose {
+    """
+    `SECURITY` features provide metadata necessary to securely resolve fields.
+    """
+    SECURITY
+
+    """
+    `EXECUTION` features provide metadata necessary for operation execution.
+    """
+    EXECUTION
+  }
+
+  type Query
+    @join__type(graph: SUB1)
+    @join__type(graph: SUB2)
+  {
+    stuff: Stuff @join__field(graph: SUB1)
+  }
+
+  type Stuff
+    @join__type(graph: SUB1, key: "id")
+    @join__type(graph: SUB2, key: "id", extension: true)
+  {
+    id: ID
+    thing: Thing
+    isEnabled: Boolean @join__field(graph: SUB2, requires: "thing { ... on Thing { text } }")
+  }
+
+  type Thing
+  @join__type(graph: SUB1, key: "id")
+  @join__type(graph: SUB2, key: "id") {
+    id: ID
+    text: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+  }
+  "#;
+
+    let query = "query {
+        stuff {
+          id
+          isEnabled
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs([
+        ("sub1", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query": "{stuff{__typename id thing{__typename id text}}}",}},
+            serde_json::json!{{"data": {
+                "stuff": {
+                  "__typename": "Stuff",
+                  "id": "1",
+                  "thing": {
+                    "__typename": "Thing",
+                    "id": "2",
+                    "text": "aaa"
+                  }
+                }
+            } }}
+        ).build()),
+        ("sub2", MockSubgraph::builder().with_json(
+            serde_json::json!{{
+                "query": "query($representations:[_Any!]!){_entities(representations:$representations){...on Stuff{isEnabled}}}",
+                "variables":{"representations": [
+                    {
+                        "__typename": "Stuff",
+                        "id": "1",
+                        "thing": {
+                        "text": "aaa"
+                        }
+                    }
+                ]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "isEnabled": true
+                }]
+            } }}
+        ).build()),
+        ].into_iter().collect());
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({"include_subgraph_errors": { "all": true } }))
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "1"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn missing_typename_and_fragments_in_requires2() {
+    let schema = r#"schema
+    @link(url: "https://specs.apollo.dev/link/v1.0")
+    @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+  {
+    query: Query
+  }
+
+  directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+  directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+  directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+  directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+  directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+  directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+  directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+  scalar join__FieldSet
+
+  enum join__Graph {
+    SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+    SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+  }
+
+  scalar link__Import
+
+  enum link__Purpose {
+    """
+    `SECURITY` features provide metadata necessary to securely resolve fields.
+    """
+    SECURITY
+
+    """
+    `EXECUTION` features provide metadata necessary for operation execution.
+    """
+    EXECUTION
+  }
+
+  type Query
+    @join__type(graph: SUB1)
+    @join__type(graph: SUB2)
+  {
+    stuff: Stuff @join__field(graph: SUB1)
+  }
+
+  type Stuff
+    @join__type(graph: SUB1, key: "id")
+    @join__type(graph: SUB2, key: "id", extension: true)
+  {
+    id: ID
+    thing: PossibleThing @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+    isEnabled: Boolean @join__field(graph: SUB2, requires: "thing { ... on Thing1 { __typename text1 } ... on Thing2 { __typename text2 } }")
+  }
+
+  union PossibleThing @join__type(graph: SUB1) @join__type(graph: SUB2)
+  @join__unionMember(graph: SUB1, member: "Thing1") @join__unionMember(graph: SUB1, member: "Thing2")
+  @join__unionMember(graph: SUB2, member: "Thing1") @join__unionMember(graph: SUB2, member: "Thing2")
+    = Thing1 | Thing2
+
+  type Thing1
+  @join__type(graph: SUB1, key: "id")
+  @join__type(graph: SUB2, key: "id") {
+    id: ID
+    text1: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+  }
+
+  type Thing2
+  @join__type(graph: SUB1, key: "id")
+  @join__type(graph: SUB2, key: "id") {
+    id: ID
+    text2: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+  }
+  "#;
+
+    let query = "query {
+        stuff {
+          id
+          isEnabled
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs([
+        ("sub1", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query": "{stuff{__typename id thing{__typename ...on Thing1{__typename text1}...on Thing2{__typename text2}}}}",}},
+            serde_json::json!{{"data": {
+                "stuff": {
+                  "__typename": "Stuff",
+                  "id": "1",
+                  "thing": {
+                    "__typename": "Thing1",
+                    "text1": "aaa"
+                  }
+                }
+            } }}
+        ).build()),
+        ("sub2", MockSubgraph::builder().with_json(
+            serde_json::json!{{
+                "query": "query($representations:[_Any!]!){_entities(representations:$representations){...on Stuff{isEnabled}}}",
+                "variables":{"representations": [
+                    {
+                        "__typename": "Stuff",
+                        "id": "1",
+                        "thing": {
+                        "__typename": "Thing1",
+                        "text1": "aaa"
+                        }
+                    }
+                ]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "isEnabled": true
+                }]
+            } }}
+        ).build()),
+        ].into_iter().collect());
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                // TODO(@goto-bus-stop): need to update the mocks and remove this, #6013
+                "generate_query_fragments": false,
+            }
+        }))
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "1"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn null_in_requires() {
+    let schema = r#"schema
+    @link(url: "https://specs.apollo.dev/link/v1.0")
+    @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+  {
+    query: Query
+  }
+
+  directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+  directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+  directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+  directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+  directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+  directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+  directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+  scalar join__FieldSet
+
+  enum join__Graph {
+    SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+    SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+  }
+
+  scalar link__Import
+
+  enum link__Purpose {
+    """
+    `SECURITY` features provide metadata necessary to securely resolve fields.
+    """
+    SECURITY
+
+    """
+    `EXECUTION` features provide metadata necessary for operation execution.
+    """
+    EXECUTION
+  }
+
+  type Query
+    @join__type(graph: SUB1)
+    @join__type(graph: SUB2)
+  {
+    stuff: Stuff @join__field(graph: SUB1)
+  }
+
+  type Stuff
+    @join__type(graph: SUB1, key: "id")
+    @join__type(graph: SUB2, key: "id", extension: true)
+  {
+    id: ID
+    thing: Thing
+    isEnabled: Boolean @join__field(graph: SUB2, requires: "thing { a text }")
+  }
+
+  type Thing
+  @join__type(graph: SUB1, key: "id")
+  @join__type(graph: SUB2, key: "id") {
+    id: ID
+    a: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+    text: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+  }
+  "#;
+
+    let query = "query {
+        stuff {
+          id
+          isEnabled
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs([
+        ("sub1", MockSubgraph::builder().with_json(
+            serde_json::json!{{"query": "{stuff{__typename id thing{__typename id a text}}}",}},
+            serde_json::json!{{"data": {
+                "stuff": {
+                  "__typename": "Stuff",
+                  "id": "1",
+                  "thing": {
+                    "__typename": "Thing",
+                    "id": "2",
+                    "a": "A",
+                    "text": null
+                  }
+                }
+            } }}
+        ).build()),
+        ("sub2", MockSubgraph::builder().with_json(
+            serde_json::json!{{
+                "query": "query($representations:[_Any!]!){_entities(representations:$representations){...on Stuff{isEnabled}}}",
+                "variables":{"representations": [
+                    {
+                        "__typename": "Stuff",
+                        "id": "1",
+                        "thing": {
+                            "a": "A",
+                            "text": null
+                        }
+                    }
+                ]}}},
+            serde_json::json!{{"data": {
+                "_entities": [{
+                    "isEnabled": true
+                }]
+            } }}
+        ).build()),
+        ].into_iter().collect());
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({"include_subgraph_errors": { "all": true } }))
+        .unwrap()
+        .schema(schema)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .variables(
+            serde_json_bytes::json! {{ "tId": "1"}}
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+const TYPENAME_PROPAGATION_SCHEMA: &str = r#"schema
+@link(url: "https://specs.apollo.dev/link/v1.0")
+@link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+{
+query: Query
+}
+
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+type Author implements Node
+@join__implements(graph: NODE_RELAY_SUBGRAPH, interface: "Node")
+@join__type(graph: AUTHOR_SUBGRAPH, key: "authorId")
+@join__type(graph: BOOK_SUBGRAPH, key: "authorId")
+@join__type(graph: NODE_RELAY_SUBGRAPH, key: "authorId")
+{
+authorId: String!
+fullName: String! @join__field(graph: AUTHOR_SUBGRAPH) @join__field(graph: BOOK_SUBGRAPH, external: true) @join__field(graph: NODE_RELAY_SUBGRAPH, external: true)
+id: ID! @join__field(graph: NODE_RELAY_SUBGRAPH)
+}
+
+type Book implements Node
+@join__implements(graph: NODE_RELAY_SUBGRAPH, interface: "Node")
+@join__type(graph: BOOK_SUBGRAPH, key: "bookId author { fullName }")
+@join__type(graph: NODE_RELAY_SUBGRAPH, key: "bookId author { fullName }")
+{
+bookId: String!
+author: Author!
+id: ID! @join__field(graph: NODE_RELAY_SUBGRAPH)
+}
+
+scalar join__FieldSet
+
+enum join__Graph {
+AUTHOR_SUBGRAPH @join__graph(name: "author_subgraph", url: "https://films.example.com")
+BOOK_SUBGRAPH @join__graph(name: "book_subgraph", url: "https://films.example.com")
+NODE_RELAY_SUBGRAPH @join__graph(name: "node_relay_subgraph", url: "https://films.example.com")
+}
+
+scalar link__Import
+
+enum link__Purpose {
+"""
+`SECURITY` features provide metadata necessary to securely resolve fields.
+"""
+SECURITY
+
+"""
+`EXECUTION` features provide metadata necessary for operation execution.
+"""
+EXECUTION
+}
+
+interface Node
+@join__type(graph: NODE_RELAY_SUBGRAPH)
+{
+id: ID!
+}
+
+type Query
+@join__type(graph: AUTHOR_SUBGRAPH)
+@join__type(graph: BOOK_SUBGRAPH)
+@join__type(graph: NODE_RELAY_SUBGRAPH)
+{
+b: Boolean @join__field(graph: AUTHOR_SUBGRAPH)
+book: Book @join__field(graph: BOOK_SUBGRAPH)
+node(id: ID): Node @join__field(graph: NODE_RELAY_SUBGRAPH)
+}"#;
+
+#[tokio::test]
+async fn typename_propagation() {
+    let subgraphs = MockedSubgraphs(
+        [
+            ("author_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook__author_subgraph__1($representations:[_Any!]!){_entities(representations:$representations){...on Author{fullName}}}",
+                    "operationName": "QueryBook__author_subgraph__1",
+                    "variables": {
+                        "representations": [{
+                            "__typename": "Author",
+                            "authorId": "Author1"
+                        }]
+                    }
+                }},
+                serde_json::json! {{"data": {
+                    "_entities": [{
+                        "fullName": "Ada"
+                    }]
+                } }},
+            ).build()),
+            ("book_subgraph", MockSubgraph::builder().build()),
+            ("node_relay_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query Query__node_relay_subgraph__0{node{__typename ...on Book{id author{__typename}}}}",
+                    "operationName": "Query__node_relay_subgraph__0"
+                }},
+                serde_json::json! {{"data": {
+                    "node": {
+                      "__typename": "Book",
+                      "id": "1",
+                      "author": {
+                        "__typename": "Author"
+                      }
+                    }
+                } }},
+            ).build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                // TODO(@goto-bus-stop): need to update the mocks and remove this, #6013
+                "generate_query_fragments": false,
+            }
+        }))
+        .unwrap()
+        .schema(TYPENAME_PROPAGATION_SCHEMA)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(
+            "query Query {
+            node {
+              __typename
+              ... on Book {
+                id
+                author {
+                  __typename
+                }
+              }
+            }
+          }",
+        )
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn typename_propagation2() {
+    let subgraphs = MockedSubgraphs(
+        [
+            ("author_subgraph", MockSubgraph::builder().build()),
+            ("book_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook__book_subgraph__0{book{__typename bookId author{__typename authorId}}}",
+                    "operationName": "QueryBook__book_subgraph__0"
+                }},
+                serde_json::json! {{"data": {
+                    "book": {
+                      "__typename": "Book",
+                      "bookId": "book1",
+                      "author": {
+                        "__typename": null,
+                        "authorId": "Author1"
+                      }
+                    }
+                } }},
+            ).build()),
+            ("node_relay_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook__node_relay_subgraph__2($representations:[_Any!]!){_entities(representations:$representations){...on Book{__typename id}}}",
+                    "operationName": "QueryBook__node_relay_subgraph__2",
+                    "variables": {
+                        "representations": [{
+                            "__typename": "Book",
+                            "bookId": "book1",
+                            "author": null
+                        }]
+                    }
+                }},
+                serde_json::json! {{"data": {
+                    "_entities": [{
+                        "__typename": "Book",
+                        "id": "1"
+                    }]
+                } }},
+            ).with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook__node_relay_subgraph__2($representations:[_Any!]!){_entities(representations:$representations){...on Book{__typename id}}}",
+                    "operationName": "QueryBook__node_relay_subgraph__2",
+                    "variables": {
+                        "representations": [{
+                            "__typename": "Book",
+                            "bookId": "book1",
+                            "author": {
+                                "fullName": null
+                            }
+                        }]
+                    }
+                }},
+                serde_json::json! {{"data": {
+                    "_entities": [{
+                        "__typename": "Book",
+                        "id": "1"
+                    }]
+                } }},
+            ).build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                // TODO(@goto-bus-stop): need to update the mocks and remove this, #6013
+                "generate_query_fragments": false,
+            }
+        }))
+        .unwrap()
+        .schema(TYPENAME_PROPAGATION_SCHEMA)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let query = "query QueryBook {
+        book {
+          __typename
+          ... on Book {
+            id
+            author {
+              __typename
+            }
+          }
+        }
+      }";
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[tokio::test]
+async fn typename_propagation3() {
+    let subgraphs = MockedSubgraphs(
+        [
+            ("author_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook2__author_subgraph__1($representations:[_Any!]!){_entities(representations:$representations){...on Author{fullName}}}",
+                    "operationName": "QueryBook2__author_subgraph__1",
+                    "variables": {
+                        "representations": [{
+                            "__typename": "Author",
+                            "authorId": "Author1"
+                        }]
+                    }
+                }},
+                serde_json::json! {{"data": {
+                    "_entities": [{
+                        "fullName": "Ada"
+                    }]
+                } }},
+            ).build()),
+            ("book_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook2__book_subgraph__0{book{__typename bookId author{__typename authorId}}}",
+                    "operationName": "QueryBook2__book_subgraph__0"
+                }},
+                serde_json::json! {{"data": {
+                    "book": {
+                      "__typename": "Book",
+                      "bookId": "book1",
+                      "author": {
+                        "__typename": "Author",
+                        "authorId": "Author1"
+                      }
+                    }
+                } }},
+            ).build()),
+            ("node_relay_subgraph", MockSubgraph::builder().with_json(
+                serde_json::json! {{
+                    "query": "query QueryBook2__node_relay_subgraph__2($representations:[_Any!]!){_entities(representations:$representations){...on Book{__typename id author{id}}}}",
+                    "operationName": "QueryBook2__node_relay_subgraph__2",
+                    "variables": {
+                        "representations": [{
+                            "__typename": "Book",
+                            "bookId": "book1",
+                            "author": {
+                                "fullName": "Ada"
+                            }
+                        }]
+                    }
+                }},
+                serde_json::json! {{"data": {
+                    "_entities": [{
+                        "__typename": "Book",
+                        "id": "1",
+                        "author": {
+                            "id": "2"
+                        }
+                    }]
+                } }},
+            ).build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let service = TestHarness::builder()
+        .configuration_json(serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                // TODO(@goto-bus-stop): need to update the mocks and remove this, #6013
+                "generate_query_fragments": false,
+            }
+        }))
+        .unwrap()
+        .schema(TYPENAME_PROPAGATION_SCHEMA)
+        .extra_plugin(subgraphs)
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let query = "query QueryBook2 {
+        book {
+          __typename
+          ... on Book {
+            id
+            author {
+              id
+            }
+          }
+        }
+      }";
+
+    let request = supergraph::Request::fake_builder()
+        .context(Context::new())
+        .query(query)
+        .build()
+        .unwrap();
+
+    let mut stream = service.clone().oneshot(request).await.unwrap();
+    let response = stream.next_response().await.unwrap();
+    insta::assert_json_snapshot!(serde_json::to_value(&response).unwrap());
+}
+
+#[test]
+fn broken_plan_does_not_panic() {
+    let operation = "{ invalid }";
+    let subgraph_schema = "type Query { field: Int }";
+    let mut plan = QueryPlan {
+        root: Some(Arc::new(PlanNode::Fetch(FetchNode {
+            service_name: "X".into(),
+            requires: vec![],
+            variable_usages: vec![],
+            operation: SerializableDocument::from_string(operation),
+            operation_name: Some("t".into()),
+            operation_kind: OperationKind::Query,
+            id: Some("fetch1".into()),
+            input_rewrites: None,
+            output_rewrites: None,
+            context_rewrites: None,
+            schema_aware_hash: Default::default(),
+            authorization: Default::default(),
+        }))),
+        formatted_query_plan: Default::default(),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+    let subgraph_schema = apollo_compiler::Schema::parse_and_validate(subgraph_schema, "").unwrap();
+    let mut subgraph_schemas = HashMap::default();
+    subgraph_schemas.insert(
+        "X".to_owned(),
+        query_planner::HashedSubgraphSchema::new(subgraph_schema),
+    );
+    // Run the plan initialization code to make sure it doesn't panic.
+    let root_node = plan.root.as_mut().expect("non-empty query plan");
+    let result =
+        Arc::make_mut(root_node).init_parsed_operations_and_hash_subqueries(&subgraph_schemas);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        r#"[1:3] Cannot query field "invalid" on type "Query"."#
+    );
+}
+
+/// Reproduces a bug where a deferred node's dependency list was missing a fetch
+/// that provides `__typename` and entity keys at the deferred Flatten path.
+///
+/// The root cause was in the query planner's `collect_redundant_edges` (transitive
+/// reduction): when a direct edge from a primary fetch to a deferred fetch was also
+/// reachable transitively through an intermediate fetch, the direct edge was removed.
+/// This caused `extract_children_and_deferred_dependencies` to only register the
+/// intermediate fetch as a dependency, omitting the primary fetch that provides
+/// `__typename` and entity keys.
+///
+/// The scenario:
+/// - Primary: Fetch(X, id=fetch1) gets `start.inner { __typename id sub }`,
+///   then Flatten Fetch(Y, id=fetch0) gets `sub.data`
+/// - Deferred(depends: [fetch0, fetch1]): Flatten at `start.inner`, Fetch(Z) requires
+///   `Inner { __typename id sub { subId data } }` and returns `target`
+///
+/// With the planner fix, both fetch0 AND fetch1 are registered as dependencies,
+/// ensuring the deferred node has complete data (including `__typename` and `id`).
+#[tokio::test]
+async fn defer_depends_skips_fetch_when_typename_missing() {
+    // Query plan for:
+    //   { start { id inner { __typename id ... @defer { target { x } } } } }
+    // where inner.sub.data is fetched by a dependency (Y, id=fetch0)
+    // and the deferred fetch (Z) requires inner.__typename + id + sub { subId data }
+    let query_plan: QueryPlan = QueryPlan {
+        formatted_query_plan: Default::default(),
+        root: Some(Arc::new(PlanNode::Defer {
+            primary: Primary {
+                subselection: Some("{ start { id inner { __typename id } } }".to_string()),
+                node: Some(Box::new(PlanNode::Sequence {
+                    nodes: vec![
+                        // Primary fetch: gets start with inner { __typename, id, sub }
+                        // With the planner fix, this fetch gets an id so the deferred
+                        // node can depend on it for __typename and id.
+                        PlanNode::Fetch(FetchNode {
+                            service_name: "X".into(),
+                            requires: vec![],
+                            variable_usages: vec![],
+                            operation: SerializableDocument::from_string(
+                                "{ start { __typename id inner { __typename id sub { __typename subId } } } }",
+                            ),
+                            operation_name: None,
+                            operation_kind: OperationKind::Query,
+                            id: Some("fetch1".into()),
+                            input_rewrites: None,
+                            output_rewrites: None,
+                            context_rewrites: None,
+                            schema_aware_hash: Default::default(),
+                            authorization: Default::default(),
+                        }),
+                        // Dependency fetch: gets sub.data (the deferred node depends on this)
+                        PlanNode::Flatten(FlattenNode {
+                            path: Path(vec![
+                                PathElement::Key("start".to_string(), None),
+                                PathElement::Key("inner".to_string(), None),
+                                PathElement::Key("sub".to_string(), None),
+                            ]),
+                            node: Box::new(PlanNode::Fetch(FetchNode {
+                                service_name: "Y".into(),
+                                requires: vec![requires_selection::Selection::InlineFragment(
+                                    requires_selection::InlineFragment {
+                                        conditions: vec![],
+                                        type_condition: Some(name!("Sub")),
+                                        selections: vec![
+                                            requires_selection::Selection::Field(
+                                                requires_selection::Field {
+                                                    alias: None,
+                                                    name: name!("__typename"),
+                                                    selections: Vec::new(),
+                                                },
+                                            ),
+                                            requires_selection::Selection::Field(
+                                                requires_selection::Field {
+                                                    alias: None,
+                                                    name: name!("subId"),
+                                                    selections: Vec::new(),
+                                                },
+                                            ),
+                                        ],
+                                    },
+                                )],
+                                variable_usages: vec![],
+                                operation: SerializableDocument::from_string(
+                                    "query($representations:[_Any!]!){_entities(representations:$representations){...on Sub{data}}}",
+                                ),
+                                operation_name: None,
+                                operation_kind: OperationKind::Query,
+                                id: Some("fetch0".into()),
+                                input_rewrites: None,
+                                output_rewrites: None,
+                                context_rewrites: None,
+                                schema_aware_hash: Default::default(),
+                                authorization: Default::default(),
+                            })),
+                        }),
+                    ],
+                })),
+            },
+            deferred: vec![DeferredNode {
+                depends: vec![
+                    Depends {
+                        id: "fetch0".into(),
+                    },
+                    Depends {
+                        id: "fetch1".into(),
+                    },
+                ],
+                label: None,
+                query_path: Path(vec![
+                    PathElement::Key("start".to_string(), None),
+                    PathElement::Key("inner".to_string(), None),
+                ]),
+                subselection: Some("{ target { x } }".to_string()),
+                node: Some(Arc::new(PlanNode::Flatten(FlattenNode {
+                    path: Path(vec![
+                        PathElement::Key("start".to_string(), None),
+                        PathElement::Key("inner".to_string(), None),
+                    ]),
+                    node: Box::new(PlanNode::Fetch(FetchNode {
+                        service_name: "Z".into(),
+                        requires: vec![requires_selection::Selection::InlineFragment(
+                            requires_selection::InlineFragment {
+                                conditions: vec![],
+                                type_condition: Some(name!("Inner")),
+                                selections: vec![
+                                    requires_selection::Selection::Field(
+                                        requires_selection::Field {
+                                            alias: None,
+                                            name: name!("__typename"),
+                                            selections: Vec::new(),
+                                        },
+                                    ),
+                                    requires_selection::Selection::Field(
+                                        requires_selection::Field {
+                                            alias: None,
+                                            name: name!("id"),
+                                            selections: Vec::new(),
+                                        },
+                                    ),
+                                    requires_selection::Selection::Field(
+                                        requires_selection::Field {
+                                            alias: None,
+                                            name: name!("sub"),
+                                            selections: vec![
+                                                requires_selection::Selection::Field(
+                                                    requires_selection::Field {
+                                                        alias: None,
+                                                        name: name!("subId"),
+                                                        selections: Vec::new(),
+                                                    },
+                                                ),
+                                                requires_selection::Selection::Field(
+                                                    requires_selection::Field {
+                                                        alias: None,
+                                                        name: name!("data"),
+                                                        selections: Vec::new(),
+                                                    },
+                                                ),
+                                            ],
+                                        },
+                                    ),
+                                ],
+                            },
+                        )],
+                        variable_usages: vec![],
+                        operation: SerializableDocument::from_string(
+                            "query($representations:[_Any!]!){_entities(representations:$representations){...on Inner{target{x}}}}",
+                        ),
+                        operation_name: None,
+                        operation_kind: OperationKind::Query,
+                        id: None,
+                        input_rewrites: None,
+                        output_rewrites: None,
+                        context_rewrites: None,
+                        schema_aware_hash: Default::default(),
+                        authorization: Default::default(),
+                    })),
+                }))),
+            }],
+        })),
+        usage_reporting: UsageReporting::Error("this is a test report key".to_string()).into(),
+        query: Arc::new(Query::empty_for_tests()),
+        estimated_size: Default::default(),
+    };
+
+    // Mock X service: returns the root query data for start
+    let (mock_x_service, mut handle_x) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_x = tokio::spawn(async move {
+        let (_req, responder) = handle_x.next_request().await.unwrap();
+        responder.send_response(
+            SubgraphResponse::fake_builder()
+                .data(serde_json::json! {{
+                    "start": {
+                        "__typename": "T",
+                        "id": "1",
+                        "inner": {
+                            "__typename": "Inner",
+                            "id": "i1",
+                            "sub": {
+                                "__typename": "Sub",
+                                "subId": "s1"
+                            }
+                        }
+                    }
+                }})
+                .build(),
+        );
+    });
+
+    // Mock Y service: entity fetch for Sub, returns data field
+    let (mock_y_service, mut handle_y) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_y = tokio::spawn(async move {
+        let (_req, responder) = handle_y.next_request().await.unwrap();
+        responder.send_response(
+            SubgraphResponse::fake_builder()
+                .data(serde_json::json! {{
+                    "_entities": [{"data": "d1"}]
+                }})
+                .build(),
+        );
+    });
+
+    // Mock Z service: entity fetch for Inner, returns target
+    // If the bug exists, this service will NOT be called (fetch is skipped).
+    let (mock_z_service, mut handle_z) = tower_test::mock::pair::<
+        crate::services::SubgraphRequest,
+        crate::services::SubgraphResponse,
+    >();
+    let driver_z = tokio::spawn(async move {
+        let (_req, responder) = handle_z.next_request().await.unwrap();
+        responder.send_response(
+            SubgraphResponse::fake_builder()
+                .data(serde_json::json! {{
+                    "_entities": [{"target": {"x": "42"}}]
+                }})
+                .build(),
+        );
+    });
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(10);
+
+    let schema = include_str!("testdata/defer_depends_schema.graphql");
+    let schema = Arc::new(Schema::parse(schema, &Default::default()).unwrap());
+    let ssf = subgraph_services(vec![
+        ("X".into(), mock_x_service.boxed_clone()),
+        ("Y".into(), mock_y_service.boxed_clone()),
+        ("Z".into(), mock_z_service.boxed_clone()),
+    ]);
+    let sf = FetchService::new(
+        schema.clone(),
+        Default::default(),
+        Arc::new(ssf),
+        Arc::new(ConnectorServices::empty(schema.clone())),
+        None,
+        Arc::new(SubgraphConfiguration::<HoistOrphanErrors>::default()),
+    );
+
+    let response = query_plan
+        .execute(
+            &Context::new(),
+            &sf,
+            &Default::default(),
+            &schema,
+            &Default::default(),
+            sender,
+            None,
+            &None,
+            None,
+        )
+        .await;
+
+    // Primary response should have start.inner with __typename and id
+    let primary_data = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        primary_data,
+        serde_json::json! {{
+            "data": {
+                "start": {
+                    "__typename": "T",
+                    "id": "1",
+                    "inner": {
+                        "__typename": "Inner",
+                        "id": "i1",
+                        "sub": {
+                            "__typename": "Sub",
+                            "subId": "s1",
+                            "data": "d1"
+                        }
+                    }
+                }
+            }
+        }}
+    );
+
+    // Deferred response should include target from Z fetch
+    let deferred = ReceiverStream::new(receiver).next().await.unwrap();
+    let deferred_data = serde_json::to_value(&deferred).unwrap();
+
+    // The deferred response data should contain target with x.
+    // If the bug exists (Z fetch skipped), target will be missing/null.
+    let inner_data = &deferred_data["data"]["start"]["inner"];
+    assert!(
+        inner_data.get("target").is_some() && !inner_data["target"].is_null(),
+        "target should not be null in the deferred response. \
+         This indicates the deferred fetch to Z was skipped because \
+         __typename was missing from the deferred node's context at the Flatten path. \
+         Got deferred response: {}",
+        serde_json::to_string_pretty(&deferred_data).unwrap()
+    );
+    assert_eq!(
+        inner_data["target"]["x"], "42",
+        "target should have x from Z fetch"
+    );
+    crate::plugin::test::await_mock_driver(driver_x).await;
+    crate::plugin::test::await_mock_driver(driver_y).await;
+    crate::plugin::test::await_mock_driver(driver_z).await;
+}
+
+// Documents that the user-visible "errors" array stays SILENT when the
+// user-asked fields are all nullable. The skipped @requires fetch leaves
+// `computed` and `nickname` null in `data` (existing behavior), but the
+// new approach only emits `RESPONSE_VALIDATION_FAILED` for non-null
+// requested fields. The planner-internal `code: String!` that triggered
+// the skip is not in the user's operation, so no diagnostic surfaces.
+#[tokio::test]
+async fn missing_nonnull_field_in_requires_returns_error() {
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+            SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+        }
+
+        type Query
+            @join__type(graph: SUB1)
+            @join__type(graph: SUB2)
+        {
+            entity: Entity @join__field(graph: SUB1)
+        }
+
+        type Entity
+            @join__type(graph: SUB1, key: "id")
+            @join__type(graph: SUB2, key: "id", extension: true)
+        {
+            id: ID!
+            name: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            code: String! @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            computed: String @join__field(graph: SUB2, requires: "code")
+            nickname: String @join__field(graph: SUB2, requires: "name")
+        }
+        "#,
+    );
+
+    let query = "query { entity { id computed nickname } }";
+
+    let subgraphs = MockedSubgraphs(
+        [
+            (
+                "sub1",
+                MockSubgraph::builder()
+                    .with_json(
+                        // Router queries sub1 for entity fields including code and name (needed for @requires)
+                        serde_json::json! {{"query": "{entity{__typename id name code}}"}},
+                        // Sub1 returns WITHOUT `code` (simulating coprocessor stripping the field
+                        // from the request, so the subgraph never received it and doesn't return it)
+                        serde_json::json! {{"data": {
+                            "entity": {
+                              "__typename": "Entity",
+                              "id": "1",
+                              "name": "Alice"
+                            }
+                        } }},
+                    )
+                    .build(),
+            ),
+            ("sub2", MockSubgraph::builder().build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let value = run_query(&schema, subgraphs, query, default_config()).await;
+
+    let data = &value["data"]["entity"];
+    // `computed` and `nickname` are nullable; they land as null in `data`.
+    assert_eq!(data["computed"], serde_json::Value::Null);
+    assert_eq!(data["nickname"], serde_json::Value::Null);
+
+    // Both fields are nullable, and coercion errors are off in this
+    // harness → no emission anywhere. (`emit_missing_field` only
+    // writes valueCompletion for non-null, and only writes response
+    // errors when coercion is on.)
+    assert_response_diagnostics(&value, serde_json::json!([]), serde_json::json!([]));
+}
+
+// Variant of C.1 with `enable_result_coercion_errors` ON. Nullable missing fields surface
+// `RESPONSE_VALIDATION_FAILED` in `response.errors` when the gate is enabled.
+#[tokio::test]
+async fn missing_nullable_field_in_requires_returns_error_coercion_on() {
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+            SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+        }
+
+        type Query
+            @join__type(graph: SUB1)
+            @join__type(graph: SUB2)
+        {
+            entity: Entity @join__field(graph: SUB1)
+        }
+
+        type Entity
+            @join__type(graph: SUB1, key: "id")
+            @join__type(graph: SUB2, key: "id", extension: true)
+        {
+            id: ID!
+            name: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            code: String! @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            computed: String @join__field(graph: SUB2, requires: "code")
+            nickname: String @join__field(graph: SUB2, requires: "name")
+        }
+        "#,
+    );
+
+    let query = "query { entity { id computed nickname } }";
+
+    let subgraphs = MockedSubgraphs(
+        [
+            (
+                "sub1",
+                MockSubgraph::builder()
+                    .with_json(
+                        serde_json::json! {{"query": "{entity{__typename id name code}}"}},
+                        serde_json::json! {{"data": {
+                            "entity": {
+                              "__typename": "Entity",
+                              "id": "1",
+                              "name": "Alice"
+                            }
+                        } }},
+                    )
+                    .build(),
+            ),
+            ("sub2", MockSubgraph::builder().build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let value = run_query(&schema, subgraphs, query, coercion_errors_config()).await;
+
+    let data = &value["data"]["entity"];
+    assert_eq!(data["computed"], serde_json::Value::Null);
+    assert_eq!(data["nickname"], serde_json::Value::Null);
+
+    // With coercion errors ON, nullable missing fields emit
+    // `RESPONSE_VALIDATION_FAILED` at the leaf path. No valueCompletion
+    // (that's non-null only).
+    assert_response_diagnostics(
+        &value,
+        serde_json::json!([
+            {
+                "message": "Missing field",
+                "path": ["entity", "computed"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+            {
+                "message": "Missing field",
+                "path": ["entity", "nickname"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]),
+        serde_json::json!([]),
+    );
+}
+
+// Variant of `missing_nonnull_field_in_requires_returns_error` where `computed` is a non-nullable
+// field. When the skipped fetch's field is non-nullable, `apply_selection_set` propagates null up
+// to the parent (entity), per the GraphQL spec. The post-fix `format_response` emits a
+// `RESPONSE_VALIDATION_FAILED` error at the leaf path that triggered the null.
+#[tokio::test]
+async fn missing_nonnull_field_in_requires_returns_error_nonnull_leaf() {
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+            SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+        }
+
+        type Query
+            @join__type(graph: SUB1)
+            @join__type(graph: SUB2)
+        {
+            entity: Entity @join__field(graph: SUB1)
+        }
+
+        type Entity
+            @join__type(graph: SUB1, key: "id")
+            @join__type(graph: SUB2, key: "id", extension: true)
+        {
+            id: ID!
+            name: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            code: String! @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            computed: String! @join__field(graph: SUB2, requires: "code")
+            nickname: String @join__field(graph: SUB2, requires: "name")
+        }
+        "#,
+    );
+
+    let query = "query {
+        entity {
+          id
+          computed
+          nickname
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs(
+        [
+            (
+                "sub1",
+                MockSubgraph::builder()
+                    .with_json(
+                        serde_json::json! {{"query": "{entity{__typename id name code}}"}},
+                        // sub1 returns WITHOUT `code` — sub2 (which requires code) is skipped.
+                        serde_json::json! {{"data": {
+                            "entity": {
+                              "__typename": "Entity",
+                              "id": "1",
+                              "name": "Alice"
+                            }
+                        } }},
+                    )
+                    .build(),
+            ),
+            ("sub2", MockSubgraph::builder().build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let value = run_query(&schema, subgraphs, query, coercion_errors_config()).await;
+
+    // `computed: String!` is non-nullable — the missing value bubbles up and nullifies
+    // `data.entity` per GraphQL null-propagation rules.
+    assert_eq!(value["data"]["entity"], serde_json::Value::Null);
+
+    // `RESPONSE_VALIDATION_FAILED` is emitted at the leaf
+    // `[entity, computed]` (the non-null user-asked field). `nickname`
+    // is nullable — the formatter returns `Err(InvalidValue)` at
+    // `computed` and short-circuits before iterating to `nickname`, so
+    // only `computed`'s emission appears. `emit_missing_field` writes
+    // to both sinks for non-null missing, so `valueCompletion` also
+    // carries an entry at the parent path `[entity]`.
+    assert_response_diagnostics(
+        &value,
+        serde_json::json!([
+            {
+                "message": "Missing field",
+                "path": ["entity", "computed"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]),
+        serde_json::json!([
+            { "message": "Cannot return null for non-nullable type String", "path": ["entity"] },
+        ]),
+    );
+}
+
+// Variant of `missing_nonnull_field_in_requires_returns_error` where the root `Query.entity`
+// field is non-nullable. With `computed: String!` also non-nullable, the missing value at the
+// leaf bubbles up: `computed` → `entity` (becomes null) → `data` (becomes null, since
+// `Query.entity` is non-null). This tests how null-propagation behaves when there's no
+// nullable ancestor to stop at.
+#[tokio::test]
+async fn missing_nonnull_field_in_requires_returns_error_nonnull_entity() {
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+            SUB2 @join__graph(name: "sub2", url: "http://localhost/sub2")
+        }
+
+        type Query
+            @join__type(graph: SUB1)
+            @join__type(graph: SUB2)
+        {
+            entity: Entity! @join__field(graph: SUB1)
+        }
+
+        type Entity
+            @join__type(graph: SUB1, key: "id")
+            @join__type(graph: SUB2, key: "id", extension: true)
+        {
+            id: ID!
+            name: String @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            code: String! @join__field(graph: SUB1) @join__field(graph: SUB2, external: true)
+            computed: String! @join__field(graph: SUB2, requires: "code")
+            nickname: String @join__field(graph: SUB2, requires: "name")
+        }
+        "#,
+    );
+
+    let query = "query {
+        entity {
+          id
+          computed
+          nickname
+        }
+      }";
+
+    let subgraphs = MockedSubgraphs(
+        [
+            (
+                "sub1",
+                MockSubgraph::builder()
+                    .with_json(
+                        serde_json::json! {{"query": "{entity{__typename id name code}}"}},
+                        // sub1 returns WITHOUT `code` — sub2 (which requires code) is skipped.
+                        serde_json::json! {{"data": {
+                            "entity": {
+                              "__typename": "Entity",
+                              "id": "1",
+                              "name": "Alice"
+                            }
+                        } }},
+                    )
+                    .build(),
+            ),
+            ("sub2", MockSubgraph::builder().build()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+
+    let value = run_query(&schema, subgraphs, query, coercion_errors_config()).await;
+
+    // `computed: String!` missing → nullifies `entity` → `Query.entity: Entity!` is non-null →
+    // the null bubbles up to `data` itself.
+    assert_eq!(value["data"], serde_json::Value::Null);
+
+    // Only ONE `RESPONSE_VALIDATION_FAILED` at the originating leaf
+    // `[entity, computed]`.
+    assert_response_diagnostics(
+        &value,
+        serde_json::json!([
+            {
+                "message": "Missing field",
+                "path": ["entity", "computed"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]),
+        serde_json::json!([
+            { "message": "Cannot return null for non-nullable type String", "path": ["entity"] },
+        ]),
+    );
+}
+
+// Symmetry test: the missing and explicit-null branches in `spec/query.rs` response formatting
+// both emit `RESPONSE_VALIDATION_FAILED` in `response.errors` (in addition to the existing
+// `valueCompletion` entry either case still leaves in extensions).
+//
+// Before the fix, only the explicit-null branch surfaced a user-visible error; the missing branch
+// went only to `valueCompletion`. That asymmetry is the reason `@requires`-driven skips (which
+// look like "missing" from the formatter's perspective — the field was never fetched) used to
+// silently drop. With the fix, the symptom is the same regardless of whether the subgraph returned
+// an explicit null or omitted the field.
+#[tokio::test]
+async fn response_formatting_missing_vs_null_nonnull_field_asymmetry() {
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            SUB1 @join__graph(name: "sub1", url: "http://localhost/sub1")
+        }
+
+        type Query @join__type(graph: SUB1) {
+            entity: Entity @join__field(graph: SUB1)
+        }
+
+        type Entity @join__type(graph: SUB1, key: "id") {
+            id: ID!
+            name: String! @join__field(graph: SUB1)
+        }
+        "#,
+    );
+
+    let query = "query { entity { id name } }";
+
+    // Helper: build a service whose single subgraph returns the given `entity` payload.
+    async fn run_with_entity(
+        schema: &str,
+        query: &str,
+        entity: serde_json::Value,
+    ) -> serde_json::Value {
+        let subgraphs = MockedSubgraphs(
+            [(
+                "sub1",
+                MockSubgraph::builder()
+                    .with_json(
+                        serde_json::json! {{"query": "{entity{id name}}"}},
+                        serde_json::json! {{"data": {"entity": entity}}},
+                    )
+                    .build(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        // Enable coercion errors so any errors generated by `format_non_nullable_value`
+        // show up in `response.errors`.
+        run_query(schema, subgraphs, query, coercion_errors_config()).await
+    }
+
+    // Case A: `name` is MISSING (absent) from the subgraph response.
+    // `apply_selection_set`'s missing-field branch calls `emit_missing_field`,
+    // which writes RVF to `response.errors` at the leaf, plus a
+    // valueCompletion entry at the **parent** path (it never recursed
+    // into the field).
+    let missing = run_with_entity(&schema, query, serde_json::json!({ "id": "1" })).await;
+    assert_eq!(
+        missing["data"]["entity"],
+        serde_json::Value::Null,
+        "non-null `name` missing → `entity` nullified"
+    );
+    assert_response_diagnostics(
+        &missing,
+        serde_json::json!([
+            {
+                "message": "Missing field",
+                "path": ["entity", "name"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]),
+        serde_json::json!([
+            { "message": "Cannot return null for non-nullable type String", "path": ["entity"] },
+        ]),
+    );
+
+    // Case B: `name` is explicitly NULL in the subgraph response.
+    // `format_value` recurses, `format_non_nullable_value` then notices
+    // the null. Its legacy dual-emission writes RVF to both sinks at
+    // the **leaf** path (the field name was pushed by the caller).
+    let null = run_with_entity(
+        &schema,
+        query,
+        serde_json::json!({ "id": "1", "name": null }),
+    )
+    .await;
+    assert_eq!(
+        null["data"]["entity"],
+        serde_json::Value::Null,
+        "null non-null `name` → `entity` nullified"
+    );
+    assert_response_diagnostics(
+        &null,
+        serde_json::json!([
+            {
+                "message": "Null value found for non-nullable type String",
+                "path": ["entity", "name"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]),
+        serde_json::json!([
+            { "message": "Null value found for non-nullable type String", "path": ["entity", "name"] },
+        ]),
+    );
+}
+
+/// A field with `@requires` is under `@include`, and shares its entity fetch with an unconditional
+/// sibling (FED-707). The required field is only fetched when the condition holds, so the
+/// `requires` inputs carry that condition, and the router must evaluate it when building the
+/// representations: the sibling must be fetched whether or not the condition holds.
+#[tokio::test]
+async fn conditional_requires_next_to_unconditional_sibling() {
+    // The required field is tested both as non-null and as nullable: when it is nullable and
+    // absent from the parent's response, the representation would be built with it set to `null`
+    // if the condition on the input were not evaluated. Both query planners are exercised.
+    for (incremental_planner, only_in_b_type) in [
+        (false, "Int!"),
+        (false, "Int"),
+        (true, "Int!"),
+        (true, "Int"),
+    ] {
+        let schema = supergraph_schema(&format!(
+            r#"
+            enum join__Graph {{
+                A @join__graph(name: "a", url: "http://localhost/a")
+                B @join__graph(name: "b", url: "http://localhost/b")
+            }}
+
+            type Query @join__type(graph: A) @join__type(graph: B) {{
+                start: T! @join__field(graph: B)
+            }}
+
+            type T @join__type(graph: A, key: "id") @join__type(graph: B, key: "id") {{
+                id: ID!
+                onlyInA: Int! @join__field(graph: A)
+                demanding: Int! @join__field(graph: A, requires: "onlyInB")
+                onlyInB: {only_in_b_type} @join__field(graph: A, external: true) @join__field(graph: B)
+            }}
+            "#
+        ));
+        let query =
+            "query Q($c: Boolean = false) { start { id onlyInA demanding @include(if: $c) } }";
+
+        // The mock subgraphs execute the actual subgraph operations against the data below, so
+        // the test does not depend on the exact text of the generated operations. The `_entities`
+        // mock matches a representation to the first entity having all of the representation's
+        // fields with the same values. So the two entities below let the response reveal what the
+        // representation sent to A contained:
+        // - `{ __typename id }` matches the first entity, so `demanding` would be `-1`;
+        // - `{ __typename id onlyInB }` cannot match the first entity (it has no `onlyInB`), so
+        //   `demanding` is `3`;
+        // - `{ __typename id onlyInB: null }` matches neither, which is an error.
+        let config = serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                "query_planning": {
+                    "incremental_planner": { "enabled": incremental_planner },
+                },
+            },
+            "experimental_mock_subgraphs": {
+                "b": {
+                    "query": {
+                        "start": { "__typename": "T", "id": "1", "onlyInB": 2 },
+                    },
+                },
+                "a": {
+                    "entities": [
+                        { "__typename": "T", "id": "1", "onlyInA": 1, "demanding": -1 },
+                        { "__typename": "T", "id": "1", "onlyInB": 2, "onlyInA": 1, "demanding": 3 },
+                    ],
+                },
+            },
+        });
+
+        async fn run(
+            config: &serde_json::Value,
+            schema: &str,
+            query: &str,
+            variables: serde_json_bytes::Map<serde_json_bytes::ByteString, serde_json_bytes::Value>,
+        ) -> (serde_json::Value, HashMap<String, u64>) {
+            let service = TestHarness::builder()
+                .configuration_json(config.clone())
+                .unwrap()
+                .schema(schema)
+                .build_supergraph()
+                .await
+                .unwrap();
+            let request = supergraph::Request::fake_builder()
+                .context(Context::new())
+                .query(query)
+                .variables(variables)
+                .build()
+                .unwrap();
+            let mut stream = service.oneshot(request).await.unwrap();
+            let response = stream.next_response().await.unwrap();
+            let subgraph_calls = stream
+                .context
+                .get("apollo::experimental_mock_subgraphs::subgraph_call_count")
+                .unwrap()
+                .unwrap_or_default();
+            (serde_json::to_value(&response).unwrap(), subgraph_calls)
+        }
+
+        // Condition false (through the variable's default value): `onlyInB` is not fetched from
+        // B, and must not be part of the representation sent to A, so that `onlyInA` is still
+        // fetched.
+        let (response, subgraph_calls) = run(&config, &schema, query, Default::default()).await;
+        assert_eq!(
+            response,
+            serde_json::json!({"data": {"start": {"id": "1", "onlyInA": 1}}}),
+            "incremental_planner: {incremental_planner}, onlyInB: {only_in_b_type}"
+        );
+        assert_eq!(
+            subgraph_calls,
+            HashMap::from([("b".into(), 1), ("a".into(), 1)])
+        );
+
+        // Condition true: `onlyInB` is fetched from B and is part of the representation sent to A.
+        let (response, subgraph_calls) = run(
+            &config,
+            &schema,
+            query,
+            json!({"c": true}).as_object().unwrap().clone(),
+        )
+        .await;
+        assert_eq!(
+            response,
+            serde_json::json!({"data": {"start": {"id": "1", "onlyInA": 1, "demanding": 3}}}),
+            "incremental_planner: {incremental_planner}, onlyInB: {only_in_b_type}"
+        );
+        assert_eq!(
+            subgraph_calls,
+            HashMap::from([("b".into(), 1), ("a".into(), 1)])
+        );
+    }
+}
+
+#[tokio::test]
+async fn conditional_key_and_requires_inputs_next_to_unconditional_hop() {
+    // Two fetches from B under different conditions merge into one ungated fetch, and one of them
+    // has a `@requires`. The hop to C selects `__typename` unconditionally, so a `@requires` input
+    // read regardless of the conditions would make `{ __typename name }`, a representation with
+    // no key, whenever both conditions are false. The representations sent to B are recorded to
+    // check that each one has its key, since the mock would match the keyless one by `name`.
+    let schema = supergraph_schema(
+        r#"
+        enum join__Graph {
+            A @join__graph(name: "a", url: "http://localhost/a")
+            B @join__graph(name: "b", url: "http://localhost/b")
+            C @join__graph(name: "c", url: "http://localhost/c")
+        }
+
+        type Query @join__type(graph: A) @join__type(graph: B) @join__type(graph: C) {
+            posts: [Post] @join__field(graph: A)
+        }
+
+        type Post @join__type(graph: A) {
+            author: User
+        }
+
+        type User @join__type(graph: A, key: "id") @join__type(graph: B, key: "id") @join__type(graph: C, key: "id") {
+            id: ID!
+            name: String @join__field(graph: A) @join__field(graph: B, external: true)
+            email: String @join__field(graph: B)
+            emailDomain: String @join__field(graph: B, requires: "name")
+            score: Int @join__field(graph: C)
+        }
+        "#,
+    );
+    let query = "query Q($x: Boolean!, $y: Boolean!) { posts { author { score ... @include(if: $x) { emailDomain } ... @include(if: $y) { email } } } }";
+
+    for incremental_planner in [false, true] {
+        let config = serde_json::json!({
+            "include_subgraph_errors": { "all": true },
+            "supergraph": {
+                "query_planning": {
+                    "incremental_planner": { "enabled": incremental_planner },
+                },
+            },
+            "experimental_mock_subgraphs": {
+                "a": {
+                    "query": {
+                        "posts": [
+                            { "author": { "__typename": "User", "id": "1", "name": "Ann" } },
+                        ],
+                    },
+                },
+                "b": {
+                    "entities": [
+                        { "__typename": "User", "id": "1", "name": "Ann", "email": "ann@x", "emailDomain": "x" },
+                    ],
+                },
+                "c": {
+                    "entities": [
+                        { "__typename": "User", "id": "1", "score": 3 },
+                    ],
+                },
+            },
+        });
+
+        for (x, y) in [(false, false), (true, false), (false, true), (true, true)] {
+            let representations_to_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = representations_to_b.clone();
+            let service = TestHarness::builder()
+                .configuration_json(config.clone())
+                .unwrap()
+                .schema(&schema)
+                .subgraph_hook(move |name, service| {
+                    let recorded = recorded.clone();
+                    let is_b = name == "b";
+                    service
+                        .map_request(move |request: subgraph::Request| {
+                            if is_b {
+                                let representations = request
+                                    .subgraph_request
+                                    .body()
+                                    .variables
+                                    .get("representations")
+                                    .and_then(|r| r.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                recorded.lock().unwrap().push(representations);
+                            }
+                            request
+                        })
+                        .boxed_clone()
+                })
+                .build_supergraph()
+                .await
+                .unwrap();
+            let request = supergraph::Request::fake_builder()
+                .context(Context::new())
+                .query(query)
+                .variables(json!({ "x": x, "y": y }).as_object().unwrap().clone())
+                .build()
+                .unwrap();
+            let response = service
+                .oneshot(request)
+                .await
+                .unwrap()
+                .next_response()
+                .await
+                .unwrap();
+
+            let mut author = serde_json::json!({ "score": 3 });
+            if x {
+                author["emailDomain"] = "x".into();
+            }
+            if y {
+                author["email"] = "ann@x".into();
+            }
+            let context = format!("incremental_planner: {incremental_planner}, x: {x}, y: {y}");
+            assert_eq!(
+                serde_json::to_value(&response).unwrap(),
+                serde_json::json!({ "data": { "posts": [{ "author": author }] } }),
+                "{context}"
+            );
+            let calls_to_b = representations_to_b.lock().unwrap().clone();
+            assert_eq!(calls_to_b.is_empty(), !x && !y, "{context}: {calls_to_b:?}");
+            for representation in calls_to_b.iter().flatten() {
+                assert!(
+                    representation.get("__typename").is_some()
+                        && representation.get("id").is_some(),
+                    "{context}: representation without its key: {representation:?}"
+                );
+            }
+        }
+    }
+}

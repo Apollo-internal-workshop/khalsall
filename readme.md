@@ -81,3 +81,26 @@ Join us in person and participate in **this** workshop by registering to attend 
 
 </div>
 
+
+## Tickets MCP server
+
+`tickets-schema.graphql` is a connector subgraph over the mock ticketing MCP server in `tickets-mcp/`.
+It uses connect/v0.5 (preview), as does `orders-schema.graphql`, so the router and the composition plugin have to be
+the builds that understand `@connect(mcp:)`. The router is vendored under `vendor/router`. The composition plugin comes from the Apollo-internal `mdg-private/fedutils-build-plugins`, so it is not committed (this repo is public): `install-local-builds.sh` clones it into the git-ignored `vendor/fedutils-build-plugins/` and needs access to that repo.
+
+**Composition is local.** GraphOS can't compose `mcp:` yet, so do not publish `tickets` to Studio. Regenerate the
+committed `supergraph.graphql` whenever a subgraph schema changes:
+
+```sh
+./install-local-builds.sh --no-build   # after the first build
+.rover/bin/rover supergraph compose --config supergraph-config.yaml --elv2-license accept --output supergraph.graphql
+```
+
+**Router image.** Built once and shared; deploys only reference `gcr.io/summit-enterprise-workshop/router-mcp:latest`.
+The supergraph and `router.yaml` are mounted from Secret Manager at deploy time. Rebuild only when `vendor/router` changes:
+
+```sh
+gcloud builds submit . --project summit-enterprise-workshop --config router/cloudbuild-mcp.yaml
+```
+
+**Deploy** with the `Deploy Tickets MCP + Router` workflow (Tickets service first, then the router).

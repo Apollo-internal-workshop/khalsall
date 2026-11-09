@@ -1,0 +1,638 @@
+//! Axum http server factory. Axum provides routing capability on top of Hyper HTTP.
+use std::fmt::Display;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::Extension;
+use axum::http::StatusCode;
+use axum::middleware;
+use axum::middleware::Next;
+use axum::response::*;
+use axum::routing::get;
+use futures::channel::oneshot;
+use futures::future::join_all;
+use futures::prelude::*;
+use http::HeaderValue;
+use http::Request;
+use http::header::ACCEPT_ENCODING;
+use http::header::CONTENT_ENCODING;
+use http_body::Body;
+use itertools::Itertools;
+use multimap::MultiMap;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::json;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+use tower::ServiceBuilder;
+use tower::ServiceExt;
+use tower_http::trace::TraceLayer;
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
+
+use super::ENDPOINT_CALLBACK;
+use super::ListenAddrAndRouter;
+use super::listeners::ListenersAndRouters;
+use super::listeners::endpoint_router;
+use super::listeners::ensure_endpoints_consistency;
+use super::listeners::ensure_listenaddrs_consistency;
+use super::listeners::extra_endpoints;
+use super::utils::ConnectionRouterService;
+use super::utils::PropagatingMakeSpan;
+use super::utils::connection_router_service;
+use crate::Context;
+use crate::axum_factory::Endpoint;
+use crate::axum_factory::compression::Compressor;
+use crate::axum_factory::listeners::get_extra_listeners;
+use crate::axum_factory::listeners::serve_router_on_listen_addr;
+use crate::configuration::Configuration;
+use crate::configuration::ListenAddr;
+use crate::graphql;
+use crate::http_server_factory::HttpServerFactory;
+use crate::http_server_factory::HttpServerHandle;
+use crate::http_server_factory::Listener;
+use crate::metrics::FutureMetricsExt;
+use crate::plugins::license_enforcement::layer::LicenseLayer;
+use crate::plugins::telemetry::config_new::router::instruments::ResponseBodySizeRecording;
+use crate::plugins::telemetry::config_new::router::instruments::ResponseBodySizeRecordingStream;
+use crate::router::ApolloRouterError;
+use crate::router_factory::RouterFactory;
+use crate::services::Plugins;
+use crate::services::router;
+use crate::uplink::license_enforcement::LicenseState;
+
+static BARE_WILDCARD_PATH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^/\{\*[^/]+\}$").expect("this regex to check wildcard paths is valid")
+});
+
+/// A basic http server using Axum.
+/// Uses streaming as primary method of response.
+#[derive(Debug, Default)]
+pub(crate) struct AxumHttpServerFactory {}
+
+impl AxumHttpServerFactory {
+    pub(crate) fn new() -> Self {
+        Self {}
+    }
+}
+
+pub(crate) fn make_axum_router(
+    configuration: &Configuration,
+    mut endpoints: MultiMap<ListenAddr, Endpoint>,
+    plugins: &Plugins,
+    license: Arc<LicenseState>,
+) -> Result<ListenersAndRouters, ApolloRouterError> {
+    ensure_listenaddrs_consistency(configuration, &endpoints)?;
+
+    ensure_endpoints_consistency(configuration, &endpoints)?;
+
+    let mut main_endpoint = main_endpoint(
+        configuration,
+        endpoints
+            .remove(&configuration.supergraph.listen)
+            .unwrap_or_default(),
+        plugins,
+        license,
+    )?;
+    let mut extra_endpoints = extra_endpoints(endpoints, plugins);
+
+    // put any extra endpoint that uses the main ListenAddr into the main router
+    if let Some(routers) = extra_endpoints.remove(&main_endpoint.0) {
+        main_endpoint.1 = routers
+            .into_iter()
+            .fold(main_endpoint.1, |acc, r| acc.merge(r));
+    }
+
+    Ok(ListenersAndRouters {
+        main: main_endpoint,
+        extra: extra_endpoints,
+    })
+}
+
+impl HttpServerFactory for AxumHttpServerFactory {
+    type Future = Pin<Box<dyn Future<Output = Result<HttpServerHandle, ApolloRouterError>> + Send>>;
+
+    fn create<RF>(
+        &self,
+        service_factory: RF,
+        configuration: Arc<Configuration>,
+        mut main_listener: Option<Listener>,
+        previous_listeners: Vec<(ListenAddr, Listener)>,
+        extra_endpoints: MultiMap<ListenAddr, Endpoint>,
+        license: Arc<LicenseState>,
+        all_connections_stopped_sender: mpsc::Sender<()>,
+    ) -> Self::Future
+    where
+        RF: RouterFactory,
+    {
+        Box::pin(async move {
+            let pipeline_handle = service_factory.pipeline_handle();
+            // Built once per reload; connections clone it cheaply.
+            let router_service = connection_router_service(service_factory.create());
+            let all_routers = make_axum_router(
+                &configuration,
+                extra_endpoints,
+                &service_factory.plugins(),
+                license,
+            )?;
+
+            // serve main router
+
+            // if we received a TCP listener, reuse it, otherwise create a new one
+            let main_listener = match all_routers.main.0.clone() {
+                ListenAddr::SocketAddr(addr) => {
+                    let tls_config = configuration
+                        .tls
+                        .supergraph
+                        .as_ref()
+                        .map(|tls| tls.tls_config())
+                        .transpose()?;
+                    let tls_acceptor = tls_config.clone().map(TlsAcceptor::from);
+
+                    match main_listener.take() {
+                        Some(Listener::Tcp(listener)) => {
+                            if listener.local_addr().ok() == Some(addr) {
+                                Listener::new_from_listener(listener, tls_acceptor)
+                            } else {
+                                Listener::new_from_socket_addr(addr, tls_acceptor).await?
+                            }
+                        }
+                        Some(Listener::Tls { listener, .. }) => {
+                            if listener.local_addr().ok() == Some(addr) {
+                                Listener::new_from_listener(listener, tls_acceptor)
+                            } else {
+                                Listener::new_from_socket_addr(addr, tls_acceptor).await?
+                            }
+                        }
+                        _ => Listener::new_from_socket_addr(addr, tls_acceptor).await?,
+                    }
+                }
+                #[cfg(unix)]
+                ListenAddr::UnixSocket(path) => {
+                    match main_listener.take().and_then(|listener| {
+                        listener.local_addr().ok().and_then(|l| {
+                            if l == ListenAddr::UnixSocket(path.clone()) {
+                                Some(listener)
+                            } else {
+                                None
+                            }
+                        })
+                    }) {
+                        Some(listener) => listener,
+                        None => Listener::Unix(
+                            UnixListener::bind(path)
+                                .map_err(ApolloRouterError::ServerCreationError)?,
+                        ),
+                    }
+                }
+            };
+            let actual_main_listen_address = main_listener
+                .local_addr()
+                .map_err(ApolloRouterError::ServerCreationError)?;
+
+            let (main_server, main_shutdown_sender) = serve_router_on_listen_addr(
+                all_routers.main.1,
+                pipeline_handle.clone(),
+                Some(router_service),
+                actual_main_listen_address.clone(),
+                main_listener,
+                configuration.clone(),
+                all_connections_stopped_sender.clone(),
+            );
+
+            tracing::info!(
+                "GraphQL endpoint exposed at {}{} 🚀",
+                actual_main_listen_address,
+                configuration.supergraph.path
+            );
+
+            // serve extra routers
+
+            let listeners_and_routers =
+                get_extra_listeners(previous_listeners, all_routers.extra).await?;
+
+            let actual_extra_listen_adresses = listeners_and_routers
+                .iter()
+                .map(|((_, l), _)| l.local_addr().expect("checked above"))
+                .collect::<Vec<_>>();
+
+            // TODO: It would be great if we could tracing::debug!()
+            // all listen addrs *and* paths we have an endpoint on.
+            // I can only do it for listen addrs yet, but hey that's a good start
+            if !listeners_and_routers.is_empty() {
+                let tracing_endpoints = listeners_and_routers
+                    .iter()
+                    .map(|((_, l), _)| format!("{}", l.local_addr().expect("checked above")))
+                    .join(", ");
+                tracing::debug!(%tracing_endpoints, "extra endpoints the router listens to");
+            }
+
+            let servers_and_shutdowns =
+                listeners_and_routers
+                    .into_iter()
+                    .map(|((listen_addr, listener), router)| {
+                        let (server, shutdown_sender) = serve_router_on_listen_addr(
+                            router,
+                            pipeline_handle.clone(),
+                            // Extra listeners (health check, metrics, ...) never serve
+                            // GraphQL requests, so they have no need for a router service.
+                            None,
+                            listen_addr.clone(),
+                            listener,
+                            configuration.clone(),
+                            all_connections_stopped_sender.clone(),
+                        );
+                        (
+                            server.map(|listener| (listen_addr, listener)),
+                            shutdown_sender,
+                        )
+                    });
+
+            let (servers, shutdowns): (Vec<_>, Vec<_>) = servers_and_shutdowns.unzip();
+
+            // graceful shutdown mechanism:
+            // create two shutdown channels. One for the main (GraphQL) server and the other for
+            // the extra servers (health, metrics, etc...)
+            // We spawn a task for each server which just waits to propagate the message to:
+            //  - main
+            //  - all extras
+            // We have two separate channels because we want to ensure that main is notified
+            // separately from all other servers and we wait for main to shutdown before we notify
+            // extra servers.
+            let (outer_main_shutdown_sender, outer_main_shutdown_receiver) =
+                oneshot::channel::<()>();
+            tokio::task::spawn(async move {
+                let _ = outer_main_shutdown_receiver.await;
+                if let Err(_err) = main_shutdown_sender.send(()) {
+                    tracing::error!("Failed to notify http thread of shutdown");
+                }
+            });
+
+            let (outer_extra_shutdown_sender, outer_extra_shutdown_receiver) =
+                oneshot::channel::<()>();
+            tokio::task::spawn(async move {
+                let _ = outer_extra_shutdown_receiver.await;
+                shutdowns.into_iter().for_each(|sender| {
+                    if let Err(_err) = sender.send(()) {
+                        tracing::error!("Failed to notify http thread of shutdown")
+                    };
+                })
+            });
+
+            // Spawn the main (GraphQL) server into a task
+            let main_future = tokio::task::spawn(main_server.with_current_meter_provider())
+                .map_err(|_| ApolloRouterError::HttpServerLifecycleError)
+                .boxed();
+
+            // Spawn all other servers (health, metrics, etc...) into a task
+            let extra_futures = tokio::task::spawn(join_all(servers).with_current_meter_provider())
+                .map_err(|_| ApolloRouterError::HttpServerLifecycleError)
+                .boxed();
+
+            Ok(HttpServerHandle::new(
+                outer_main_shutdown_sender,
+                outer_extra_shutdown_sender,
+                main_future,
+                extra_futures,
+                Some(actual_main_listen_address),
+                actual_extra_listen_adresses,
+                all_connections_stopped_sender,
+            ))
+        })
+    }
+}
+
+fn main_endpoint(
+    configuration: &Configuration,
+    endpoints_on_main_listener: Vec<Endpoint>,
+    plugins: &Plugins,
+    license: Arc<LicenseState>,
+) -> Result<ListenAddrAndRouter, ApolloRouterError> {
+    let cors = configuration.cors.clone().into_layer().map_err(|e| {
+        ApolloRouterError::ServiceCreationError(format!("CORS configuration error: {e}").into())
+    })?;
+    // XXX(@goto-bus-stop): in hyper 0.x, we required a HandleErrorLayer around this,
+    // to turn errors from decompression into an axum error response. Now,
+    // `RequestDecompressionLayer` appears to preserve(?) the error type from the inner service?
+    // So maybe we don't need this anymore? But I don't understand what happens to an error *caused
+    // by decompression* (such as an invalid compressed data stream).
+    let decompression = tower_http::decompression::RequestDecompressionLayer::new()
+        .br(true)
+        .gzip(true)
+        .deflate(true);
+
+    let mut main_route = main_router(configuration).layer(
+        ServiceBuilder::new()
+            // Telemetry layers MUST be first. This means that they will be hit first during execution of the pipeline
+            // Adding layers before telemetry will cause us to lose metrics and spans.
+            .layer(middleware::from_fn(metrics_handler))
+            .layer(
+                TraceLayer::new_for_http().make_span_with(PropagatingMakeSpan {
+                    license: license.clone(),
+                }),
+            )
+            // CORS layer must be before any layer that can short-circuit with an error response, else
+            // browser clients will not be able to view the error response body.
+            .layer(cors)
+            .layer(LicenseLayer::new(license))
+            .layer(decompression),
+    );
+
+    if let Some(main_endpoint_layer) = ENDPOINT_CALLBACK.get() {
+        main_route = main_endpoint_layer(main_route);
+    }
+
+    let route = endpoints_on_main_listener
+        .into_iter()
+        .fold(main_route, |acc, r| acc.merge(endpoint_router(r, plugins)));
+
+    let listener = configuration.supergraph.listen.clone();
+    Ok(ListenAddrAndRouter(listener, route))
+}
+
+async fn metrics_handler(request: Request<axum::body::Body>, next: Next) -> Response {
+    let resp = next.run(request).await;
+    u64_counter!(
+        "apollo.router.operations",
+        "The number of graphql operations performed by the Router",
+        1,
+        "http.response.status_code" = resp.status().as_u16() as i64
+    );
+    resp
+}
+
+#[derive(Clone)]
+struct HandlerOptions {
+    early_cancel: bool,
+    log_on_broken_pipe: bool,
+}
+
+pub(super) fn main_router(configuration: &Configuration) -> axum::Router<()> {
+    let mut router = Router::new().route(
+        &configuration.supergraph.sanitized_path(),
+        get(handle_graphql).post(handle_graphql),
+    );
+
+    if BARE_WILDCARD_PATH_REGEX.is_match(configuration.supergraph.path.as_str()) {
+        router = router.route("/", get(handle_graphql).post(handle_graphql));
+    }
+
+    router = router.route_layer(Extension(HandlerOptions {
+        early_cancel: configuration.supergraph.early_cancel,
+        log_on_broken_pipe: configuration.supergraph.log_on_broken_pipe,
+    }));
+    #[cfg(all(feature = "global-allocator", not(feature = "dhat-heap"), unix))]
+    {
+        router =
+            router.layer(crate::services::layers::jemalloc_metrics::JemallocMetricsLayer::new());
+    }
+
+    router
+}
+
+async fn handle_graphql(
+    Extension(options): Extension<HandlerOptions>,
+    Extension(service): Extension<ConnectionRouterService>,
+    http_request: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let HandlerOptions {
+        early_cancel,
+        log_on_broken_pipe,
+    } = options;
+    let request: router::Request = http_request.into();
+    let context = request.context.clone();
+    let accept_encoding = request
+        .router_request
+        .headers()
+        .get(ACCEPT_ENCODING)
+        .cloned();
+
+    let res = if early_cancel {
+        service.oneshot(request).await
+    } else {
+        // to make sure we can record request handling when the client closes the connection prematurely,
+        // we execute the request in a separate task that will run until we get the first response, which
+        // means it went through the entire pipeline at least once (not looking at deferred responses or
+        // subscription events). This is a bit wasteful, so to avoid unneeded subgraph calls, we insert in
+        // the context a flag to indicate that the request is canceled and subgraph calls should not be made
+        let mut cancel_handler = CancelHandler::new(&context, log_on_broken_pipe);
+        let task = service
+            .oneshot(request)
+            .with_current_subscriber()
+            .in_current_span();
+        let res = match tokio::task::spawn(task).await {
+            Ok(res) => res,
+            Err(err) => return internal_server_error(err),
+        };
+        cancel_handler.on_response();
+        res
+    };
+
+    match res {
+        Err(err) => internal_server_error(err),
+        Ok(response) => {
+            let (mut parts, body) = response.response.into_parts();
+
+            let opt_compressor = accept_encoding
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|v| Compressor::new(v.split(',').map(|s| s.trim())));
+
+            let response_body_size_recording = context
+                .extensions()
+                .with_lock(|lock| lock.remove::<ResponseBodySizeRecording>());
+
+            let body = match opt_compressor {
+                None => {
+                    if let Some(recording) = response_body_size_recording
+                        && let Some(size) = body.size_hint().exact()
+                    {
+                        recording.record_byte_count(size);
+                    }
+
+                    body
+                }
+                Some(compressor) => {
+                    parts.headers.insert(
+                        CONTENT_ENCODING,
+                        HeaderValue::from_static(compressor.content_encoding()),
+                    );
+
+                    let stream = compressor.process(body);
+                    match response_body_size_recording {
+                        Some(recording) => router::body::from_result_stream(
+                            ResponseBodySizeRecordingStream::new(stream, recording),
+                        ),
+                        None => router::body::from_result_stream(stream),
+                    }
+                }
+            };
+
+            http::Response::from_parts(parts, body).into_response()
+        }
+    }
+}
+
+fn internal_server_error<T>(err: T) -> Response
+where
+    T: Display,
+{
+    tracing::error!(
+        code = "INTERNAL_SERVER_ERROR",
+        %err,
+    );
+
+    // This intentionally doesn't include an error message as this could represent leakage of internal information.
+    // The error message is logged above.
+    let error = graphql::Error::builder()
+        .message("internal server error")
+        .extension_code("INTERNAL_SERVER_ERROR")
+        .build();
+
+    let response = graphql::Response::builder().error(error).build();
+
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!(response))).into_response()
+}
+
+struct CancelHandler<'a> {
+    context: &'a Context,
+    got_first_response: bool,
+    log_on_broken_pipe: bool,
+    span: tracing::Span,
+}
+
+impl<'a> CancelHandler<'a> {
+    fn new(context: &'a Context, log_on_broken_pipe: bool) -> Self {
+        CancelHandler {
+            context,
+            got_first_response: false,
+            log_on_broken_pipe,
+            span: tracing::Span::current(),
+        }
+    }
+
+    fn on_response(&mut self) {
+        self.got_first_response = true;
+    }
+}
+
+impl Drop for CancelHandler<'_> {
+    fn drop(&mut self) {
+        if !self.got_first_response {
+            if self.log_on_broken_pipe {
+                self.span
+                    .in_scope(|| tracing::error!("broken pipe: the client closed the connection"));
+            }
+            self.context
+                .extensions()
+                .with_lock(|lock| lock.insert(CanceledRequest));
+        }
+    }
+}
+
+pub(crate) struct CanceledRequest;
+
+#[cfg(test)]
+mod tests {
+    use http::header::ACCEPT;
+    use http::header::CONTENT_TYPE;
+    use tower::Service;
+
+    use super::*;
+    use crate::assert_snapshot_subscriber;
+
+    // Drive the http router call into its cancellation-handling path (where `CancelHandler`
+    // is constructed) and then deterministically cancel it before completion. With
+    // `log_on_broken_pipe = true`, dropping `CancelHandler` without an
+    // intervening `on_response` is what emits the "broken pipe" error log asserted on below.
+    //
+    // Historical note: this used to race a `Duration::from_nanos(100)` timeout against the
+    // call. Whether the future was polled even once before the timeout fired was a function
+    // of scheduler timing, not test logic, so the assertion was inherently flaky. See
+    // `flaky-test-fixes.md` (nanosecond-timeout-race anti-pattern).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_cancel_log() {
+        let mut http_router = crate::TestHarness::builder()
+            .configuration_yaml(include_str!("testdata/log_on_broken_pipe.router.yaml"))
+            .expect("invalid configuration")
+            .schema(include_str!("../testdata/supergraph.graphql"))
+            .build_http_service()
+            .await
+            .unwrap();
+
+        async {
+            cancel_after_first_poll(&mut http_router).await;
+        }
+        .with_subscriber(assert_snapshot_subscriber!(
+            tracing_core::LevelFilter::ERROR
+        ))
+        .await
+    }
+
+    // Same shape as `request_cancel_log`, but with `log_on_broken_pipe = false`,
+    // so the snapshot asserts that no error log is emitted on cancellation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_cancel_no_log() {
+        let mut http_router = crate::TestHarness::builder()
+            .configuration_yaml(include_str!("testdata/no_log_on_broken_pipe.router.yaml"))
+            .expect("invalid configuration")
+            .schema(include_str!("../testdata/supergraph.graphql"))
+            .build_http_service()
+            .await
+            .unwrap();
+
+        async {
+            cancel_after_first_poll(&mut http_router).await;
+        }
+        .with_subscriber(assert_snapshot_subscriber!(
+            tracing_core::LevelFilter::ERROR
+        ))
+        .await
+    }
+
+    // Drive `http_router.call(...)` to its first `Pending` (which is what constructs the
+    // request's `CancelHandler` inside the production code path) and then drop the future to
+    // cancel it. Using `futures::poll!` instead of a `tokio::time::timeout` race makes
+    // "polled then cancelled" deterministic regardless of scheduler timing.
+    //
+    // The phase doc sketched a `tokio::sync::oneshot` + `tokio::select!` cancellation, which
+    // is the same shape any caller would use to cancel a real request; this helper is the
+    // synchronous-equivalent collapsed into a test-only single-task form because we don't
+    // need to `tokio::spawn` to observe cancellation here.
+    async fn cancel_after_first_poll(http_router: &mut crate::test_harness::HttpService) {
+        use std::task::Poll;
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/json")
+            .body(router::body::from_bytes(
+                r#"{"query":"query { me { name }}"}"#,
+            ))
+            .unwrap();
+
+        // `HttpService::call` already returns a `Pin<Box<dyn Future + Send>>`, so we can
+        // poll it via `.as_mut()` and explicitly drop it without `tokio::pin!` (which would
+        // shadow the binding with a `Pin<&mut _>` and make the subsequent `drop` a no-op
+        // on the underlying boxed future).
+        let mut call_fut = http_router.call(request);
+
+        // First poll drives the router synchronously through `CancelHandler::new` into the
+        // inner `tokio::task::spawn(task).await`, which returns `Pending`. After this point
+        // dropping the future will run `CancelHandler::Drop` with
+        // `got_first_response == false`.
+        let first = futures::poll!(call_fut.as_mut());
+        assert!(
+            matches!(first, Poll::Pending),
+            "expected first poll of the router call to be Pending so the request enters \
+             the cancellation-handling path; got {:?}",
+            first
+        );
+
+        drop(call_fut);
+    }
+}

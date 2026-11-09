@@ -1,0 +1,3046 @@
+use apollo_federation::query_plan::FetchDataRewrite;
+
+use crate::query_plan::build_query_plan_support::find_fetch_nodes_for_subgraph;
+
+mod include_skip;
+
+#[test]
+fn handles_simple_requires() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+
+          type T @key(fields: "id") {
+            id: ID!
+            a: Int
+          }
+        "#,
+        Subgraph2: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            a: Int @external
+            b: Int @requires(fields: "a")
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              b
+            }
+          }
+        "#,
+
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                  a
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                    a
+                  }
+                } =>
+                {
+                  ... on T {
+                    b
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_handles_multiple_requires_within_the_same_entity_fetch() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            is: [I!]!
+          }
+  
+          interface I {
+            id: ID!
+            f: Int
+            g: Int
+          }
+  
+          type T1 implements I {
+            id: ID!
+            f: Int
+            g: Int
+          }
+  
+          type T2 implements I @key(fields: "id") {
+            id: ID!
+            f: Int!
+            g: Int @external
+          }
+  
+          type T3 implements I @key(fields: "id") {
+            id: ID!
+            f: Int
+            g: Int @external
+          }
+        "#,
+        Subgraph2: r#"
+          type T2 @key(fields: "id") {
+            id: ID!
+            f: Int! @external
+            g: Int @requires(fields: "f")
+          }
+  
+          type T3 @key(fields: "id") {
+            id: ID!
+            f: Int @external
+            g: Int @requires(fields: "f")
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            is {
+              g
+            }
+          }
+        "#,
+
+
+      // The main goal of this test is to show that the 2 @requires for `f` gets handled seamlessly
+      // into the same fetch group. But note that because the type for `f` differs, the 2nd instance
+      // gets aliased (or the fetch would be invalid graphQL).
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                is {
+                  __typename
+                  ... on T1 {
+                    g
+                  }
+                  ... on T2 {
+                    __typename
+                    id
+                    f
+                  }
+                  ... on T3 {
+                    __typename
+                    id
+                    f__alias_0: f
+                  }
+                }
+              }
+            },
+            Flatten(path: "is.@") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T2 {
+                    __typename
+                    id
+                    f
+                  }
+                  ... on T3 {
+                    __typename
+                    id
+                    f
+                  }
+                } =>
+                {
+                  ... on T2 {
+                    g
+                  }
+                  ... on T3 {
+                    g
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_aliases_conflicting_requires_nested_under_an_aliased_field() {
+    // `o` has different types in `T2` and `T3`, so one occurrence is aliased in the Subgraph1
+    // fetch. Inside both `o` selections, `x` also has different types in `A` and `B`, so it
+    // needs an alias too, including under the aliased `o`.
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            is: [I!]!
+          }
+
+          interface I {
+            id: ID!
+            o: P
+            g: Int
+            h: Int
+          }
+
+          type T1 implements I {
+            id: ID!
+            o: P
+            g: Int
+            h: Int
+          }
+
+          type T2 implements I @key(fields: "id") {
+            id: ID!
+            o: P!
+            g: Int @external
+            h: Int @external
+          }
+
+          type T3 implements I @key(fields: "id") {
+            id: ID!
+            o: P
+            g: Int @external
+            h: Int @external
+          }
+
+          type P {
+            u: [U!]!
+          }
+
+          union U = A | B
+
+          type A {
+            x: Int!
+          }
+
+          type B {
+            x: Int
+          }
+        "#,
+        Subgraph2: r#"
+          type T2 @key(fields: "id") {
+            id: ID!
+            o: P! @external
+            g: Int @requires(fields: "o { u { ... on A { x } } }")
+            h: Int @requires(fields: "o { u { ... on B { x } } }")
+          }
+
+          type T3 @key(fields: "id") {
+            id: ID!
+            o: P @external
+            g: Int @requires(fields: "o { u { ... on A { x } } }")
+            h: Int @requires(fields: "o { u { ... on B { x } } }")
+          }
+
+          type P {
+            u: [U!]! @external
+          }
+
+          union U = A | B
+
+          type A {
+            x: Int! @external
+          }
+
+          type B {
+            x: Int @external
+          }
+        "#,
+    );
+    let plan = assert_plan!(
+        &planner,
+        r#"
+          {
+            is {
+              g
+              h
+            }
+          }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "Subgraph1") {
+          {
+            is {
+              __typename
+              ... on T1 {
+                g
+                h
+              }
+              ... on T2 {
+                __typename
+                id
+                o {
+                  u {
+                    __typename
+                    ... on B {
+                      x
+                    }
+                    ... on A {
+                      x__alias_0: x
+                    }
+                  }
+                }
+              }
+              ... on T3 {
+                __typename
+                id
+                o__alias_0: o {
+                  u {
+                    __typename
+                    ... on B {
+                      x
+                    }
+                    ... on A {
+                      x__alias_0: x
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        Flatten(path: "is.@") {
+          Fetch(service: "Subgraph2") {
+            {
+              ... on T2 {
+                __typename
+                id
+                o {
+                  u {
+                    ... on B {
+                      x
+                    }
+                    ... on A {
+                      x
+                    }
+                  }
+                }
+              }
+              ... on T3 {
+                __typename
+                id
+                o {
+                  u {
+                    ... on B {
+                      x
+                    }
+                    ... on A {
+                      x
+                    }
+                  }
+                }
+              }
+            } =>
+            {
+              ... on T2 {
+                g
+                h
+              }
+              ... on T3 {
+                g
+                h
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+    let fetch_nodes = find_fetch_nodes_for_subgraph("Subgraph1", &plan);
+    assert_eq!(fetch_nodes.len(), 1);
+    let renames = fetch_nodes[0]
+        .output_rewrites
+        .iter()
+        .map(|rewrite| match rewrite.as_ref() {
+            FetchDataRewrite::KeyRenamer(renamer) => format!(
+                "{} -> {}",
+                renamer
+                    .path
+                    .iter()
+                    .map(|element| element.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                renamer.rename_key_to
+            ),
+            other => panic!("unexpected rewrite {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    // `o` is renamed back first, so the nested renames are keyed under `o`, not `o__alias_0`.
+    assert_eq!(
+        renames,
+        [
+            "is/... on T3/o__alias_0 -> o",
+            "is/... on T2/o/u/... on A/x__alias_0 -> x",
+            "is/... on T3/o/u/... on A/x__alias_0 -> x",
+        ]
+    );
+}
+
+#[test]
+fn handles_multiple_requires_involving_different_nestedness() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            list: [Item]
+          }
+  
+          type Item @key(fields: "user { id }") {
+            id: ID!
+            value: String
+            user: User
+          }
+  
+          type User @key(fields: "id") {
+            id: ID!
+            value: String
+          }
+        "#,
+        Subgraph2: r#"
+          type Item @key(fields: "user { id }") {
+            user: User
+            value: String @external
+            computed: String @requires(fields: "user { value } value")
+            computed2: String @requires(fields: "user { value }")
+          }
+  
+          type User @key(fields: "id") {
+            id: ID!
+            value: String @external
+            computed: String @requires(fields: "value")
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            list {
+              computed
+              computed2
+              user {
+                computed
+              }
+            }
+          }
+        "#,
+
+
+      // The main goal of this test is to show that the 2 @requires for `f` gets handled seamlessly
+      // into the same fetch group.
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                list {
+                  __typename
+                  user {
+                    __typename
+                    id
+                    value
+                  }
+                  value
+                }
+              }
+            },
+            Parallel {
+              Flatten(path: "list.@.user") {
+                Fetch(service: "Subgraph2") {
+                  {
+                    ... on User {
+                      __typename
+                      id
+                      value
+                    }
+                  } =>
+                  {
+                    ... on User {
+                      computed
+                    }
+                  }
+                },
+              },
+              Flatten(path: "list.@") {
+                Fetch(service: "Subgraph2") {
+                  {
+                    ... on Item {
+                      __typename
+                      user {
+                        id
+                        value
+                      }
+                      value
+                    }
+                  } =>
+                  {
+                    ... on Item {
+                      computed
+                      computed2
+                    }
+                  }
+                },
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+/// require that depends on another require
+#[test]
+fn it_handles_simple_require_chain() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id") {
+            id: ID!
+            v: Int!
+          }
+        "#,
+        Subgraph2: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            v: Int! @external
+            inner: Int! @requires(fields: "v")
+          }
+        "#,
+        Subgraph3: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner: Int! @external
+            outer: Int! @requires(fields: "inner")
+          }
+        "#
+    );
+    // Ensures that if we only ask `outer`, we get everything needed in between.
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              outer
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                  v
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    v
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    inner
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph3") {
+                {
+                  ... on T {
+                    __typename
+                    inner
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    outer
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+
+    // Ensures that manually asking for the required dependencies doesn't change anything
+    // (note: technically it happens to switch the order of fields in the inputs of "Subgraph2"
+    // so the plans are not 100% the same "string", which is why we inline it in both cases,
+    // but that's still the same plan and a perfectly valid output).
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              v
+              inner
+              outer
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                  v
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                    v
+                  }
+                } =>
+                {
+                  ... on T {
+                    inner
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph3") {
+                {
+                  ... on T {
+                    __typename
+                    inner
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    outer
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_handles_require_chain_not_ending_in_original_group() {
+    // This is somewhat similar to the 'simple require chain' case, but the chain does not
+    // end in the group in which the query start
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id") {
+            id: ID!
+          }
+        "#,
+        Subgraph2: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            v: Int! @external
+            inner: Int! @requires(fields: "v")
+          }
+        "#,
+        Subgraph3: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner: Int! @external
+            outer: Int! @requires(fields: "inner")
+          }
+        "#,
+        Subgraph4: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            v: Int!
+          }
+        "#,
+    );
+    // Ensures that if we only ask `outer`, we get everything needed in between.
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              outer
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph4") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    v
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    inner
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph3") {
+                {
+                  ... on T {
+                    __typename
+                    inner
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    outer
+                  }
+                }
+              },
+            },
+          },
+        }
+        "###
+    );
+
+    // Ensures that manually asking for the required dependencies doesn't change anything.
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              v
+              inner
+              outer
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph4") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    v
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    inner
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph3") {
+                {
+                  ... on T {
+                    __typename
+                    inner
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    outer
+                  }
+                }
+              },
+            },
+          },
+        }
+        "###
+    );
+}
+
+/// a chain of 10 requires
+#[test]
+fn it_handles_longer_require_chain() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id") {
+            id: ID!
+            v1: Int!
+          }
+        "#,
+        Subgraph2: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v1: Int! @external
+                v2: Int! @requires(fields: "v1")
+            }
+        "#,
+        Subgraph3: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v2: Int! @external
+                v3: Int! @requires(fields: "v2")
+            }
+        "#,
+        Subgraph4: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v3: Int! @external
+                v4: Int! @requires(fields: "v3")
+            }
+        "#,
+        Subgraph5: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v4: Int! @external
+                v5: Int! @requires(fields: "v4")
+            }
+        "#,
+        Subgraph6: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v5: Int! @external
+                v6: Int! @requires(fields: "v5")
+            }
+        "#,
+        Subgraph7: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v6: Int! @external
+                v7: Int! @requires(fields: "v6")
+            }
+        "#,
+        Subgraph8: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v7: Int! @external
+                v8: Int! @requires(fields: "v7")
+            }
+        "#,
+        Subgraph9: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v8: Int! @external
+                v9: Int! @requires(fields: "v8")
+            }
+        "#,
+        Subgraph10: r#"
+            type T @key(fields: "id") {
+                id: ID!
+                v9: Int! @external
+                v10: Int! @requires(fields: "v9")
+            }
+        "#,
+    );
+    // Ensures that if we only ask `outer`, we get everything needed in between.
+    assert_plan!(
+        &planner,
+        r#"
+        {
+          t {
+            v10
+          }
+        }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                  v1
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    v1
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v2
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph3") {
+                {
+                  ... on T {
+                    __typename
+                    v2
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v3
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph4") {
+                {
+                  ... on T {
+                    __typename
+                    v3
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v4
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph5") {
+                {
+                  ... on T {
+                    __typename
+                    v4
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v5
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph6") {
+                {
+                  ... on T {
+                    __typename
+                    v5
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v6
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph7") {
+                {
+                  ... on T {
+                    __typename
+                    v6
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v7
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph8") {
+                {
+                  ... on T {
+                    __typename
+                    v7
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v8
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph9") {
+                {
+                  ... on T {
+                    __typename
+                    v8
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v9
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph10") {
+                {
+                  ... on T {
+                    __typename
+                    v9
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v10
+                  }
+                }
+              },
+            },
+          },
+        }
+        "###
+    );
+}
+
+#[test]
+fn it_handles_complex_require_chain() {
+    // Another "require chain" test but with more complexity as we have a require on multiple fields, some of which being
+    // nested, and having requirements of their own.
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id") {
+            id: ID!
+          }
+        "#,
+        Subgraph2: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner1: Int!
+            inner2_required: Int!
+          }
+        "#,
+        Subgraph3: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner2_required: Int! @external
+            inner2: Int! @requires(fields: "inner2_required")
+          }
+        "#,
+        Subgraph4: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner3: Inner3Type!
+          }
+  
+          type Inner3Type @key(fields: "k3") {
+            k3: ID!
+          }
+  
+          type Inner4Type @key(fields: "k4") {
+            k4: ID!
+            inner4_required: Int!
+          }
+        "#,
+        Subgraph5: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner1: Int! @external
+            inner2: Int! @external
+            inner3: Inner3Type! @external
+            inner4: Inner4Type! @external
+            inner5: Int! @external
+            outer: Int!
+              @requires(
+                fields: "inner1 inner2 inner3 { inner3_nested } inner4 { inner4_nested } inner5"
+              )
+          }
+  
+          type Inner3Type @key(fields: "k3") {
+            k3: ID!
+            inner3_nested: Int!
+          }
+  
+          type Inner4Type @key(fields: "k4") {
+            k4: ID!
+            inner4_nested: Int! @requires(fields: "inner4_required")
+            inner4_required: Int! @external
+          }
+        "#,
+        Subgraph6: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner4: Inner4Type!
+          }
+  
+          type Inner4Type @key(fields: "k4") {
+            k4: ID!
+          }
+        "#,
+        Subgraph7: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            inner5: Int!
+          }
+        "#
+    );
+
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              outer
+            }
+          }
+        "#,
+
+
+      // This is a big plan, but afaict, this is optimal. That is, there is 3 main steps:
+      // 1. it get the `id` for `T`, which is needed for anything else.
+      // 2. it gets all the dependencies of for the @require on `outer` in parallel
+      // 3. it finally get `outer`, passing all requirements as inputs.
+      //
+      // The 2nd step is the most involved, but it's just gathering the "outer" requirements in parallel,
+      // while satisfying the "inner" requirements in each branch.
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                }
+              }
+            },
+            Parallel {
+              Flatten(path: "t") {
+                Fetch(service: "Subgraph7") {
+                  {
+                    ... on T {
+                      __typename
+                      id
+                    }
+                  } =>
+                  {
+                    ... on T {
+                      inner5
+                    }
+                  }
+                },
+              },
+              Sequence {
+                Flatten(path: "t") {
+                  Fetch(service: "Subgraph6") {
+                    {
+                      ... on T {
+                        __typename
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        inner4 {
+                          __typename
+                          k4
+                        }
+                      }
+                    }
+                  },
+                },
+                Flatten(path: "t.inner4") {
+                  Fetch(service: "Subgraph4") {
+                    {
+                      ... on Inner4Type {
+                        __typename
+                        k4
+                      }
+                    } =>
+                    {
+                      ... on Inner4Type {
+                        inner4_required
+                      }
+                    }
+                  },
+                },
+                Flatten(path: "t.inner4") {
+                  Fetch(service: "Subgraph5") {
+                    {
+                      ... on Inner4Type {
+                        __typename
+                        inner4_required
+                        k4
+                      }
+                    } =>
+                    {
+                      ... on Inner4Type {
+                        inner4_nested
+                      }
+                    }
+                  },
+                },
+              },
+              Sequence {
+                Flatten(path: "t") {
+                  Fetch(service: "Subgraph4") {
+                    {
+                      ... on T {
+                        __typename
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        inner3 {
+                          __typename
+                          k3
+                        }
+                      }
+                    }
+                  },
+                },
+                Flatten(path: "t.inner3") {
+                  Fetch(service: "Subgraph5") {
+                    {
+                      ... on Inner3Type {
+                        __typename
+                        k3
+                      }
+                    } =>
+                    {
+                      ... on Inner3Type {
+                        inner3_nested
+                      }
+                    }
+                  },
+                },
+              },
+              Sequence {
+                Flatten(path: "t") {
+                  Fetch(service: "Subgraph2") {
+                    {
+                      ... on T {
+                        __typename
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        inner2_required
+                        inner1
+                      }
+                    }
+                  },
+                },
+                Flatten(path: "t") {
+                  Fetch(service: "Subgraph3") {
+                    {
+                      ... on T {
+                        __typename
+                        inner2_required
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        inner2
+                      }
+                    }
+                  },
+                },
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph5") {
+                {
+                  ... on T {
+                    __typename
+                    inner1
+                    inner2
+                    inner3 {
+                      inner3_nested
+                    }
+                    inner4 {
+                      inner4_nested
+                    }
+                    inner5
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    outer
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_handes_diamond_shape_depedencies() {
+    // The idea of this test is that to be able to fulfill the @require in subgraph D, we need
+    // both values from C for the @require and values from B for the key itself, but both
+    // B and C can be queried directly after the initial query to A. This make the optimal query
+    // plan diamond-shaped: after starting in A, we can get everything from B and C in
+    // parallel, and then D needs to wait on both of those to run.
+
+    let planner = planner!(
+        A: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id1") {
+            id1: ID!
+          }
+        "#,
+        B: r#"
+          type T @key(fields: "id1") @key(fields: "id2") {
+            id1: ID!
+            id2: ID!
+            v1: Int
+            v2: Int
+          }
+        "#,
+        C: r#"
+          type T @key(fields: "id1") {
+            id1: ID!
+            v3: Int
+          }
+        "#,
+        D: r#"
+          type T @key(fields: "id2") {
+            id2: ID!
+            v3: Int @external
+            v4: Int @requires(fields: "v3")
+          }
+        "#
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              v1
+              v2
+              v3
+              v4
+            }
+          }
+        "#,
+
+
+      // The optimal plan should:
+      // 1. fetch id1 from A
+      // 2. from that, it can both (in parallel):
+      //   - get id2, v1 and v2 from B
+      //   - get v3 from C
+      // 3. lastly, once both of those return, it can get v4 from D as it has all requirement
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "A") {
+              {
+                t {
+                  __typename
+                  id1
+                }
+              }
+            },
+            Parallel {
+              Flatten(path: "t") {
+                Fetch(service: "C") {
+                  {
+                    ... on T {
+                      __typename
+                      id1
+                    }
+                  } =>
+                  {
+                    ... on T {
+                      v3
+                    }
+                  }
+                },
+              },
+              Flatten(path: "t") {
+                Fetch(service: "B") {
+                  {
+                    ... on T {
+                      __typename
+                      id1
+                    }
+                  } =>
+                  {
+                    ... on T {
+                      __typename
+                      id2
+                      v1
+                      v2
+                      id1
+                    }
+                  }
+                },
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "D") {
+                {
+                  ... on T {
+                    __typename
+                    v3
+                    id2
+                  }
+                } =>
+                {
+                  ... on T {
+                    v4
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_can_require_at_inaccessible_fields() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            one: One
+            onlyIn1: Int
+          }
+  
+          type One @key(fields: "id") {
+            id: ID!
+            a: String @inaccessible
+            onlyIn1: Int
+          }
+        "#,
+        Subgraph2: r#"
+          type Query {
+            onlyIn2: Int
+          }
+  
+          type One @key(fields: "id") {
+            id: ID!
+            a: String @external
+            b: String @requires(fields: "a")
+            onlyIn2: Int
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            one {
+              b
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                one {
+                  __typename
+                  id
+                  a
+                }
+              }
+            },
+            Flatten(path: "one") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on One {
+                    __typename
+                    id
+                    a
+                  }
+                } =>
+                {
+                  ... on One {
+                    b
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_require_of_multiple_field_when_one_is_also_a_key_to_reach_another() {
+    // The specificity of this example is that we `T.v` requires 2 fields `req1`
+    // and `req2`, but `req1` is also a key to get `req2`. This dependency was
+    // confusing a previous version of the code (which, when gathering the
+    // "createdGroups" for `T.v` @requires, was using the group for `req1` twice
+    // separately (instead of recognizing it was the same group), and this was
+    // confusing the rest of the code was wasn't expecting it.
+    let planner = planner!(
+        A: r#"
+          type Query {
+            t: T
+          }
+  
+          type T @key(fields: "id1") @key(fields: "req1") {
+            id1: ID!
+            req1: Int
+          }
+        "#,
+        B: r#"
+          type T @key(fields: "id1") {
+            id1: ID!
+            req1: Int @external
+            req2: Int @external
+            v: Int @requires(fields: "req1 req2")
+          }
+        "#,
+        C: r#"
+          type T @key(fields: "req1") {
+            req1: Int
+            req2: Int
+          }
+        "#
+    );
+
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              v
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "A") {
+              {
+                t {
+                  __typename
+                  id1
+                  req1
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "C") {
+                {
+                  ... on T {
+                    __typename
+                    req1
+                  }
+                } =>
+                {
+                  ... on T {
+                    req2
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "B") {
+                {
+                  ... on T {
+                    __typename
+                    req1
+                    req2
+                    id1
+                  }
+                } =>
+                {
+                  ... on T {
+                    v
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn it_handles_multiple_requires_with_multiple_fetches() {
+    let planner = planner!(
+        s1: r#"
+            type Query {
+              t: T
+            }
+
+            interface I {
+              id: ID!
+              name: String!
+            }
+
+            type T implements I @key(fields: "id") {
+              id: ID!
+              name: String! @shareable
+              x: X @shareable
+              v: V @shareable
+            }
+
+            type U implements I @key(fields: "id") {
+              id: ID!
+              name: String! @external
+            }
+
+            type V @key(fields: "id") @key(fields: "internalID") {
+              id: ID!
+              internalID: ID!
+            }
+
+            type X @key(fields: "t { id }") {
+              t: T!
+              isX: Boolean!
+            }
+        "#,
+        s2: r#"
+            type V @key(fields: "id") {
+              id: ID!
+              internalID: ID! @shareable
+              y: Y! @shareable
+              zz: [Z!] @external
+            }
+
+            type Z {
+              u: U! @external
+            }
+
+            type Y @key(fields: "id") {
+              id: ID!
+              isY: Boolean! @external
+            }
+
+            interface I {
+              id: ID!
+              name: String!
+            }
+
+            type T implements I @key(fields: "id") {
+              id: ID!
+              name: String! @external
+              x: X @external
+              v: V @external
+              foo: [String!]! @requires(fields: "x { isX }\nv { y { isY } }")
+              bar: [I!]! @requires(fields: "x { isX }\nv { y { isY } zz { u { id } } }")
+            }
+
+            type X {
+              isX: Boolean! @external
+            }
+
+            type U implements I @key(fields: "id") {
+              id: ID!
+              name: String! @external
+            }
+        "#,
+        s3: r#"
+            type V @key(fields: "internalID") {
+              internalID: ID!
+              y: Y! @shareable
+            }
+
+            type Y @key(fields: "id") {
+              id: ID!
+              isY: Boolean!
+            }
+        "#,
+        s4: r#"
+            type V @key(fields: "id") @key(fields: "internalID") {
+              id: ID!
+              internalID: ID!
+              zz: [Z!] @override(from: "s1")
+            }
+
+            type Z {
+              free: Boolean
+              u: U!
+              v: V!
+            }
+
+            interface I {
+              id: ID!
+              name: String!
+            }
+
+            type T implements I @key(fields: "id") {
+              id: ID!
+              name: String! @shareable
+              x: X @shareable
+              v: V @shareable
+            }
+
+            type X @key(fields: "t { id }", resolvable: false) {
+              t: T! @external
+            }
+
+            type U implements I @key(fields: "id") {
+              id: ID!
+              name: String! @override(from: "s1")
+            }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+        {
+            t {
+                foo
+                bar {
+                    name
+                }
+            }
+        }
+        "#,
+
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "s1") {
+              {
+                t {
+                  __typename
+                  id
+                  x {
+                    isX
+                  }
+                  v {
+                    __typename
+                    internalID
+                  }
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "s4") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                  }
+                } =>
+                {
+                  ... on T {
+                    v {
+                      __typename
+                      internalID
+                      zz {
+                        u {
+                          id
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+            },
+            Flatten(path: "t.v") {
+              Fetch(service: "s3") {
+                {
+                  ... on V {
+                    __typename
+                    internalID
+                  }
+                } =>
+                {
+                  ... on V {
+                    y {
+                      isY
+                    }
+                  }
+                }
+              },
+            },
+            Parallel {
+              Flatten(path: "t") {
+                Fetch(service: "s2") {
+                  {
+                    ... on T {
+                      __typename
+                      x {
+                        isX
+                      }
+                      v {
+                        y {
+                          isY
+                        }
+                      }
+                      id
+                    }
+                  } =>
+                  {
+                    ... on T {
+                      foo
+                    }
+                  }
+                },
+              },
+              Sequence {
+                Flatten(path: "t") {
+                  Fetch(service: "s2") {
+                    {
+                      ... on T {
+                        __typename
+                        x {
+                          isX
+                        }
+                        v {
+                          y {
+                            isY
+                          }
+                          zz {
+                            u {
+                              id
+                            }
+                          }
+                        }
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        bar {
+                          __typename
+                          ... on T {
+                            __typename
+                            id
+                          }
+                          ... on U {
+                            __typename
+                            id
+                          }
+                        }
+                      }
+                    }
+                  },
+                },
+                Flatten(path: "t.bar.@") {
+                  Fetch(service: "s4") {
+                    {
+                      ... on T {
+                        __typename
+                        id
+                      }
+                      ... on U {
+                        __typename
+                        id
+                      }
+                    } =>
+                    {
+                      ... on T {
+                        name
+                      }
+                      ... on U {
+                        name
+                      }
+                    }
+                  },
+                },
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn handles_requires_from_supergraph() {
+    // This test verifies that @requires field selection set does not have to be locally satisfiable
+    // and is valid as long as it is satisfiable in the supergraph.
+    // In the test below, type U implements interface I only in the Subgraph1, but we can still use
+    // that type information in the @requires selection set in Subgraph2.
+    //
+    // NOTE: While GraphQL does not allow you to return raw interface data, it is still a valid schema.
+    // Since our interface field is marked as @external, its value should always be provided from
+    // other subgraph and should not be resolved locally (as that would lead to a runtime exception
+    // as we don't have any concrete type to return there).
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+
+          type T @key(fields: "id") {
+            id: ID!
+            i: I
+          }
+
+          interface I {
+            name: String
+          }
+
+          type U implements I {
+            name: String @shareable
+            value: String
+          }
+        "#,
+        Subgraph2: r#"
+          interface I {
+            name: String
+          }
+
+          type U {
+            name: String @shareable
+            value: String @external
+          }
+
+          type T @key(fields: "id") {
+            id: ID!
+            i: I @external
+            r: Int @requires(fields: "i { name ... on U { value } }")
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              r
+            }
+          }
+        "#,
+
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "Subgraph1") {
+              {
+                t {
+                  __typename
+                  id
+                  i {
+                    __typename
+                    name
+                    ... on U {
+                      value
+                    }
+                  }
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "Subgraph2") {
+                {
+                  ... on T {
+                    __typename
+                    id
+                    i {
+                      name
+                      ... on U {
+                        value
+                      }
+                    }
+                  }
+                } =>
+                {
+                  ... on T {
+                    r
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+#[test]
+fn allows_post_requires_input_with_typename_on_interface_object_type() {
+    // This used to panic with an `InternalRebaseError(InterfaceObjectTypename)` error.
+    let planner = planner!(
+        A: r#"
+          type I @key(fields: "id") @interfaceObject {
+            id: ID!
+          }
+
+          extend type Query {
+            start: I!
+          }
+        "#,
+        B: r#"
+          interface I @key(fields: "id") {
+            id: ID!
+            required: String
+          }
+
+          type P implements I @key(fields: "id") {
+            id: ID!
+            required: String
+          }
+        "#,
+        C: r#"
+          type I @key(fields: "id") @interfaceObject {
+            id: ID!
+            required: String @external
+            data: String! @requires(fields: "required")
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            start {
+              data
+            }
+          }
+        "#,
+        @r###"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "A") {
+          {
+            start {
+              __typename
+              id
+            }
+          }
+        },
+        Flatten(path: "start") {
+          Fetch(service: "B") {
+            {
+              ... on I {
+                __typename
+                id
+              }
+            } =>
+            {
+              ... on I {
+                __typename
+                required
+              }
+            }
+          },
+        },
+        Flatten(path: "start") {
+          Fetch(service: "C") {
+            {
+              ... on I {
+                __typename
+                required
+                id
+              }
+            } =>
+            {
+              ... on I {
+                data
+              }
+            }
+          },
+        },
+      },
+    }
+    "###
+    );
+}
+
+#[test]
+fn avoids_selecting_inapplicable_key_from_parent_node() {
+    // Previously, there was an issue where a subgraph jump inserted due to a @requires field would
+    // try (as an optimization) to collect its locally satisfiable key from the parent, but the
+    // parent may not have that locally satisfiable key. We now explicitly check for this, falling
+    // back to the current node if needed (which should be guaranteed to have it).
+    let planner = planner!(
+        A: r#"
+          type Query {
+            t: T
+          }
+
+          type T @key(fields: "id1") {
+            id1: ID!
+          }
+        "#,
+        B: r#"
+          type T @key(fields: "id2") @key(fields: "id1") {
+            id1: ID!
+            id2: ID!
+            x: Int @external
+            req: Int @requires(fields: "x")
+          }
+        "#,
+        C: r#"
+          type T @key(fields: "id2") {
+            id2: ID!
+            x: Int
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              req
+            }
+          }
+        "#,
+
+        @r###"
+        QueryPlan {
+          Sequence {
+            Fetch(service: "A") {
+              {
+                t {
+                  __typename
+                  id1
+                }
+              }
+            },
+            Flatten(path: "t") {
+              Fetch(service: "B") {
+                {
+                  ... on T {
+                    __typename
+                    id1
+                  }
+                } =>
+                {
+                  ... on T {
+                    __typename
+                    id2
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "C") {
+                {
+                  ... on T {
+                    __typename
+                    id2
+                  }
+                } =>
+                {
+                  ... on T {
+                    x
+                  }
+                }
+              },
+            },
+            Flatten(path: "t") {
+              Fetch(service: "B") {
+                {
+                  ... on T {
+                    __typename
+                    x
+                    id2
+                  }
+                } =>
+                {
+                  ... on T {
+                    req
+                  }
+                }
+              },
+            },
+          },
+        }
+      "###
+    );
+}
+
+// Reproduction for RH-1390: router panics at planning time when @external
+// appears on nested @key fields combined with cross-subgraph @requires.
+// New versions of composition should reject this schema in the satisfibility check.
+#[test]
+#[should_panic(expected = "validation should have required a key to be present")]
+fn external_on_nested_key_fields_with_cross_subgraph_requires() {
+    let planner = planner!(
+        Subgraph1: r#"
+          type Query {
+            t: T
+          }
+
+          type T @key(fields: "id") {
+            id: ID!
+            u: U @shareable
+          }
+
+          type U @shareable {
+            x: String
+          }
+        "#,
+        Subgraph2: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            u: U @shareable
+          }
+
+          type U @shareable {
+            x: String
+            w: Int
+          }
+        "#,
+        Subgraph3: r#"
+          type T @key(fields: "id u { x }") {
+            id: ID!
+            u: U
+            computed: String @requires(fields: "u { w }")
+          }
+
+          type U {
+            x: String @external
+            w: Int @external
+          }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          {
+            t {
+              computed
+            }
+          }
+        "#,
+        @r###"
+        QueryPlan {
+          todo
+        }
+      "###
+    );
+}
+
+/// The @requires here can only be resolved by first jumping to Subgraph2 to translate
+/// `SubEntity.id1` into `id2`, because Subgraph3's `Entity` key is `subEntity { id2 }`. That makes
+/// the key-resolution *conditions* get fetched at `unionField.subEntity`, which is *deeper* in the
+/// response than the `Entity` needing the @requires (at `unionField`). The key fetch node therefore
+/// has no derivable "path in parent" relative to that condition node, and several places used to
+/// mishandle the resulting absent path: the planner first computed a reversed (and invalid) path,
+/// then silently dropped the condition fetch nodes, which ordered the @requires fetch before the
+/// fetch producing the required field.
+///
+/// The expected plan below bounces Subgraph2 -> Subgraph3 -> Subgraph2 -> Subgraph3, which looks
+/// redundant but is the minimum this schema allows. Each hop unlocks the next, in a strictly linear
+/// chain (this is the same shape as `it_handles_simple_require_chain`, just spread over more
+/// subgraphs):
+///   1. Subgraph1 is the only subgraph with `Query.unionField`, and gives us `subEntity { id1 }`.
+///   2. Subgraph2 turns `id1` into `id2`: Subgraph3's `Entity` key is `subEntity { id2 }`, Subgraph1
+///      only knows `id1`, and Subgraph2 is the only subgraph declaring both keys.
+///   3. Subgraph3 gives us `requiredSubEntity { id2 }`. `requiredSubEntity` is declared *only* in
+///      Subgraph3, so there is no way to know *which* `SubEntity` the @requires refers to without
+///      first asking Subgraph3 -- hence the jump into Subgraph3 before the required field exists.
+///   4. Subgraph2 resolves `requiredField` on it. Subgraph3 declares that field `@external` on a
+///      `resolvable: false` key, so Subgraph3 cannot resolve it itself.
+///   5. Subgraph3 finally resolves `requiringField`, now that it has both the key (2) and the
+///      @requires data (4).
+///
+/// Note also that fetch 3 re-selects `subEntity { id2 }` in its output even though fetch 2 already
+/// fetched exactly that at `unionField.subEntity`. That is `add_post_require_inputs()` adding the
+/// key needed to resume after the @requires to the pre-@requires node unconditionally: as its
+/// comment notes, it cannot cheaply prove the key is already selected, so it adds it and accepts a
+/// no-op when it was. It costs no extra round trip, only a slightly larger response.
+#[test]
+fn handles_requires_when_key_conditions_are_fetched_below_the_entity() {
+    let planner = planner!(
+        Subgraph1: r#"
+            union Union = Entity | Dummy
+
+            type Dummy {
+              dummy: Boolean!
+            }
+
+            type Entity @key(fields: "subEntity { id1 }") {
+              subEntity: SubEntity!
+            }
+
+            type SubEntity @key(fields: "id1") {
+              id1: ID!
+            }
+
+            type Query {
+              unionField: Union
+            }
+        "#,
+        Subgraph2: r#"
+            type SubEntity @key(fields: "id1") @key(fields: "id2") {
+              id1: ID!
+              id2: ID!
+              requiredField: Boolean!
+            }
+        "#,
+        Subgraph3: r#"
+            type Entity @key(fields: "subEntity { id2 }") {
+              subEntity: SubEntity!
+              requiredSubEntity: SubEntity!
+              requiringField: Boolean @requires(fields: "requiredSubEntity { requiredField }")
+            }
+
+            type SubEntity @key(fields: "id2", resolvable: false) {
+              id2: ID!
+              requiredField: Boolean! @external
+            }
+        "#,
+    );
+    assert_plan!(
+        &planner,
+        r#"
+            query {
+              unionField {
+                ... on Entity {
+                  requiringField
+                }
+              }
+            }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "Subgraph1") {
+          {
+            unionField {
+              __typename
+              ... on Entity {
+                __typename
+                subEntity {
+                  __typename
+                  id1
+                }
+              }
+            }
+          }
+        },
+        Flatten(path: "unionField.subEntity") {
+          Fetch(service: "Subgraph2") {
+            {
+              ... on SubEntity {
+                __typename
+                id1
+              }
+            } =>
+            {
+              ... on SubEntity {
+                id2
+              }
+            }
+          },
+        },
+        Flatten(path: "unionField") {
+          Fetch(service: "Subgraph3") {
+            {
+              ... on Entity {
+                __typename
+                subEntity {
+                  id2
+                }
+              }
+            } =>
+            {
+              ... on Entity {
+                __typename
+                requiredSubEntity {
+                  __typename
+                  id2
+                }
+                subEntity {
+                  id2
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "unionField.requiredSubEntity") {
+          Fetch(service: "Subgraph2") {
+            {
+              ... on SubEntity {
+                __typename
+                id2
+              }
+            } =>
+            {
+              ... on SubEntity {
+                requiredField
+              }
+            }
+          },
+        },
+        Flatten(path: "unionField") {
+          Fetch(service: "Subgraph3") {
+            {
+              ... on Entity {
+                __typename
+                requiredSubEntity {
+                  requiredField
+                }
+                subEntity {
+                  id2
+                }
+              }
+            } =>
+            {
+              ... on Entity {
+                requiringField
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+}
+
+#[test]
+fn rh1396_transitive_require_with_own_require() {
+    let planner = planner!(
+        hotelpage: r#"
+          type Query { t: T }
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String
+            rooms: Int
+          }
+        "#,
+        room_details: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property @external
+            availableOffers: Offer @requires(fields: "property { location rooms }")
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String @external
+            rooms: Int @external
+          }
+          type Offer {
+            price: Int
+            property: Property
+          }
+        "#,
+        value_merchandising: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            availableOffers: Offer @external
+            vMPricingData: Int @requires(fields: "availableOffers { price property { location rooms } }")
+          }
+          type Offer {
+            price: Int @external
+            property: Property @external
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String @external
+            rooms: Int @external
+          }
+        "#
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          { t { vMPricingData } }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "hotelpage") {
+          {
+            t {
+              __typename
+              id
+              property {
+                location
+                rooms
+              }
+            }
+          }
+        },
+        Flatten(path: "t") {
+          Fetch(service: "room_details") {
+            {
+              ... on T {
+                __typename
+                property {
+                  location
+                  rooms
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                availableOffers {
+                  price
+                  property {
+                    __typename
+                    id
+                  }
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t.availableOffers.property") {
+          Fetch(service: "hotelpage") {
+            {
+              ... on Property {
+                __typename
+                id
+              }
+            } =>
+            {
+              ... on Property {
+                location
+                rooms
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "value_merchandising") {
+            {
+              ... on T {
+                __typename
+                availableOffers {
+                  price
+                  property {
+                    location
+                    rooms
+                  }
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                vMPricingData
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+}
+
+// Same shape as `rh1396_transitive_require_with_own_require`, but with the ROOT
+// field `t` owned by `room_details` — the same subgraph that owns
+// `availableOffers` (the field carrying the nested `@requires`). Hypothesis
+// (RH-1396): when the nested-`@requires` field is co-located in the entry
+// subgraph, the planner resolves it in the initial fetch and drops its own
+// `@requires` (on `property`), instead of sequencing the hotelpage fetch first.
+#[test]
+fn rh1396_nested_require_when_root_is_colocated() {
+    let planner = planner!(
+        room_details: r#"
+          type Query { t: T }
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property @external
+            availableOffers: Offer @requires(fields: "property { location rooms }")
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String @external
+            rooms: Int @external
+          }
+          type Offer {
+            price: Int
+          }
+        "#,
+        hotelpage: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String
+            rooms: Int
+          }
+        "#,
+        value_merchandising: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            availableOffers: Offer @external
+            vMPricingData: Int @requires(fields: "availableOffers { price }")
+          }
+          type Offer {
+            price: Int @external
+          }
+        "#
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          { t { vMPricingData } }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "room_details") {
+          {
+            t {
+              __typename
+              id
+            }
+          }
+        },
+        Flatten(path: "t") {
+          Fetch(service: "hotelpage") {
+            {
+              ... on T {
+                __typename
+                id
+              }
+            } =>
+            {
+              ... on T {
+                property {
+                  location
+                  rooms
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "room_details") {
+            {
+              ... on T {
+                __typename
+                property {
+                  location
+                  rooms
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                availableOffers {
+                  price
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "value_merchandising") {
+            {
+              ... on T {
+                __typename
+                availableOffers {
+                  price
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                vMPricingData
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+}
+
+// RH-1396 generalization probe: same co-location trigger as
+// `rh1396_nested_require_when_root_is_colocated`, but with the nested `@requires`
+// chain THREE levels deep instead of two: `vMPricingData` requires `availableOffers`
+// (room_details, co-located with the root), which requires `property` (hotelpage),
+// which in turn requires `geoCoords` (geo). This checks whether the ancestor check
+// in `can_merge_child_in` still correctly blocks the wrongful merge when the
+// dependency chain is longer than the minimal repro.
+#[test]
+fn rh1396_three_level_nested_require_when_root_is_colocated() {
+    let planner = planner!(
+        room_details: r#"
+          type Query { t: T }
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property @external
+            availableOffers: Offer @requires(fields: "property { location rooms }")
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String @external
+            rooms: Int @external
+          }
+          type Offer {
+            price: Int
+          }
+        "#,
+        hotelpage: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            geoCoords: Coords @external
+            property: Property @requires(fields: "geoCoords { lat lng }")
+          }
+          type Coords {
+            lat: Float @external
+            lng: Float @external
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String
+            rooms: Int
+          }
+        "#,
+        geo: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            geoCoords: Coords
+          }
+          type Coords {
+            lat: Float
+            lng: Float
+          }
+        "#,
+        value_merchandising: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            availableOffers: Offer @external
+            vMPricingData: Int @requires(fields: "availableOffers { price }")
+          }
+          type Offer {
+            price: Int @external
+          }
+        "#
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          { t { vMPricingData } }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "room_details") {
+          {
+            t {
+              __typename
+              id
+            }
+          }
+        },
+        Flatten(path: "t") {
+          Fetch(service: "geo") {
+            {
+              ... on T {
+                __typename
+                id
+              }
+            } =>
+            {
+              ... on T {
+                geoCoords {
+                  lat
+                  lng
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "hotelpage") {
+            {
+              ... on T {
+                __typename
+                geoCoords {
+                  lat
+                  lng
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                property {
+                  location
+                  rooms
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "room_details") {
+            {
+              ... on T {
+                __typename
+                property {
+                  location
+                  rooms
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                availableOffers {
+                  price
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "value_merchandising") {
+            {
+              ... on T {
+                __typename
+                availableOffers {
+                  price
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                vMPricingData
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+}
+
+// RH-1396 generalization probe: same co-location trigger, but the root field
+// returns a LIST of entities (`ts: [T]`) rather than a single `T`. Checks whether
+// the fix holds when fetch node `merge_at` paths include a list index.
+#[test]
+fn rh1396_nested_require_when_root_is_colocated_list_entity() {
+    let planner = planner!(
+        room_details: r#"
+          type Query { ts: [T] }
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property @external
+            availableOffers: Offer @requires(fields: "property { location rooms }")
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String @external
+            rooms: Int @external
+          }
+          type Offer {
+            price: Int
+          }
+        "#,
+        hotelpage: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            property: Property
+          }
+          type Property @key(fields: "id") {
+            id: ID!
+            location: String
+            rooms: Int
+          }
+        "#,
+        value_merchandising: r#"
+          type T @key(fields: "id") {
+            id: ID!
+            availableOffers: Offer @external
+            vMPricingData: Int @requires(fields: "availableOffers { price }")
+          }
+          type Offer {
+            price: Int @external
+          }
+        "#
+    );
+    assert_plan!(
+        &planner,
+        r#"
+          { ts { vMPricingData } }
+        "#,
+        @r#"
+    QueryPlan {
+      Sequence {
+        Fetch(service: "room_details") {
+          {
+            ts {
+              __typename
+              id
+            }
+          }
+        },
+        Flatten(path: "ts.@") {
+          Fetch(service: "hotelpage") {
+            {
+              ... on T {
+                __typename
+                id
+              }
+            } =>
+            {
+              ... on T {
+                property {
+                  location
+                  rooms
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "ts.@") {
+          Fetch(service: "room_details") {
+            {
+              ... on T {
+                __typename
+                property {
+                  location
+                  rooms
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                availableOffers {
+                  price
+                }
+              }
+            }
+          },
+        },
+        Flatten(path: "ts.@") {
+          Fetch(service: "value_merchandising") {
+            {
+              ... on T {
+                __typename
+                availableOffers {
+                  price
+                }
+                id
+              }
+            } =>
+            {
+              ... on T {
+                vMPricingData
+              }
+            }
+          },
+        },
+      },
+    }
+    "#
+    );
+}

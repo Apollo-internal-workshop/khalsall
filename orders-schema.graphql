@@ -4,7 +4,7 @@ extend schema
     import: ["@key", "@tag", "@shareable", "@authenticated", "@requiresScopes"]
   )
   @link(
-    url: "https://specs.apollo.dev/connect/v0.1"
+    url: "https://specs.apollo.dev/connect/v0.5"
     import: ["@connect", "@source"]
   )
   @source(
@@ -24,8 +24,6 @@ type Query {
       id
       buyer: { id: $.customerId }
       items: $.variantIds { id: $ }
-      total
-      orderDate
       """
       entity: true
     )
@@ -50,16 +48,6 @@ type Order @key(fields: "id") {
   product and which size/color/feature was bought
   """
   items: [ProductVariant!]!
-
-  """
-  The total cost of the order
-  """
-  total: Float
-  
-  """
-  The date the order was made
-  """
-  orderDate: String
 }
 
 type User @key(fields: "id", resolvable: false) {

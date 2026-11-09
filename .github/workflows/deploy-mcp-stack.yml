@@ -1,0 +1,21 @@
+name: Deploy Tickets MCP + Router
+
+# The router looks up the Tickets MCP service URL, so tickets deploys first.
+# The router image (router-mcp) is built separately and rarely; see build-router-mcp.yml.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tickets-mcp/**'
+      - 'router/router.yaml'
+      - 'supergraph.graphql'
+
+jobs:
+  tickets:
+    uses: ./.github/workflows/deploy-tickets-mcp.yml
+    secrets: inherit
+  router:
+    needs: tickets
+    uses: ./.github/workflows/deploy-router.yml
+    secrets: inherit

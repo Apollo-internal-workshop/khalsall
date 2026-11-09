@@ -1,0 +1,18 @@
+federation_version: =3.0.0-preview.connectors-mcp
+subgraphs:
+  customers:
+    routing_url: https://subgraph-customers-j3nprurqka-ue.a.run.app
+    schema:
+      file: customers-schema.graphql
+  orders:
+    routing_url: https://subgraph-orders-j3nprurqka-ue.a.run.app
+    schema:
+      file: orders-schema.graphql
+  products:
+    routing_url: https://subgraph-products-j3nprurqka-ue.a.run.app
+    schema:
+      file: products-schema.graphql
+  tickets:
+    routing_url: http://tickets
+    schema:
+      file: tickets-schema.graphql

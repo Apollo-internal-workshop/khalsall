@@ -1,0 +1,19 @@
+---
+source: apollo-router/src/configuration/tests.rs
+expression: error.to_string()
+---
+apollo::configuration::schema
+
+  × schema validation error
+  ╰─▶ schema validation error
+
+Error: apollo::configuration::validation
+
+  × 5 is not of type "string"
+    ╭─[9:7]
+  8 │     - Content-Type
+  9 │     - 5
+    ·       ┬
+    ·       ╰── 5 is not of type "string"
+ 10 │         
+    ╰────

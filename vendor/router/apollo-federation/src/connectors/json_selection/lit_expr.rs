@@ -1,0 +1,1759 @@
+//! A LitExpr (short for LiteralExpression) is similar to a JSON value (or
+//! serde_json::Value), with the addition of PathSelection as a possible leaf
+//! value, so literal expressions passed to -> methods (via MethodArgs) can
+//! incorporate dynamic $variable values in addition to the usual input data and
+//! argument values.
+
+use apollo_compiler::collections::IndexMap;
+use nom::Parser;
+use nom::branch::alt;
+use nom::character::complete::char;
+use nom::character::complete::one_of;
+use nom::combinator::map;
+use nom::combinator::not;
+use nom::combinator::opt;
+use nom::combinator::recognize;
+use nom::multi::many0;
+use nom::multi::many1;
+use nom::sequence::pair;
+use nom::sequence::preceded;
+use nom::sequence::terminated;
+
+use super::ParseResult;
+use super::PathList;
+use super::VarPaths;
+use super::helpers::spaces_or_comments;
+use super::location::Ranged;
+use super::location::Span;
+use super::location::WithRange;
+use super::location::merge_ranges;
+use super::location::ranged_span;
+use super::nom_error_message;
+use super::parser::DepthGuard;
+use super::parser::IDENTIFIER_CONTINUE_CHARS;
+use super::parser::Key;
+use super::parser::PathSelection;
+use super::parser::SubSelection;
+use super::parser::key_start_char;
+use super::parser::nom_fail_message;
+use super::parser::parse_string_literal;
+use super::parser::propagate_recursion_error;
+use crate::connectors::spec::ConnectSpec;
+
+/// Keys that begin with (or are prefixes of) `true`/`false`/`null`, all of
+/// which must parse as ordinary keys. Shared with `parser::tests`.
+#[cfg(test)]
+pub(super) const KEYWORD_PREFIXED_KEYS: &[&str] = &[
+    "nullField",
+    "nullish",
+    "trueField",
+    "falseField",
+    "falsey",
+    "falsePositives",
+    "null_",
+    "null2",
+    "true1",
+    "false_positives",
+    "nul",
+    "tru",
+    "fals",
+    "truthy",
+];
+
+/// Paths rooted at a number, which `LitNumber`'s digitless fraction (`1.`)
+/// used to truncate. No leading zeros, since those don't round-trip.
+#[cfg(test)]
+pub(super) const NUMBER_ROOTED_PATHS: &[&str] = &[
+    "1.foo",
+    "-1.foo",
+    "0.foo",
+    "1.f",
+    "1.foo.bar",
+    "1.\"quoted\"",
+];
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum LitExpr {
+    String(String),
+    Number(serde_json::Number),
+    Bool(bool),
+    Null,
+    // Deprecated: `LegacyObject` is the v0.3-and-earlier object-literal shape
+    // produced by `parse_object`. It maps keys to `LitExpr` values with no
+    // notion of alias or spread. Connect v0.4+ parses object literals into
+    // `Object(SubSelection)` instead (see below), and this variant is
+    // scheduled for removal in v0.5.
+    LegacyObject(IndexMap<WithRange<Key>, WithRange<LitExpr>>),
+    // In v0.4+, object literals share their grammar with `SubSelection`: the
+    // body is a sequence of `NamedSelection` entries carrying the full
+    // alias / bare-path / spread vocabulary, with all-or-nothing comma
+    // placement. The AST is a single canonical shape — a `SubSelection` —
+    // rather than the restricted key/value map of `LegacyObject`.
+    Object(SubSelection),
+    // Array literals have the same AST shape in every spec version: a flat
+    // vector of element expressions with no `...` spread vocabulary. The v0.4
+    // grammar change only adjusts the comma-placement rules (all-or-nothing
+    // within a single array), not the AST.
+    Array(Vec<WithRange<LitExpr>>),
+    Path(PathSelection),
+
+    // Whereas the LitExpr::Path variant wraps a PathSelection that obeys the
+    // parsing rules of the outer selection syntax (i.e. default JSONSelection
+    // syntax, not LitExpr syntax), this LitExpr::LitPath variant can be parsed
+    // only as part of a LitExpr, and allows the value at the root of the path
+    // to be any LitExpr literal expression, without needing a $(...) wrapper,
+    // allowing you to write "asdf"->slice(0, 2) when you're already in an
+    // expression parsing context, rather than $(asdf)->slice(0, 2).
+    //
+    // The WithRange<LitExpr> argument is the root expression (never a
+    // LitExpr::Path), and the WithRange<PathList> argument represents the rest
+    // of the path, which is never PathList::Empty, because that would mean the
+    // LitExpr could stand on its own, using one of the other variants.
+    LitPath(WithRange<LitExpr>, WithRange<PathList>),
+
+    // Operator chains: A op B op C ... where all operators are the same type
+    // OpChain contains the operator type and a vector of operands
+    // For example: A ?? B ?? C becomes OpChain(NullishCoalescing, [A, B, C])
+    OpChain(WithRange<LitOp>, Vec<WithRange<LitExpr>>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum LitOp {
+    NullishCoalescing, // ??
+    NoneCoalescing,    // ?!
+}
+
+impl LitOp {
+    #[cfg(test)]
+    pub(super) fn into_with_range(self) -> WithRange<Self> {
+        WithRange::new(self, None)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        match self {
+            LitOp::NullishCoalescing => "??",
+            LitOp::NoneCoalescing => "?!",
+        }
+    }
+}
+
+impl LitExpr {
+    // LitExpr ::= LitOpChain | LitPath | LitPrimitive | LitObject | LitArray | PathSelection
+    pub(crate) fn parse(input: Span) -> ParseResult<WithRange<Self>> {
+        match input.extra.spec {
+            ConnectSpec::V0_1 | ConnectSpec::V0_2 => {
+                let (input, _) = spaces_or_comments(input)?;
+                Self::parse_primary(input)
+            }
+            ConnectSpec::V0_3 | ConnectSpec::V0_4 | ConnectSpec::V0_5 => {
+                Self::parse_with_operators(input)
+            }
+        }
+    }
+
+    // Parse expressions with operator chains (no precedence since we forbid mixing operators)
+    fn parse_with_operators(input: Span) -> ParseResult<WithRange<Self>> {
+        let (input, _) = spaces_or_comments(input)?;
+
+        // Parse the left-hand side (primary expression)
+        let (mut input, left) = Self::parse_primary(input)?;
+
+        // Track operators and operands for building OpChain
+        let mut current_op: Option<WithRange<LitOp>> = None;
+        let mut operands = vec![left.clone()];
+
+        loop {
+            let (input_after_spaces, _) = spaces_or_comments(input.clone())?;
+
+            // Try to parse a binary operator
+            if let Ok((suffix, op)) = Self::parse_binary_operator(input_after_spaces.clone()) {
+                // Check if we're starting a new operator chain or continuing an existing one
+                match current_op {
+                    None => {
+                        // Starting a new operator chain
+                        current_op = Some(op);
+                    }
+                    Some(ref existing_op) if existing_op.as_ref() != op.as_ref() => {
+                        // Operator mismatch - we cannot mix operators in a chain
+                        // This breaks the chain, so we need to stop parsing here
+                        let err = format!(
+                            "Found mixed operators {} and {}. You can only chain operators of the same kind.",
+                            existing_op.as_str(),
+                            op.as_str(),
+                        );
+                        return Err(nom_fail_message(input_after_spaces, err));
+                    }
+                    Some(_) => {
+                        // Same operator, continue the chain
+                    }
+                }
+
+                // Parse the right-hand side (with spaces)
+                let (suffix_with_spaces, _) = spaces_or_comments(suffix)?;
+                let (remainder, right) = Self::parse_primary(suffix_with_spaces)?;
+
+                operands.push(right);
+                input = remainder;
+            } else {
+                break;
+            }
+        }
+
+        // Build the final expression
+        let result = if let Some(op) = current_op {
+            let full_range = if operands.len() >= 2 {
+                merge_ranges(
+                    operands.first().and_then(|o| o.range()),
+                    operands.last().and_then(|o| o.range()),
+                )
+            } else {
+                operands.first().and_then(|o| o.range())
+            };
+            WithRange::new(Self::OpChain(op, operands), full_range)
+        } else {
+            left
+        };
+
+        Ok((input, result))
+    }
+
+    fn parse_primary(input: Span) -> ParseResult<WithRange<Self>> {
+        match alt((Self::parse_primitive, Self::parse_object, Self::parse_array))
+            .parse(input.clone())
+        {
+            Ok((suffix, initial_literal)) => {
+                // If we parsed an initial literal expression, it may be the
+                // entire result, but we also want to greedily parse one or more
+                // PathStep items that follow it, according to the rule
+                //
+                //    LitPath ::= (LitPrimitive | LitObject | LitArray) PathStep+
+                //
+                // This allows paths beginning with literal values without the
+                // initial $(...) expression wrapper, so you can write
+                // $(123->add(111)) instead of $($(123)->add(111)) when you're
+                // already in a LitExpr parsing context.
+                //
+                // We begin parsing the path at depth 1 rather than 0 because
+                // we've already parsed the initial literal at depth 0, so the
+                // subpath should obey the parsing rules for for depth > 0.
+                match propagate_recursion_error(PathList::parse_with_depth(suffix.clone(), 1))? {
+                    Ok((remainder, subpath)) => {
+                        if matches!(subpath.as_ref(), PathList::Empty) {
+                            return Ok((remainder, initial_literal));
+                        }
+                        // `NonEmptyPathTail` (the grammar tail attached to a
+                        // LitPath) admits only `?`, `.key`, and `->method`
+                        // continuations — never a `SubSelection`. So a literal
+                        // immediately followed by `{ ... }` cannot be a
+                        // LitPath: we re-parse the original input as a
+                        // `PathSelection` so the literal's source token is
+                        // reinterpreted as a `Key` (quoted string, or one of
+                        // the identifier-shaped `LitPrimitive`s `null` /
+                        // `true` / `false`) anchoring a `KeyPath` whose
+                        // trailing `SubSelection` is the `{ ... }`.
+                        //
+                        // See the README section "Literals followed by a
+                        // SubSelection". Wrap the literal in `$(...)` to force
+                        // the LitExpr-then-trailing-`{...}` reading.
+                        if matches!(subpath.as_ref(), PathList::Selection(_)) {
+                            return PathSelection::parse(input.clone()).map(|(remainder, path)| {
+                                let range = path.range();
+                                (remainder, WithRange::new(Self::Path(path), range))
+                            });
+                        }
+                        let full_range = merge_ranges(initial_literal.range(), subpath.range());
+                        Ok((
+                            remainder,
+                            WithRange::new(Self::LitPath(initial_literal, subpath), full_range),
+                        ))
+                    }
+                    // If we failed to parse a path, return initial_literal as-is.
+                    Err(_) => Ok((suffix.clone(), initial_literal)),
+                }
+            }
+
+            // If we failed to parse a primitive, object, or array, try parsing
+            // a PathSelection (which cannot be a LitPath).
+            //
+            // A fatal (`Err::Failure`) error from the inner parsers means one
+            // of them committed to the input and then hit a real syntax error
+            // (e.g. a mixed separator inside a SubSelection body). In that
+            // case we must propagate the failure rather than fall back to
+            // PathSelection, or the informative error gets replaced with
+            // whatever generic PathSelection error comes next.
+            Err(nom::Err::Failure(e)) => Err(nom::Err::Failure(e)),
+            Err(_) => PathSelection::parse(input.clone()).map(|(remainder, path)| {
+                let range = path.range();
+                (remainder, WithRange::new(Self::Path(path), range))
+            }),
+        }
+    }
+
+    fn parse_binary_operator(input: Span) -> ParseResult<WithRange<LitOp>> {
+        alt((
+            map(ranged_span("??"), |qq| {
+                WithRange::new(LitOp::NullishCoalescing, qq.range())
+            }),
+            map(ranged_span("?!"), |qq| {
+                WithRange::new(LitOp::NoneCoalescing, qq.range())
+            }),
+        ))
+        .parse(input)
+    }
+
+    // LitPrimitive ::= LitString | LitNumber | "true" | "false" | "null"
+    fn parse_primitive(input: Span) -> ParseResult<WithRange<Self>> {
+        alt((
+            map(parse_string_literal, |s| s.take_as(Self::String)),
+            Self::parse_number,
+            alt(Self::keywords().map(|(s, value)| Self::parse_keyword(s, value))),
+        ))
+        .parse(input)
+    }
+
+    /// The keyword literals. `parse_primitive` and the boundary test both
+    /// derive from this table, so new keywords should be added here rather
+    /// than as a bare `ranged_span`, which would match inside `nullField`.
+    pub(super) fn keywords() -> [(&'static str, Self); 3] {
+        [
+            ("true", Self::Bool(true)),
+            ("false", Self::Bool(false)),
+            ("null", Self::Null),
+        ]
+    }
+
+    /// Parses keyword `s` as `value`, unless an identifier character follows.
+    fn parse_keyword<'a, 'b: 'a>(
+        s: &'a str,
+        value: Self,
+    ) -> impl Parser<Span<'b>, Output = WithRange<Self>, Error = nom::error::Error<Span<'b>>> {
+        map(
+            terminated(ranged_span(s), not(one_of(IDENTIFIER_CONTINUE_CHARS))),
+            move |keyword: WithRange<&'b str>| WithRange::new(value.clone(), keyword.range()),
+        )
+    }
+
+    // LitNumber ::= "-"? ([0-9]+ ("." [0-9]*)? | "." [0-9]+)
+    fn parse_number(input: Span) -> ParseResult<WithRange<Self>> {
+        let (suffix, (_, neg, _, num)) = (
+            spaces_or_comments,
+            opt(ranged_span("-")),
+            spaces_or_comments,
+            alt((
+                map(
+                    pair(
+                        recognize(many1(one_of("0123456789"))),
+                        opt((
+                            spaces_or_comments,
+                            ranged_span("."),
+                            spaces_or_comments,
+                            alt((
+                                recognize(many1(one_of("0123456789"))),
+                                // A digitless fraction (`1.`) is allowed only
+                                // if no `Key` follows, so `1.foo` stays a path.
+                                recognize(not(key_start_char)),
+                            )),
+                        )),
+                    ),
+                    |(int, frac)| {
+                        let int_range = Some(
+                            int.location_offset()..int.location_offset() + int.fragment().len(),
+                        );
+
+                        let mut s = String::new();
+
+                        // Remove leading zeros to avoid failing the stricter
+                        // number.parse() below, but allow a single zero.
+                        let mut int_chars_without_leading_zeros =
+                            int.fragment().chars().skip_while(|c| *c == '0');
+                        if let Some(first_non_zero) = int_chars_without_leading_zeros.next() {
+                            s.push(first_non_zero);
+                            s.extend(int_chars_without_leading_zeros);
+                        } else {
+                            s.push('0');
+                        }
+
+                        let full_range = if let Some((_, dot, _, frac)) = frac {
+                            let frac_range = merge_ranges(
+                                dot.range(),
+                                if frac.len() > 0 {
+                                    Some(
+                                        frac.location_offset()
+                                            ..frac.location_offset() + frac.fragment().len(),
+                                    )
+                                } else {
+                                    None
+                                },
+                            );
+                            s.push('.');
+                            if frac.fragment().is_empty() {
+                                s.push('0');
+                            } else {
+                                s.push_str(frac.fragment());
+                            }
+                            merge_ranges(int_range, frac_range)
+                        } else {
+                            int_range
+                        };
+
+                        WithRange::new(s, full_range)
+                    },
+                ),
+                map(
+                    (
+                        spaces_or_comments,
+                        ranged_span("."),
+                        spaces_or_comments,
+                        recognize(many1(one_of("0123456789"))),
+                    ),
+                    |(_, dot, _, frac)| {
+                        let frac_range = Some(
+                            frac.location_offset()..frac.location_offset() + frac.fragment().len(),
+                        );
+                        let full_range = merge_ranges(dot.range(), frac_range);
+                        WithRange::new(format!("0.{}", frac.fragment()), full_range)
+                    },
+                ),
+            )),
+        )
+            .parse(input.clone())?;
+
+        let mut number = String::new();
+        if neg.is_some() {
+            number.push('-');
+        }
+        number.push_str(num.as_str());
+
+        number.parse().map(Self::Number).map_or_else(
+            |_| {
+                // CONSIDER USING THIS ERROR? now that we have access to them?
+                Err(nom_error_message(
+                    input,
+                    // We could include the faulty number in the error message, but
+                    // it will also appear at the beginning of the input span.
+                    "Failed to parse numeric literal",
+                ))
+            },
+            |lit_number| {
+                Ok((
+                    suffix,
+                    WithRange::new(
+                        lit_number,
+                        merge_ranges(neg.and_then(|n| n.range()), num.range()),
+                    ),
+                ))
+            },
+        )
+    }
+
+    // LitObject ::= "{" (LitProperty ("," LitProperty)* ","?)? "}"   (V0_1..V0_3)
+    // LitObject ::= SubSelection                                      (V0_4+)
+    //
+    // In v0.4+, object literals are syntactically identical to a `SubSelection`,
+    // so we delegate to `SubSelection::parse` and wrap the result in
+    // `LitExpr::Object(SubSelection)`. In v0.3 and earlier, object literals use
+    // the restricted `Key ":" LitExpr` shape and produce `LitExpr::LegacyObject`.
+    fn parse_object(input: Span) -> ParseResult<WithRange<Self>> {
+        if input.extra.spec >= ConnectSpec::V0_4 {
+            return Self::parse_object_v0_4(input);
+        }
+
+        let (input, _) = spaces_or_comments(input)?;
+        let (input, open_brace) = ranged_span("{").parse(input)?;
+        let _guard = DepthGuard::increment(&input)?;
+        let (mut input, _) = spaces_or_comments(input)?;
+
+        let mut output = IndexMap::default();
+
+        if let Ok((remainder, (key, value))) =
+            propagate_recursion_error(Self::parse_property(input.clone()))?
+        {
+            output.insert(key, value);
+            input = remainder;
+
+            while let Ok((remainder, _)) = (spaces_or_comments, char(',')).parse(input.clone()) {
+                input = remainder;
+                if let Ok((remainder, (key, value))) =
+                    propagate_recursion_error(Self::parse_property(input.clone()))?
+                {
+                    output.insert(key, value);
+                    input = remainder;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let (input, _) = spaces_or_comments(input.clone())?;
+        let (input, close_brace) = ranged_span("}").parse(input)?;
+
+        let range = merge_ranges(open_brace.range(), close_brace.range());
+        Ok((input, WithRange::new(Self::LegacyObject(output), range)))
+    }
+
+    fn parse_object_v0_4(input: Span) -> ParseResult<WithRange<Self>> {
+        let (input, _) = spaces_or_comments(input)?;
+        let (remainder, sub) = SubSelection::parse(input)?;
+        let range = sub.range();
+        Ok((remainder, WithRange::new(Self::Object(sub), range)))
+    }
+
+    // LitProperty ::= Key ":" LitExpr | KeyPath (shorthand, V0_4+)
+    fn parse_property(input: Span) -> ParseResult<(WithRange<Key>, WithRange<Self>)> {
+        let full_result = propagate_recursion_error(
+            (Key::parse, spaces_or_comments, char(':'), Self::parse).parse(input.clone()),
+        )?;
+
+        match full_result {
+            Ok((remainder, (key, _, _, value))) => Ok((remainder, (key, value))),
+            Err(_) if input.extra.spec >= ConnectSpec::V0_4 => {
+                Self::parse_shorthand_property(input)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn parse_shorthand_property(input: Span) -> ParseResult<(WithRange<Key>, WithRange<Self>)> {
+        let (remainder, value) = Self::parse(input.clone())?;
+        let Self::Path(path) = value.as_ref() else {
+            return Err(nom_fail_message(
+                input,
+                "Shorthand property must be a path starting with a key",
+            ));
+        };
+        let Some(key) = path.get_single_key() else {
+            return Err(nom_fail_message(
+                input,
+                "Shorthand property must be a path starting with a key",
+            ));
+        };
+        Ok((remainder, (key.clone(), value)))
+    }
+
+    // LitArray ::= "[" (LitExpr ("," LitExpr)* ","?)? "]"
+    pub(super) fn parse_array(input: Span) -> ParseResult<WithRange<Self>> {
+        let (input, (_, open_bracket)) = (spaces_or_comments, ranged_span("[")).parse(input)?;
+        let _guard = DepthGuard::increment(&input)?;
+        (
+            spaces_or_comments,
+            map(
+                opt((
+                    Self::parse,
+                    many0(preceded((spaces_or_comments, char(',')), Self::parse)),
+                    opt((spaces_or_comments, char(','))),
+                )),
+                |elements| {
+                    let mut output = vec![];
+                    if let Some((first, rest, _trailing_comma)) = elements {
+                        output.push(first);
+                        output.extend(rest);
+                    }
+                    Self::Array(output)
+                },
+            ),
+            spaces_or_comments,
+            ranged_span("]"),
+        )
+            .parse(input)
+            .map(|(input, (_, output, _, close_bracket))| {
+                let range = merge_ranges(open_bracket.range(), close_bracket.range());
+                (input, WithRange::new(output, range))
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_with_range(self) -> WithRange<Self> {
+        WithRange::new(self, None)
+    }
+
+    #[allow(unused)]
+    pub(super) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Number(n) => n.as_i64(),
+            _ => None,
+        }
+    }
+
+    /// The next `SubSelection` reachable through this `LitExpr`, if any.
+    ///
+    /// A path-shaped value delegates to the trailing `SubSelection` of its
+    /// `PathSelection` (if any). A bare `LitExpr::Object` value *is* the next
+    /// subselection — v0.4 unified object literals with `SubSelection`, so the
+    /// object body is itself a selection set. A `LitPath` delegates to its
+    /// tail, since its `PathList` can end in a `PathList::Selection`. Other
+    /// variants have no subselection to return.
+    pub(crate) fn next_subselection(&self) -> Option<&SubSelection> {
+        match self {
+            Self::Path(path) => path.next_subselection(),
+            Self::Object(sub) => Some(sub),
+            Self::LitPath(_, tail) => tail.next_subselection(),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Self::next_subselection`].
+    pub(crate) fn next_mut_subselection(&mut self) -> Option<&mut SubSelection> {
+        match self {
+            Self::Path(path) => path.next_mut_subselection(),
+            Self::Object(sub) => Some(sub),
+            Self::LitPath(_, tail) => tail.next_mut_subselection(),
+            _ => None,
+        }
+    }
+}
+
+impl VarPaths for LitExpr {
+    fn var_paths(&self) -> Vec<&PathSelection> {
+        let mut paths = vec![];
+        match self {
+            Self::String(_) | Self::Number(_) | Self::Bool(_) | Self::Null => {}
+            Self::LegacyObject(map) => {
+                for value in map.values() {
+                    paths.extend(value.var_paths());
+                }
+            }
+            Self::Object(sub) => {
+                paths.extend(sub.var_paths());
+            }
+            Self::Array(vec) => {
+                for value in vec {
+                    paths.extend(value.var_paths());
+                }
+            }
+            Self::Path(path) => {
+                paths.extend(path.var_paths());
+            }
+            Self::LitPath(literal, subpath) => {
+                paths.extend(literal.var_paths());
+                paths.extend(subpath.var_paths());
+            }
+            Self::OpChain(_, operands) => {
+                for operand in operands {
+                    paths.extend(operand.var_paths());
+                }
+            }
+        }
+        paths
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::known_var::KnownVariable;
+    use super::super::location::strip_ranges::StripRanges;
+    use super::*;
+    use crate::connectors::json_selection::JSONSelection;
+    use crate::connectors::json_selection::MethodArgs;
+    use crate::connectors::json_selection::PathList;
+    use crate::connectors::json_selection::PrettyPrintable;
+    use crate::connectors::json_selection::fixtures::Namespace;
+    use crate::connectors::json_selection::helpers::span_is_all_spaces_or_comments;
+    use crate::connectors::json_selection::location::new_span;
+    use crate::connectors::json_selection::location::new_span_with_spec;
+    use crate::connectors::json_selection::parser::Alias;
+    use crate::connectors::json_selection::parser::NamedSelection;
+    use crate::connectors::json_selection::parser::NamingPrefix;
+    use crate::connectors::spec::ConnectSpec;
+
+    #[track_caller]
+    fn check_parse(input: &str, expected: LitExpr) {
+        match LitExpr::parse(new_span(input)) {
+            Ok((remainder, parsed)) => {
+                assert!(span_is_all_spaces_or_comments(remainder));
+                assert_eq!(parsed.strip_ranges(), WithRange::new(expected, None));
+            }
+            Err(e) => panic!("Failed to parse '{input}': {e:?}"),
+        };
+    }
+
+    #[test]
+    fn test_lit_expr_parse_primitives() {
+        check_parse("'hello'", LitExpr::String("hello".to_string()));
+        check_parse("\"hello\"", LitExpr::String("hello".to_string()));
+        check_parse(" 'hello' ", LitExpr::String("hello".to_string()));
+        check_parse(" \"hello\" ", LitExpr::String("hello".to_string()));
+
+        check_parse("123", LitExpr::Number(serde_json::Number::from(123)));
+        check_parse("-123", LitExpr::Number(serde_json::Number::from(-123)));
+        check_parse(" - 123 ", LitExpr::Number(serde_json::Number::from(-123)));
+        check_parse(
+            "123.456",
+            LitExpr::Number(serde_json::Number::from_f64(123.456).unwrap()),
+        );
+        check_parse(
+            ".456",
+            LitExpr::Number(serde_json::Number::from_f64(0.456).unwrap()),
+        );
+        check_parse(
+            "-.456",
+            LitExpr::Number(serde_json::Number::from_f64(-0.456).unwrap()),
+        );
+        check_parse(
+            "123.",
+            LitExpr::Number(serde_json::Number::from_f64(123.0).unwrap()),
+        );
+        check_parse(
+            "-123.",
+            LitExpr::Number(serde_json::Number::from_f64(-123.0).unwrap()),
+        );
+        check_parse("00", LitExpr::Number(serde_json::Number::from(0)));
+        check_parse(
+            "-00",
+            LitExpr::Number(serde_json::Number::from_f64(-0.0).unwrap()),
+        );
+        check_parse("0", LitExpr::Number(serde_json::Number::from(0)));
+        check_parse(
+            "-0",
+            LitExpr::Number(serde_json::Number::from_f64(-0.0).unwrap()),
+        );
+        check_parse(" 00 ", LitExpr::Number(serde_json::Number::from(0)));
+        check_parse(" 0 ", LitExpr::Number(serde_json::Number::from(0)));
+        check_parse(
+            " - 0 ",
+            LitExpr::Number(serde_json::Number::from_f64(-0.0).unwrap()),
+        );
+        check_parse("001", LitExpr::Number(serde_json::Number::from(1)));
+        check_parse(
+            "00.1",
+            LitExpr::Number(serde_json::Number::from_f64(0.1).unwrap()),
+        );
+        check_parse("0010", LitExpr::Number(serde_json::Number::from(10)));
+        check_parse(
+            "00.10",
+            LitExpr::Number(serde_json::Number::from_f64(0.1).unwrap()),
+        );
+        check_parse("-001 ", LitExpr::Number(serde_json::Number::from(-1)));
+        check_parse(
+            "-00.1",
+            LitExpr::Number(serde_json::Number::from_f64(-0.1).unwrap()),
+        );
+        check_parse(" - 0010 ", LitExpr::Number(serde_json::Number::from(-10)));
+        check_parse(
+            "- 00.10",
+            LitExpr::Number(serde_json::Number::from_f64(-0.1).unwrap()),
+        );
+        check_parse(
+            "007.",
+            LitExpr::Number(serde_json::Number::from_f64(7.0).unwrap()),
+        );
+        check_parse(
+            "-007.",
+            LitExpr::Number(serde_json::Number::from_f64(-7.0).unwrap()),
+        );
+
+        check_parse("true", LitExpr::Bool(true));
+        check_parse(" true ", LitExpr::Bool(true));
+        check_parse("false", LitExpr::Bool(false));
+        check_parse(" false ", LitExpr::Bool(false));
+        check_parse("null", LitExpr::Null);
+        check_parse(" null ", LitExpr::Null);
+    }
+
+    #[test]
+    fn keywords_respect_identifier_boundary() {
+        // Every keyword crossed with every identifier-continue character.
+        for (keyword, expected) in LitExpr::keywords() {
+            let (_, parsed) = LitExpr::parse_primitive(new_span(keyword))
+                .unwrap_or_else(|e| panic!("Failed to parse '{keyword}': {e:?}"));
+            assert_eq!(
+                parsed.strip_ranges(),
+                WithRange::new(expected.clone(), None),
+                "'{keyword}' should parse as its literal",
+            );
+
+            for c in IDENTIFIER_CONTINUE_CHARS.chars() {
+                let key = format!("{keyword}{c}");
+                let (remainder, parsed) = LitExpr::parse(new_span(&key))
+                    .unwrap_or_else(|e| panic!("Failed to parse '{key}': {e:?}"));
+                assert!(span_is_all_spaces_or_comments(remainder));
+                assert_eq!(
+                    parsed.strip_ranges(),
+                    WithRange::new(
+                        LitExpr::Path(PathSelection::from_slice(&[Key::field(&key)], None)),
+                        None
+                    ),
+                    "'{key}' should parse as a key, not as the literal '{keyword}'",
+                );
+
+                // The alias position is where the bug was silent.
+                let selection = format!("alias: {key}");
+                let parsed = JSONSelection::parse(&selection)
+                    .unwrap_or_else(|e| panic!("Failed to parse '{selection}': {e:?}"));
+                assert_eq!(
+                    parsed.pretty_print_with_indentation(true, 0),
+                    selection,
+                    "'{selection}' should not split into two selections",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lit_expr_parse_keyword_prefixed_keys() {
+        for key in KEYWORD_PREFIXED_KEYS {
+            let (remainder, parsed) = LitExpr::parse(new_span(key))
+                .unwrap_or_else(|e| panic!("Failed to parse '{key}': {e:?}"));
+            assert!(span_is_all_spaces_or_comments(remainder));
+            assert_eq!(
+                parsed.strip_ranges(),
+                WithRange::new(
+                    LitExpr::Path(PathSelection::from_slice(&[Key::field(key)], None)),
+                    None
+                ),
+                "'{key}' should parse as an ordinary key, not a keyword literal",
+            );
+        }
+
+        #[track_caller]
+        fn check_primitive_matches(input: &str, expected: LitExpr) {
+            let (_, parsed) = LitExpr::parse_primitive(new_span(input))
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert_eq!(parsed.strip_ranges(), WithRange::new(expected, None));
+        }
+        check_primitive_matches("null", LitExpr::Null);
+        check_primitive_matches("true", LitExpr::Bool(true));
+        check_primitive_matches("false", LitExpr::Bool(false));
+
+        // A non-identifier character ends the keyword.
+        check_primitive_matches("null.foo", LitExpr::Null);
+        check_primitive_matches("true?bar", LitExpr::Bool(true));
+        check_primitive_matches("null)", LitExpr::Null);
+        check_primitive_matches("false]", LitExpr::Bool(false));
+
+        // Before a SubSelection, a keyword is read as a Key (see the README's
+        // "Literals followed by a SubSelection").
+        #[track_caller]
+        fn check_round_trip(input: &str) {
+            let (remainder, parsed) = LitExpr::parse(new_span(input))
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert!(span_is_all_spaces_or_comments(remainder));
+            assert!(
+                matches!(parsed.as_ref(), LitExpr::Path(_)),
+                "'{input}' should parse as a key path, got {parsed:?}",
+            );
+            assert_eq!(parsed.pretty_print_with_indentation(true, 0), input);
+        }
+        check_round_trip("null { x }");
+        check_round_trip("nullField { x }");
+    }
+
+    #[test]
+    fn test_lit_expr_parse_objects_v0_3() {
+        // v0.3 and earlier parse object literals as an unordered
+        // `LitExpr::LegacyObject` map. Pinned to V0_3 so bumping
+        // `ConnectSpec::latest()` can't silently drop this coverage; v0.4+
+        // `Object` parsing is covered by `test_lit_expr_parse_objects_v0_4`.
+        #[track_caller]
+        fn check_parse(input: &str, expected: LitExpr) {
+            check_parse_with_spec(input, ConnectSpec::V0_3, expected);
+        }
+
+        check_parse(
+            "{a: 1}",
+            LitExpr::LegacyObject({
+                let mut map = IndexMap::default();
+                map.insert(
+                    Key::field("a").into_with_range(),
+                    LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                );
+                map
+            }),
+        );
+
+        check_parse(
+            "{'a': 1}",
+            LitExpr::LegacyObject({
+                let mut map = IndexMap::default();
+                map.insert(
+                    Key::quoted("a").into_with_range(),
+                    LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                );
+                map
+            }),
+        );
+
+        {
+            fn make_expected(a_key: Key, b_key: Key) -> LitExpr {
+                let mut map = IndexMap::default();
+                map.insert(
+                    a_key.into_with_range(),
+                    LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                );
+                map.insert(
+                    b_key.into_with_range(),
+                    LitExpr::Number(serde_json::Number::from(2)).into_with_range(),
+                );
+                LitExpr::LegacyObject(map)
+            }
+            check_parse(
+                "{'a': 1, 'b': 2}",
+                make_expected(Key::quoted("a"), Key::quoted("b")),
+            );
+            check_parse(
+                "{ a : 1, 'b': 2}",
+                make_expected(Key::field("a"), Key::quoted("b")),
+            );
+            check_parse(
+                "{ a : 1, b: 2}",
+                make_expected(Key::field("a"), Key::field("b")),
+            );
+            check_parse(
+                "{ \"a\" : 1, \"b\": 2 }",
+                make_expected(Key::quoted("a"), Key::quoted("b")),
+            );
+            check_parse(
+                "{ \"a\" : 1, b: 2 }",
+                make_expected(Key::quoted("a"), Key::field("b")),
+            );
+            check_parse(
+                "{ a : 1, \"b\": 2 }",
+                make_expected(Key::field("a"), Key::quoted("b")),
+            );
+        }
+    }
+
+    #[test]
+    fn test_lit_expr_parse_objects_v0_4() {
+        // As of connect/v0.4, object literals are syntactically identical to
+        // a `SubSelection`, so `{a: 1}` parses as `LitExpr::Object`, wrapping
+        // one `NamedSelection` per property, rather than `LitExpr::LegacyObject`
+        // (see `test_lit_expr_parse_objects_v0_3`). Behavior is identical across
+        // v0.4 and v0.5, so assert both.
+        #[track_caller]
+        fn check_parse(input: &str, expected: LitExpr) {
+            for spec in [ConnectSpec::V0_4, ConnectSpec::V0_5] {
+                check_parse_with_spec(input, spec, expected.clone());
+            }
+        }
+
+        fn named_number(alias: Alias, value: i64) -> NamedSelection {
+            NamedSelection {
+                prefix: NamingPrefix::Alias(alias),
+                path: LitExpr::Number(serde_json::Number::from(value)).into_with_range(),
+            }
+        }
+
+        check_parse(
+            "{a: 1}",
+            LitExpr::Object(SubSelection {
+                selections: vec![named_number(Alias::field("a"), 1)],
+                ..Default::default()
+            }),
+        );
+
+        check_parse(
+            "{'a': 1}",
+            LitExpr::Object(SubSelection {
+                selections: vec![named_number(Alias::quoted("a"), 1)],
+                ..Default::default()
+            }),
+        );
+
+        {
+            fn make_expected(a_alias: Alias, b_alias: Alias) -> LitExpr {
+                LitExpr::Object(SubSelection {
+                    selections: vec![named_number(a_alias, 1), named_number(b_alias, 2)],
+                    ..Default::default()
+                })
+            }
+            check_parse(
+                "{'a': 1, 'b': 2}",
+                make_expected(Alias::quoted("a"), Alias::quoted("b")),
+            );
+            check_parse(
+                "{ a : 1, 'b': 2}",
+                make_expected(Alias::field("a"), Alias::quoted("b")),
+            );
+            check_parse(
+                "{ a : 1, b: 2}",
+                make_expected(Alias::field("a"), Alias::field("b")),
+            );
+            check_parse(
+                "{ \"a\" : 1, \"b\": 2 }",
+                make_expected(Alias::quoted("a"), Alias::quoted("b")),
+            );
+            check_parse(
+                "{ \"a\" : 1, b: 2 }",
+                make_expected(Alias::quoted("a"), Alias::field("b")),
+            );
+            check_parse(
+                "{ a : 1, \"b\": 2 }",
+                make_expected(Alias::field("a"), Alias::quoted("b")),
+            );
+        }
+    }
+
+    #[test]
+    fn test_lit_expr_parse_arrays() {
+        check_parse(
+            "[1, 2]",
+            LitExpr::Array(vec![
+                WithRange::new(LitExpr::Number(serde_json::Number::from(1)), None),
+                WithRange::new(LitExpr::Number(serde_json::Number::from(2)), None),
+            ]),
+        );
+
+        check_parse(
+            "[1, true, 'three']",
+            LitExpr::Array(vec![
+                WithRange::new(LitExpr::Number(serde_json::Number::from(1)), None),
+                WithRange::new(LitExpr::Bool(true), None),
+                WithRange::new(LitExpr::String("three".to_string()), None),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_lit_expr_parse_paths() {
+        {
+            let expected = LitExpr::Path(PathSelection {
+                path: PathList::Key(
+                    Key::field("a").into_with_range(),
+                    PathList::Key(
+                        Key::field("b").into_with_range(),
+                        PathList::Key(
+                            Key::field("c").into_with_range(),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            });
+
+            check_parse("a.b.c", expected.clone());
+            check_parse(" a . b . c ", expected);
+        }
+
+        {
+            let expected = LitExpr::Path(PathSelection {
+                path: PathList::Var(
+                    KnownVariable::Dollar.into_with_range(),
+                    PathList::Key(
+                        Key::field("data").into_with_range(),
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            });
+            check_parse("$.data", expected.clone());
+            check_parse(" $ . data ", expected);
+        }
+
+        {
+            let expected = LitExpr::Array(vec![
+                LitExpr::Path(PathSelection {
+                    path: PathList::Var(
+                        KnownVariable::Dollar.into_with_range(),
+                        PathList::Key(
+                            Key::field("a").into_with_range(),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+                .into_with_range(),
+                LitExpr::Path(PathSelection {
+                    path: PathList::Key(
+                        Key::field("b").into_with_range(),
+                        PathList::Key(
+                            Key::field("c").into_with_range(),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+                .into_with_range(),
+                LitExpr::Path(PathSelection {
+                    path: PathList::Key(
+                        Key::field("d").into_with_range(),
+                        PathList::Key(
+                            Key::field("e").into_with_range(),
+                            PathList::Key(
+                                Key::field("f").into_with_range(),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+                .into_with_range(),
+            ]);
+
+            check_parse("[$.a, b.c, d.e.f]", expected.clone());
+            check_parse("[$.a, b.c, d.e.f,]", expected.clone());
+            check_parse("[ $ . a , b . c , d . e . f ]", expected.clone());
+            check_parse("[ $ . a , b . c , d . e . f , ]", expected.clone());
+            check_parse(
+                r#"[
+                $.a,
+                b.c,
+                d.e.f,
+            ]"#,
+                expected.clone(),
+            );
+            check_parse(
+                r#"[
+                $ . a ,
+                b . c ,
+                d . e . f ,
+            ]"#,
+                expected,
+            );
+        }
+
+        {
+            // As of connect/v0.4, object literals are syntactically identical
+            // to a `SubSelection`, so `{a: ..., b: ...}` parses as
+            // `LitExpr::Object`, preserving property order as written (unlike
+            // the unordered `LegacyObject` map used before v0.4, pinned in the
+            // block below). Identical across v0.4 and v0.5, so assert both.
+            #[track_caller]
+            fn check_parse(input: &str, expected: LitExpr) {
+                for spec in [ConnectSpec::V0_4, ConnectSpec::V0_5] {
+                    check_parse_with_spec(input, spec, expected.clone());
+                }
+            }
+
+            fn var_path(var: KnownVariable, key: &str) -> LitExpr {
+                LitExpr::Path(PathSelection {
+                    path: PathList::Var(
+                        var.into_with_range(),
+                        PathList::Key(
+                            Key::field(key).into_with_range(),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+            }
+
+            fn named(alias: &str, value: LitExpr) -> NamedSelection {
+                NamedSelection {
+                    prefix: NamingPrefix::Alias(Alias::field(alias)),
+                    path: value.into_with_range(),
+                }
+            }
+
+            let a = named(
+                "a",
+                var_path(KnownVariable::External(Namespace::Args.to_string()), "a"),
+            );
+            let b = named(
+                "b",
+                var_path(KnownVariable::External(Namespace::This.to_string()), "b"),
+            );
+
+            check_parse(
+                r#"{
+                a: $args.a,
+                b: $this.b,
+            }"#,
+                LitExpr::Object(SubSelection {
+                    selections: vec![a.clone(), b.clone()],
+                    ..Default::default()
+                }),
+            );
+
+            check_parse(
+                r#"{
+                b: $this.b,
+                a: $args.a,
+            }"#,
+                LitExpr::Object(SubSelection {
+                    selections: vec![b.clone(), a.clone()],
+                    ..Default::default()
+                }),
+            );
+
+            check_parse(
+                r#" {
+                a : $args . a ,
+                b : $this . b
+            ,} "#,
+                LitExpr::Object(SubSelection {
+                    selections: vec![a, b],
+                    ..Default::default()
+                }),
+            );
+        }
+
+        {
+            // v0.3 parses the same object literals as an unordered
+            // `LegacyObject` map (property order not preserved, so all three
+            // orderings compare equal). Pinned to V0_3 so bumping `latest()`
+            // can't silently drop this coverage.
+            #[track_caller]
+            fn check_parse(input: &str, expected: LitExpr) {
+                check_parse_with_spec(input, ConnectSpec::V0_3, expected);
+            }
+
+            let expected = LitExpr::LegacyObject({
+                let mut map = IndexMap::default();
+                map.insert(
+                    Key::field("a").into_with_range(),
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Var(
+                            KnownVariable::External(Namespace::Args.to_string()).into_with_range(),
+                            PathList::Key(
+                                Key::field("a").into_with_range(),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    })
+                    .into_with_range(),
+                );
+                map.insert(
+                    Key::field("b").into_with_range(),
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Var(
+                            KnownVariable::External(Namespace::This.to_string()).into_with_range(),
+                            PathList::Key(
+                                Key::field("b").into_with_range(),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    })
+                    .into_with_range(),
+                );
+                map
+            });
+
+            check_parse(
+                r#"{
+                a: $args.a,
+                b: $this.b,
+            }"#,
+                expected.clone(),
+            );
+            check_parse(
+                r#"{
+                b: $this.b,
+                a: $args.a,
+            }"#,
+                expected.clone(),
+            );
+            check_parse(
+                r#" {
+                a : $args . a ,
+                b : $this . b
+            ,} "#,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_literal_methods() {
+        #[track_caller]
+        fn check_parse_and_print(input: &str, expected: LitExpr) {
+            // These cases include `$(...)` wrappers that v0.4 would elide in
+            // pretty-printing; use V0_2 so the wrappers survive round-trip.
+            let spec = ConnectSpec::V0_2;
+            let expected_inline = expected.pretty_print_with_indentation(true, 0);
+            match LitExpr::parse(new_span_with_spec(input, spec)) {
+                Ok((remainder, parsed)) => {
+                    assert!(span_is_all_spaces_or_comments(remainder));
+                    assert_eq!(parsed.strip_ranges(), WithRange::new(expected, None));
+                    assert_eq!(parsed.pretty_print_with_indentation(true, 0), input);
+                    assert_eq!(expected_inline, input);
+                }
+                Err(e) => panic!("Failed to parse '{input}': {e:?}"),
+            };
+        }
+
+        check_parse_and_print(
+            "$(\"a\")->first",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::String("a".to_string()).into_with_range(),
+                    PathList::Method(
+                        WithRange::new("first".to_string(), None),
+                        None,
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(\"a\"->first)",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::LitPath(
+                        LitExpr::String("a".to_string()).into_with_range(),
+                        PathList::Method(
+                            WithRange::new("first".to_string(), None),
+                            None,
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(1234)->add(1111)",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::Number(serde_json::Number::from(1234)).into_with_range(),
+                    PathList::Method(
+                        WithRange::new("add".to_string(), None),
+                        Some(MethodArgs {
+                            args: vec![
+                                LitExpr::Number(serde_json::Number::from(1111)).into_with_range(),
+                            ],
+                            range: None,
+                        }),
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(1234->add(1111))",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::LitPath(
+                        LitExpr::Number(serde_json::Number::from(1234)).into_with_range(),
+                        PathList::Method(
+                            WithRange::new("add".to_string(), None),
+                            Some(MethodArgs {
+                                args: vec![
+                                    LitExpr::Number(serde_json::Number::from(1111))
+                                        .into_with_range(),
+                                ],
+                                range: None,
+                            }),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(value->mul(10))",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Key(
+                            Key::field("value").into_with_range(),
+                            PathList::Method(
+                                WithRange::new("mul".to_string(), None),
+                                Some(MethodArgs {
+                                    args: vec![
+                                        LitExpr::Number(serde_json::Number::from(10))
+                                            .into_with_range(),
+                                    ],
+                                    range: None,
+                                }),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    })
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(value.key->typeof)",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Key(
+                            Key::field("value").into_with_range(),
+                            PathList::Key(
+                                Key::field("key").into_with_range(),
+                                PathList::Method(
+                                    WithRange::new("typeof".to_string(), None),
+                                    None,
+                                    PathList::Empty.into_with_range(),
+                                )
+                                .into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    })
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$(value.key)->typeof",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Key(
+                            Key::field("value").into_with_range(),
+                            PathList::Key(
+                                Key::field("key").into_with_range(),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    })
+                    .into_with_range(),
+                    PathList::Method(
+                        WithRange::new("typeof".to_string(), None),
+                        None,
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$([1, 2, 3])->last",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::Array(vec![
+                        LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                        LitExpr::Number(serde_json::Number::from(2)).into_with_range(),
+                        LitExpr::Number(serde_json::Number::from(3)).into_with_range(),
+                    ])
+                    .into_with_range(),
+                    PathList::Method(
+                        WithRange::new("last".to_string(), None),
+                        None,
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$([1, 2, 3]->last)",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::LitPath(
+                        LitExpr::Array(vec![
+                            LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                            LitExpr::Number(serde_json::Number::from(2)).into_with_range(),
+                            LitExpr::Number(serde_json::Number::from(3)).into_with_range(),
+                        ])
+                        .into_with_range(),
+                        PathList::Method(
+                            WithRange::new("last".to_string(), None),
+                            None,
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$({ a: \"ay\", b: 1 }).a",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::LegacyObject({
+                        let mut map = IndexMap::default();
+                        map.insert(
+                            Key::field("a").into_with_range(),
+                            LitExpr::String("ay".to_string()).into_with_range(),
+                        );
+                        map.insert(
+                            Key::field("b").into_with_range(),
+                            LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+                        );
+                        map
+                    })
+                    .into_with_range(),
+                    PathList::Key(
+                        Key::field("a").into_with_range(),
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+
+        check_parse_and_print(
+            "$({ a: \"ay\", b: 2 }.a)",
+            LitExpr::Path(PathSelection {
+                path: PathList::Expr(
+                    LitExpr::LitPath(
+                        LitExpr::LegacyObject({
+                            let mut map = IndexMap::default();
+                            map.insert(
+                                Key::field("a").into_with_range(),
+                                LitExpr::String("ay".to_string()).into_with_range(),
+                            );
+                            map.insert(
+                                Key::field("b").into_with_range(),
+                                LitExpr::Number(serde_json::Number::from(2)).into_with_range(),
+                            );
+                            map
+                        })
+                        .into_with_range(),
+                        PathList::Key(
+                            Key::field("a").into_with_range(),
+                            PathList::Empty.into_with_range(),
+                        )
+                        .into_with_range(),
+                    )
+                    .into_with_range(),
+                    PathList::Empty.into_with_range(),
+                )
+                .into_with_range(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_null_coalescing_operator_parsing() {
+        // Test basic parsing
+        check_parse_with_spec(
+            "null ?? 'Bar'",
+            ConnectSpec::V0_3,
+            LitExpr::OpChain(
+                LitOp::NullishCoalescing.into_with_range(),
+                vec![
+                    LitExpr::Null.into_with_range(),
+                    LitExpr::String("Bar".to_string()).into_with_range(),
+                ],
+            ),
+        );
+
+        check_parse_with_spec(
+            "null ?! 'Bar'",
+            ConnectSpec::V0_3,
+            LitExpr::OpChain(
+                LitOp::NoneCoalescing.into_with_range(),
+                vec![
+                    LitExpr::Null.into_with_range(),
+                    LitExpr::String("Bar".to_string()).into_with_range(),
+                ],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_null_coalescing_chaining() {
+        // Test chaining: A ?? B ?? C should parse as OpChain(NullishCoalescing, [A, B, C])
+        check_parse_with_spec(
+            "null ?? null ?? 'Bar'",
+            ConnectSpec::V0_3,
+            LitExpr::OpChain(
+                LitOp::NullishCoalescing.into_with_range(),
+                vec![
+                    LitExpr::Null.into_with_range(),
+                    LitExpr::Null.into_with_range(),
+                    LitExpr::String("Bar".to_string()).into_with_range(),
+                ],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_operator_mixing_validation() {
+        // Test that mixing operators in a chain fails to parse
+        let result = LitExpr::parse(new_span_with_spec(
+            "null ?? 'foo' ?! 'bar'",
+            ConnectSpec::V0_3,
+        ));
+
+        // Should fail with mixed operators error
+        let err = result.expect_err("Expected parse error for mixed operators ?? and ?!");
+
+        // Verify the error message contains information about mixed operators
+        let error_msg = format!("{err:?}");
+        assert!(
+            error_msg.contains("Found mixed operators ?? and ?!"),
+            "Expected mixed operators error message, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_object_property() {
+        // Test shorthand object property syntax: { a } means { a: a }
+        // This is only supported in V0_4+. Under V0_4, LitExpr::Object carries
+        // a SubSelection body (a Vec<NamedSelection>), so we verify the parsed
+        // shape by examining the output keys and spread prefixes.
+
+        fn object_keys(input: &str) -> Vec<String> {
+            let (remainder, parsed) = LitExpr::parse(new_span_with_spec(input, ConnectSpec::V0_4))
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert!(span_is_all_spaces_or_comments(remainder));
+            let LitExpr::Object(sub) = parsed.as_ref() else {
+                panic!("Expected Object for '{input}', got {:?}", parsed);
+            };
+            sub.selections
+                .iter()
+                .filter_map(|sel| sel.get_single_key().map(|k| k.as_str().to_string()))
+                .collect()
+        }
+
+        assert_eq!(object_keys("{ a }"), vec!["a"]);
+        assert_eq!(object_keys("{ a, b }"), vec!["a", "b"]);
+        // Literal values still require $() wrapping in v0.4 NamedSelection
+        // values; bare-LitExpr values after `alias:` are a follow-up.
+        assert_eq!(object_keys("{ a, b: $(1) }"), vec!["a", "b"]);
+        assert_eq!(object_keys("{ a?, b }"), vec!["a", "b"]);
+        assert_eq!(object_keys("{ a? { b c? }, d }"), vec!["a", "d"]);
+    }
+
+    #[test]
+    fn test_shorthand_not_supported_in_old_versions() {
+        // Shorthand should fail to parse in V0_1, V0_2, and V0_3
+        let result = LitExpr::parse(new_span_with_spec("{ a }", ConnectSpec::V0_1));
+        assert!(result.is_err(), "Shorthand should not parse in V0_1");
+
+        let result = LitExpr::parse(new_span_with_spec("{ a }", ConnectSpec::V0_2));
+        assert!(result.is_err(), "Shorthand should not parse in V0_2");
+
+        let result = LitExpr::parse(new_span_with_spec("{ a }", ConnectSpec::V0_3));
+        assert!(result.is_err(), "Shorthand should not parse in V0_3");
+    }
+
+    #[test]
+    fn test_shorthand_pretty_print() {
+        // Test that { a: a } pretty-prints as { a }
+        let obj = LitExpr::LegacyObject({
+            let mut map = IndexMap::default();
+            map.insert(
+                Key::field("a").into_with_range(),
+                LitExpr::Path(PathSelection {
+                    path: PathList::Key(
+                        Key::field("a").into_with_range(),
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+                .into_with_range(),
+            );
+            map
+        });
+
+        let printed = obj.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a }",
+            "Expected shorthand output, got: {printed}"
+        );
+
+        // But { a: b } should NOT print as shorthand (different key/value names)
+        let obj_diff = LitExpr::LegacyObject({
+            let mut map = IndexMap::default();
+            map.insert(
+                Key::field("a").into_with_range(),
+                LitExpr::Path(PathSelection {
+                    path: PathList::Key(
+                        Key::field("b").into_with_range(),
+                        PathList::Empty.into_with_range(),
+                    )
+                    .into_with_range(),
+                })
+                .into_with_range(),
+            );
+            map
+        });
+
+        let printed = obj_diff.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a: b }",
+            "Expected explicit output, got: {printed}"
+        );
+
+        // { a: 1 } should also NOT print as shorthand (value is not a path)
+        let obj_val = LitExpr::LegacyObject({
+            let mut map = IndexMap::default();
+            map.insert(
+                Key::field("a").into_with_range(),
+                LitExpr::Number(serde_json::Number::from(1)).into_with_range(),
+            );
+            map
+        });
+
+        let printed = obj_val.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a: 1 }",
+            "Expected explicit output, got: {printed}"
+        );
+    }
+
+    #[track_caller]
+    fn check_parse_with_spec(input: &str, spec: ConnectSpec, expected: LitExpr) {
+        match LitExpr::parse(new_span_with_spec(input, spec)) {
+            Ok((remainder, parsed)) => {
+                assert!(span_is_all_spaces_or_comments(remainder));
+                assert_eq!(parsed.strip_ranges(), WithRange::new(expected, None));
+            }
+            Err(e) => panic!("Failed to parse '{input}': {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shorthand_optional_pretty_print() {
+        // { a? } desugars to { a: a? } and should pretty-print back as { a? }
+        let (_, parsed) = LitExpr::parse(new_span_with_spec("{ a? }", ConnectSpec::V0_4)).unwrap();
+        let printed = parsed.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a? }",
+            "Expected shorthand optional output, got: {printed}"
+        );
+
+        // { a?, b } should pretty-print as { a?, b }
+        let (_, parsed) =
+            LitExpr::parse(new_span_with_spec("{ a?, b }", ConnectSpec::V0_4)).unwrap();
+        let printed = parsed.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a?, b }",
+            "Expected shorthand optional output, got: {printed}"
+        );
+
+        // `a: a?` collapses to `a?` (shorthand). In v0.4, `b: $(1)` keeps its
+        // `$(...)` wrapper because `PathList::Expr` in the AST preserves what
+        // the user wrote; only the alias-matches-path shorthand collapses.
+        let (_, parsed) =
+            LitExpr::parse(new_span_with_spec("{ a: a?, b: $(1) }", ConnectSpec::V0_4)).unwrap();
+        let printed = parsed.pretty_print_with_indentation(true, 0);
+        assert_eq!(
+            printed, "{ a?, b: $(1) }",
+            "Expected mixed shorthand output, got: {printed}"
+        );
+    }
+}

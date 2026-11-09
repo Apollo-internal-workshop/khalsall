@@ -1,0 +1,287 @@
+//! Configuration for apollo telemetry exporter.
+use std::fmt::Debug;
+use std::io::Write;
+
+use bytes::BytesMut;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use http::header::ACCEPT;
+use http::header::CONTENT_ENCODING;
+use http::header::CONTENT_TYPE;
+use http::header::USER_AGENT;
+use opentelemetry_sdk::ExportError;
+pub(crate) use prost::*;
+use reqwest::Client;
+use serde::ser::SerializeStruct;
+use sys_info::hostname;
+use tokio::sync::mpsc;
+use tower::BoxError;
+use url::Url;
+
+use super::apollo::Report;
+use super::config::ApolloMetricsReferenceMode;
+use super::metrics::apollo::studio::SingleStatsReport;
+use crate::plugins::telemetry::apollo::ApolloUsageReportsBatchProcessorConfiguration;
+
+const ROUTER_REPORT_TYPE_METRICS: &str = "metrics";
+pub(crate) const ROUTER_REPORT_TYPE_TRACES: &str = "traces";
+const ROUTER_TRACING_PROTOCOL_APOLLO: &str = "apollo";
+pub(crate) const ROUTER_TRACING_PROTOCOL_OTLP: &str = "otlp";
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum ApolloExportError {
+    #[error("Apollo exporter server error: {0}")]
+    ServerError(String),
+
+    #[error("Apollo exporter client error: {0}")]
+    ClientError(String),
+
+    #[error("Apollo exporter unavailable error: {0}")]
+    Unavailable(String),
+}
+
+impl ExportError for ApolloExportError {
+    fn exporter_name(&self) -> &'static str {
+        "ApolloExporter"
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) enum Sender {
+    #[default]
+    Noop,
+    Apollo(mpsc::Sender<SingleStatsReport>),
+}
+
+impl Sender {
+    pub(crate) fn send(&self, report: SingleStatsReport) {
+        match &self {
+            Sender::Noop => {}
+            Sender::Apollo(channel) => {
+                if let Err(err) = channel.to_owned().try_send(report) {
+                    tracing::warn!(
+                        "could not send metrics to telemetry, metric will be dropped: {}",
+                        err
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The Apollo exporter is responsible for attaching report header information for individual requests
+/// and sending usage report metrics periodically.
+pub(crate) struct ApolloExporter {
+    batch_config: ApolloUsageReportsBatchProcessorConfiguration,
+    endpoint: Url,
+    apollo_key: String,
+    header: proto::reports::ReportHeader,
+    client: Client,
+    metrics_reference_mode: ApolloMetricsReferenceMode,
+}
+
+impl ApolloExporter {
+    pub(crate) fn new(
+        endpoint: &Url,
+        batch_config: &ApolloUsageReportsBatchProcessorConfiguration,
+        apollo_key: &str,
+        apollo_graph_ref: &str,
+        schema_id: &str,
+        agent_id: String,
+        metrics_reference_mode: ApolloMetricsReferenceMode,
+    ) -> Result<ApolloExporter, BoxError> {
+        let header = proto::reports::ReportHeader {
+            graph_ref: apollo_graph_ref.to_string(),
+            hostname: hostname()?,
+            agent_version: format!(
+                "{}@{}",
+                std::env!("CARGO_PKG_NAME"),
+                std::env!("CARGO_PKG_VERSION")
+            ),
+            runtime_version: "rust".to_string(),
+            uname: get_uname()?,
+            executable_schema_id: schema_id.to_string(),
+            agent_id,
+            ..Default::default()
+        };
+
+        tracing::debug!("creating apollo exporter {}", endpoint);
+        Ok(ApolloExporter {
+            endpoint: endpoint.clone(),
+            batch_config: batch_config.clone(),
+            apollo_key: apollo_key.to_string(),
+            client: reqwest::Client::builder()
+                .no_gzip()
+                .timeout(*batch_config.max_export_timeout)
+                .build()
+                .map_err(BoxError::from)?,
+            header,
+            metrics_reference_mode,
+        })
+    }
+
+    pub(crate) fn start(self) -> Sender {
+        let (tx, mut rx) = mpsc::channel::<SingleStatsReport>(self.batch_config.max_queue_size);
+        tokio::spawn(async move {
+            let timeout = tokio::time::interval(*self.batch_config.scheduled_delay);
+            let mut report = Report::default();
+
+            tokio::pin!(timeout);
+
+            loop {
+                tokio::select! {
+                    // If you run this example without `biased;`, the polling order is
+                    // pseudo-random and may never choose the timeout tick
+                    biased;
+                    _ = timeout.tick() => {
+                        if let Err(err) = self.submit_report(std::mem::take(&mut report)).await {
+                            tracing::error!("failed to submit Apollo report: {}", err)
+                        }
+                    }
+                    single_report = rx.recv() => {
+                        if let Some(r) = single_report {
+                            report += r;
+                        } else {
+                            tracing::debug!("terminating apollo exporter");
+                            break;
+                        }
+                    },
+                };
+            }
+
+            if let Err(e) = self.submit_report(std::mem::take(&mut report)).await {
+                tracing::error!("failed to submit Apollo report: {}", e)
+            }
+        });
+        Sender::Apollo(tx)
+    }
+
+    pub(crate) async fn submit_report(&self, report: Report) -> Result<(), ApolloExportError> {
+        if report.licensed_operation_count_by_type.is_empty() && report.traces_per_query.is_empty()
+        {
+            return Ok(());
+        }
+
+        let extended_references_enabled = matches!(
+            self.metrics_reference_mode,
+            ApolloMetricsReferenceMode::Extended
+        );
+
+        tracing::debug!("submitting report: {:?}", report);
+        // Protobuf encode message
+        let mut content = BytesMut::new();
+        let proto_report =
+            report.build_proto_report(self.header.clone(), extended_references_enabled);
+        prost::Message::encode(&proto_report, &mut content)
+            .map_err(|e| ApolloExportError::ClientError(e.to_string()))?;
+        // Create a gzip encoder
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        // Write our content to our encoder
+        encoder
+            .write_all(&content)
+            .map_err(|e| ApolloExportError::ClientError(e.to_string()))?;
+        // Finish encoding and retrieve content
+        let compressed_content = encoder
+            .finish()
+            .map_err(|e| ApolloExportError::ClientError(e.to_string()))?;
+        let req = self
+            .client
+            .post(self.endpoint.clone())
+            .body(compressed_content)
+            .header("X-Api-Key", self.apollo_key.clone())
+            .header(CONTENT_ENCODING, "gzip")
+            .header(CONTENT_TYPE, "application/protobuf")
+            .header(ACCEPT, "application/json")
+            .header(
+                USER_AGENT,
+                format!(
+                    "{} / {} usage reporting",
+                    std::env!("CARGO_PKG_NAME"),
+                    std::env!("CARGO_PKG_VERSION")
+                ),
+            )
+            .build()
+            .map_err(|e| ApolloExportError::Unavailable(e.to_string()))?;
+
+        match self.client.execute(req).await {
+            Ok(v) => {
+                let status = v.status();
+                let data = v
+                    .text()
+                    .await
+                    .map_err(|e| ApolloExportError::ServerError(e.to_string()))?;
+                if status.is_client_error() {
+                    tracing::error!("client error reported at ingress: {}", data);
+                    Err(ApolloExportError::ClientError(data))
+                } else if status.is_server_error() {
+                    tracing::warn!("could not transfer: {}", data);
+                    Err(ApolloExportError::Unavailable(data))
+                } else {
+                    tracing::debug!("ingress response text: {:?}", data);
+                    u64_counter!(
+                        "apollo.router.telemetry.studio.reports",
+                        "The number of reports submitted to Studio by the Router",
+                        1,
+                        report.type = ROUTER_REPORT_TYPE_METRICS,
+                        report.protocol = ROUTER_TRACING_PROTOCOL_APOLLO,
+                        report.extended_references_enabled = extended_references_enabled
+                    );
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                tracing::warn!("could not transfer: {}", e);
+                Err(ApolloExportError::Unavailable(e.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn get_uname() -> Result<String, std::io::Error> {
+    let u = uname::uname()?;
+    Ok(format!(
+        "{}, {}, {}, {}, {},",
+        u.sysname, u.nodename, u.release, u.version, u.machine
+    ))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn get_uname() -> Result<String, std::io::Error> {
+    // Best we can do on windows right now
+    let sysname = sys_info::os_type().unwrap_or_else(|_| "Windows".to_owned());
+    let nodename = sys_info::hostname().unwrap_or_else(|_| "unknown".to_owned());
+    let release = sys_info::os_release().unwrap_or_else(|_| "unknown".to_owned());
+    let version = "unknown";
+    let machine = "unknown";
+    Ok(format!(
+        "{}, {}, {}, {}, {}",
+        sysname, nodename, release, version, machine
+    ))
+}
+
+#[allow(unreachable_pub)]
+pub(crate) mod proto {
+    pub(crate) mod reports {
+        #![allow(clippy::derive_partial_eq_without_eq)]
+        tonic::include_proto!("reports");
+    }
+}
+
+pub(crate) fn serialize_timestamp<S>(
+    timestamp: &Option<prost_types::Timestamp>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match timestamp {
+        Some(ts) => {
+            let mut ts_strukt = serializer.serialize_struct("Timestamp", 2)?;
+            ts_strukt.serialize_field("seconds", &ts.seconds)?;
+            ts_strukt.serialize_field("nanos", &ts.nanos)?;
+            ts_strukt.end()
+        }
+        None => serializer.serialize_none(),
+    }
+}

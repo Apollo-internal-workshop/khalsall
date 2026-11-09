@@ -1,0 +1,1921 @@
+//! Rhai module tests.
+
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use futures::StreamExt;
+use http::HeaderMap;
+use http::HeaderValue;
+use http::Method;
+use http::StatusCode;
+use parking_lot::Mutex;
+use rhai::Dynamic;
+use rhai::Engine;
+use rhai::EvalAltResult;
+use rhai::Scope;
+use serde_json::Value;
+use sha2::Digest;
+use tower::BoxError;
+use tower::Service;
+use tower::ServiceExt;
+use tracing_futures::WithSubscriber;
+use uuid::Uuid;
+
+use super::PathBuf;
+use super::Rhai;
+use super::process_error;
+use super::subgraph;
+use crate::Context;
+use crate::assert_response_eq_ignoring_error_id;
+use crate::assert_snapshot_subscriber;
+use crate::graphql;
+use crate::graphql::Error;
+use crate::graphql::Request;
+use crate::http_ext;
+use crate::metrics::FutureMetricsExt;
+use crate::plugin::DynPlugin;
+use crate::plugins::demand_control::cost_calculator::CostBySubgraph;
+use crate::plugins::rhai::engine::RhaiExecutionDeferredResponse;
+use crate::plugins::rhai::engine::RhaiExecutionResponse;
+use crate::plugins::rhai::engine::RhaiRouterChunkedResponse;
+use crate::plugins::rhai::engine::RhaiRouterFirstRequest;
+use crate::plugins::rhai::engine::RhaiRouterResponse;
+use crate::plugins::rhai::engine::RhaiSupergraphDeferredResponse;
+use crate::plugins::rhai::engine::RhaiSupergraphResponse;
+use crate::plugins::rhai::engine::reveal_router_function_error;
+use crate::services::ExecutionRequest;
+use crate::services::SubgraphRequest;
+use crate::services::SupergraphRequest;
+use crate::services::SupergraphResponse;
+use crate::services::execution;
+use crate::services::router;
+use crate::test_harness::tracing_test;
+
+// There is a lot of repetition in these tests, so I've tried to reduce that with these two
+// functions. The repetition could probably be reduced further, but ...
+async fn call_rhai_function(fn_name: &str) -> Result<(), Box<rhai::EvalAltResult>> {
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"request_response_test.rhai"}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Downcast our generic plugin. We know it must be Rhai
+    let it: &dyn std::any::Any = dyn_plugin.as_any();
+    let rhai_instance: &Rhai = it.downcast_ref::<Rhai>().expect("downcast");
+
+    // Get a scope to use for our test
+    let scope = rhai_instance.scope.clone();
+
+    let mut guard = scope.lock();
+
+    // We must wrap our canned response in Arc<Mutex<Option<>>> to keep the rhai runtime
+    // happy
+    let response = Arc::new(Mutex::new(Some(subgraph::Response::fake_builder().build())));
+
+    // Call our rhai test function. If it doesn't return an error, the test failed.
+    rhai_instance
+        .engine
+        .call_fn(&mut guard, &rhai_instance.ast, fn_name, (response,))
+}
+
+async fn call_rhai_function_with_arg<T: Sync + Send + 'static>(
+    fn_name: &str,
+    arg: T,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"request_response_test.rhai"}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Downcast our generic plugin. We know it must be Rhai
+    let it: &dyn std::any::Any = dyn_plugin.as_any();
+    let rhai_instance: &Rhai = it.downcast_ref::<Rhai>().expect("downcast");
+
+    // Get a scope to use for our test
+    let scope = rhai_instance.scope.clone();
+
+    let mut guard = scope.lock();
+
+    // We must wrap our canned request in Arc<Mutex<Option<>>> to keep the rhai runtime
+    // happy
+    let wrapped_arg = Arc::new(Mutex::new(Some(arg)));
+
+    rhai_instance
+        .engine
+        .call_fn(&mut guard, &rhai_instance.ast, fn_name, (wrapped_arg,))
+}
+
+#[tokio::test]
+async fn rhai_plugin_supergraph_service() -> Result<(), BoxError> {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(
+                SupergraphResponse::fake_builder()
+                    .header("x-custom-header", "CUSTOM_VALUE")
+                    .context(req.context)
+                    .build()
+                    .unwrap(),
+            );
+        });
+
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"test.rhai"}"#).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let context = Context::new();
+        context.insert("test", 5i64).unwrap();
+        let supergraph_req = SupergraphRequest::fake_builder().context(context).build()?;
+
+        let mut supergraph_resp = router_service.ready().await?.call(supergraph_req).await?;
+        assert_eq!(supergraph_resp.response.status(), 200);
+        let headers = supergraph_resp.response.headers().clone();
+        let context = supergraph_resp.context.clone();
+        // Check if it fails
+        let resp = supergraph_resp.next_response().await.unwrap();
+        if !resp.errors.is_empty() {
+            panic!(
+                "Contains errors : {}",
+                resp.errors
+                    .into_iter()
+                    .map(|err| err.to_string())
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            );
+        }
+
+        assert_eq!(headers.get("coucou").unwrap(), &"hello");
+        assert_eq!(headers.get("coming_from_entries").unwrap(), &"value_15");
+        assert_eq!(context.get::<_, i64>("test").unwrap().unwrap(), 42i64);
+        assert_eq!(
+            context.get::<_, String>("addition").unwrap().unwrap(),
+            "Here is a new element in the context".to_string()
+        );
+        crate::plugin::test::await_mock_driver(driver).await;
+        Ok(())
+    }
+    .with_subscriber(assert_snapshot_subscriber!())
+    .await
+}
+
+#[tokio::test]
+async fn rhai_plugin_execution_service_error() -> Result<(), BoxError> {
+    async {
+        // The execution_service in test.rhai throws an exception, so the inner service is never called.
+        let (mock_service, handle) =
+            tower_test::mock::pair::<execution::Request, execution::Response>();
+
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"test.rhai"}"#).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.execution_service(mock_service.boxed_clone());
+        let fake_req = http_ext::Request::fake_builder()
+            .header("x-custom-header", "CUSTOM_VALUE")
+            .body(Request::builder().query(String::new()).build())
+            .build()?;
+        let context = Context::new();
+        context.insert("test", 5i64).unwrap();
+        let exec_req = ExecutionRequest::fake_builder()
+            .context(context)
+            .supergraph_request(fake_req)
+            .build();
+
+        let mut exec_resp = router_service
+            .ready()
+            .await
+            .unwrap()
+            .call(exec_req)
+            .await
+            .unwrap();
+        assert_eq!(
+            exec_resp.response.status(),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // Check if it fails
+        let body = exec_resp.next_response().await.unwrap();
+        if body.errors.is_empty() {
+            panic!(
+                "Must contain errors : {}",
+                body.errors
+                    .into_iter()
+                    .map(|err| err.to_string())
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            );
+        }
+
+        // The script threw this string, so the client gets exactly that, with no Rhai wrapper.
+        assert_eq!(
+            body.errors.first().unwrap().message.as_str(),
+            "An error occured"
+        );
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+        Ok(())
+    }
+    .with_subscriber(assert_snapshot_subscriber!({r#"[].message"# => "[message]"}))
+    .await
+}
+
+// Regression test for the Rhai plugin blocking the async executor: script evaluation is
+// expected to run on the blocking thread pool via `spawn_blocking`, not inline on the async
+// executor thread that dispatched the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rhai_script_execution_does_not_block_async_executor() -> Result<(), BoxError> {
+    let (mock_service, mut handle) =
+        tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        responder.send_response(
+            SupergraphResponse::fake_builder()
+                .context(req.context)
+                .build()
+                .unwrap(),
+        );
+    });
+
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"thread_id.rhai"}"#).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+
+    let supergraph_req = SupergraphRequest::fake_builder().build()?;
+    // Spawned so the request is handled by the runtime's single worker thread. `#[tokio::test]`'s
+    // own body runs on the test-harness thread via `block_on`, which is not a worker thread, so
+    // capturing the thread ID there wouldn't tell us anything about where the script ran.
+    let (executor_thread_id, supergraph_resp) = tokio::spawn(async move {
+        let executor_thread_id = format!("{:?}", std::thread::current().id());
+        let resp = router_service.ready().await?.call(supergraph_req).await?;
+        Ok::<_, BoxError>((executor_thread_id, resp))
+    })
+    .await??;
+
+    crate::plugin::test::await_mock_driver(driver).await;
+
+    let script_thread_id = supergraph_resp
+        .context
+        .get::<_, String>("thread_id")
+        .unwrap()
+        .expect("script should have recorded the thread it ran on");
+
+    // If the script ran inline on the async executor rather than via `spawn_blocking`, it would
+    // report the same thread ID as the one that dispatched the request.
+    assert_ne!(
+        script_thread_id, executor_thread_id,
+        "the rhai script ran on the async executor thread instead of a spawn_blocking thread"
+    );
+    Ok(())
+}
+
+// A Rhai engine suitable for minimal testing. There are no scripts and the SDL is an empty
+// string.
+fn new_rhai_test_engine() -> Engine {
+    Rhai::new_rhai_engine(None, "".to_string(), PathBuf::new(), true)
+}
+
+#[tokio::test]
+async fn it_creates_plugin_with_intern_strings_false() {
+    // Verify that intern_strings: false is accepted through the full config
+    // deserialization → plugin initialization path.
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"test.rhai", "intern_strings": false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(dyn_plugin.as_any().downcast_ref::<Rhai>().is_some());
+}
+
+#[test]
+fn it_rejects_unknown_rhai_config_fields() {
+    // Verify that deny_unknown_fields is enforced on the Rhai Conf struct.
+    let result = serde_json::from_str::<super::Conf>(
+        r#"{"scripts":"tests/fixtures", "main":"test.rhai", "unknown_field": "value"}"#,
+    );
+    assert!(
+        result.is_err(),
+        "Config with unknown fields should be rejected"
+    );
+}
+
+#[test]
+fn it_disables_string_interning_when_false() {
+    let engine = Rhai::new_rhai_engine(None, "".to_string(), PathBuf::new(), false);
+    // Verify the engine can still evaluate string-heavy expressions with interning disabled.
+    let result: String = engine
+        .eval(r#"let s = "hello"; s + " " + "world""#)
+        .expect("string ops work without interning");
+    assert_eq!(result, "hello world");
+}
+
+#[test]
+fn it_preserves_default_interning_when_true() {
+    let engine = Rhai::new_rhai_engine(None, "".to_string(), PathBuf::new(), true);
+    // Verify the engine behaves identically to the default when no override is given.
+    let result: String = engine
+        .eval(r#"let s = "hello"; s + " " + "world""#)
+        .expect("string ops work with default interning");
+    assert_eq!(result, "hello world");
+}
+
+#[test]
+fn it_logs_messages() {
+    let _guard = tracing_test::dispatcher_guard();
+
+    let engine = new_rhai_test_engine();
+    let input_logs = vec![
+        r#"log_trace("trace log")"#,
+        r#"log_debug("debug log")"#,
+        r#"log_info("info log")"#,
+        r#"log_warn("warn log")"#,
+        r#"log_error("error log")"#,
+    ];
+    for log in input_logs {
+        engine.eval::<()>(log).expect("it logged a message");
+    }
+
+    assert!(tracing_test::logs_contain("trace log"));
+    assert!(tracing_test::logs_contain("debug log"));
+    assert!(tracing_test::logs_contain("info log"));
+    assert!(tracing_test::logs_contain("warn log"));
+    assert!(tracing_test::logs_contain("error log"));
+}
+
+#[test]
+fn it_prints_messages_to_log() {
+    use tracing::subscriber;
+
+    use crate::assert_snapshot_subscriber;
+
+    subscriber::with_default(assert_snapshot_subscriber!(), || {
+        let engine = new_rhai_test_engine();
+        engine
+            .eval::<()>(r#"print("info log")"#)
+            .expect("it logged a message");
+    });
+}
+
+// The Rhai customization docs show this pattern for logging a router function's error.
+#[test]
+fn it_logs_the_text_of_a_caught_router_function_error() {
+    use tracing::subscriber;
+
+    use crate::assert_snapshot_subscriber;
+
+    subscriber::with_default(assert_snapshot_subscriber!(), || {
+        let engine = new_rhai_test_engine();
+        let mut scope = Scope::new();
+        scope.push("headers", HeaderMap::new());
+        engine
+            .run_with_scope(
+                &mut scope,
+                r#"
+                try {
+                    let value = headers["x-custom-header"];
+                } catch(err) {
+                    log_error(`missing header: ${err}`);
+                    log_error(err);
+                }"#,
+            )
+            .expect("the script catches the error");
+    });
+}
+
+#[tokio::test]
+async fn it_can_access_sdl_constant() {
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"test.rhai"}"#).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Downcast our generic plugin. We know it must be Rhai
+    let it: &dyn std::any::Any = dyn_plugin.as_any();
+    let rhai_instance: &Rhai = it.downcast_ref::<Rhai>().expect("downcast");
+
+    // Get a scope to use for our test
+    let scope = rhai_instance.scope.clone();
+
+    let mut guard = scope.lock();
+
+    // Call our function to make sure we can access the sdl
+    let sdl: String = rhai_instance
+        .engine
+        .call_fn(&mut guard, &rhai_instance.ast, "get_sdl", ())
+        .expect("can get sdl");
+    assert_eq!(sdl.as_str(), "");
+}
+
+#[test]
+fn it_provides_helpful_headermap_errors() {
+    let mut engine = new_rhai_test_engine();
+    engine.register_fn("new_hm", HeaderMap::new);
+
+    let result = engine.eval::<HeaderMap>(
+        r#"
+let map = new_hm();
+map["ümlaut"] = "will fail";
+map
+"#,
+    );
+    assert!(result.is_err());
+    assert!(matches!(
+        *result.unwrap_err(),
+        EvalAltResult::ErrorRuntime(..)
+    ));
+}
+
+#[tokio::test]
+async fn it_can_process_router_request() {
+    let mut request = RhaiRouterFirstRequest::default();
+    request.request.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_str("application/json").unwrap(),
+    );
+    *request.request.method_mut() = http::Method::GET;
+
+    call_rhai_function_with_arg("process_router_request", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_supergraph_request() {
+    let request = SupergraphRequest::canned_builder()
+        .operation_name("canned")
+        .build()
+        .expect("build canned supergraph request");
+
+    call_rhai_function_with_arg("process_supergraph_request", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_execution_request() {
+    let request = ExecutionRequest::fake_builder().build();
+    call_rhai_function_with_arg("process_execution_request", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_subgraph_request() {
+    let request = SubgraphRequest::fake_builder().build();
+    call_rhai_function_with_arg("process_subgraph_request", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_router_response() {
+    let response = RhaiRouterResponse::default();
+    call_rhai_function_with_arg("process_router_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_router_chunked_response() {
+    let response = RhaiRouterChunkedResponse::default();
+    call_rhai_function_with_arg("process_router_chunked_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_supergraph_response() {
+    let response = RhaiSupergraphResponse::default();
+    call_rhai_function_with_arg("process_supergraph_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_supergraph_deferred_response() {
+    let response = RhaiSupergraphDeferredResponse::default();
+    call_rhai_function_with_arg("process_supergraph_deferred_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_execution_response() {
+    let response = RhaiExecutionResponse::default();
+    call_rhai_function_with_arg("process_execution_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_execution_deferred_response() {
+    let response = RhaiExecutionDeferredResponse::default();
+    call_rhai_function_with_arg("process_execution_deferred_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_process_subgraph_response() {
+    let response = subgraph::Response::fake_builder()
+        .status_code(StatusCode::OK)
+        .build();
+    call_rhai_function_with_arg("process_subgraph_response", response)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn it_can_parse_request_uri() {
+    let mut request = SupergraphRequest::canned_builder()
+        .operation_name("canned")
+        .build()
+        .expect("build canned supergraph request");
+    *request.supergraph_request.uri_mut() = "https://not-default:8080/path".parse().unwrap();
+    call_rhai_function_with_arg("test_parse_request_details", request)
+        .await
+        .expect("test failed");
+}
+
+#[test]
+fn it_can_urlencode_string() {
+    let engine = new_rhai_test_engine();
+    let encoded: String = engine
+        .eval(r#"urlencode("This has an ümlaut in it.")"#)
+        .expect("can encode string");
+    assert_eq!(encoded, "This%20has%20an%20%C3%BCmlaut%20in%20it.");
+}
+
+#[test]
+fn it_can_urldecode_string() {
+    let engine = new_rhai_test_engine();
+    let decoded: String = engine
+        .eval(r#"urldecode("This%20has%20an%20%C3%BCmlaut%20in%20it.")"#)
+        .expect("can decode string");
+    assert_eq!(decoded, "This has an ümlaut in it.");
+}
+
+#[test]
+fn it_can_base64encode_string() {
+    let engine = new_rhai_test_engine();
+    let encoded: String = engine
+        .eval(r#"base64::encode("This has an ümlaut in it.")"#)
+        .expect("can encode string");
+    assert_eq!(encoded, "VGhpcyBoYXMgYW4gw7xtbGF1dCBpbiBpdC4=");
+}
+
+#[test]
+fn it_can_base64decode_string() {
+    let engine = new_rhai_test_engine();
+    let decoded: String = engine
+        .eval(r#"base64::decode("VGhpcyBoYXMgYW4gw7xtbGF1dCBpbiBpdC4=")"#)
+        .expect("can decode string");
+    assert_eq!(decoded, "This has an ümlaut in it.");
+}
+
+#[test]
+fn it_can_base64encode_string_with_alphabet() {
+    let engine = new_rhai_test_engine();
+    let encoded: String = engine
+        .eval(r#"base64::encode("<<???>>", base64::STANDARD)"#)
+        .expect("can encode string");
+    assert_eq!(encoded, "PDw/Pz8+Pg==");
+    let encoded: String = engine
+        .eval(r#"base64::encode("<<???>>", base64::URL_SAFE)"#)
+        .expect("can encode string");
+    assert_eq!(encoded, "PDw_Pz8-Pg==");
+}
+
+#[test]
+fn it_can_base64decode_string_with_alphabet() {
+    let engine = new_rhai_test_engine();
+    let decoded: String = engine
+        .eval(r#"base64::decode("PDw/Pz8+Pg==", base64::STANDARD)"#)
+        .expect("can decode string");
+    assert_eq!(decoded, "<<???>>");
+    let decoded: String = engine
+        .eval(r#"base64::decode("PDw_Pz8-Pg==", base64::URL_SAFE)"#)
+        .expect("can decode string");
+    assert_eq!(decoded, "<<???>>");
+}
+
+#[test]
+fn it_can_create_unix_now() {
+    let engine = new_rhai_test_engine();
+    let st = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("can get system time")
+        .as_secs() as i64;
+    let unix_now: i64 = engine
+        .eval(r#"unix_now()"#)
+        .expect("can get unix_now() timestamp");
+    // Always difficult to do timing tests. unix_now() should execute within a second of st,
+    // so...
+    assert!(st <= unix_now && unix_now <= st + 1);
+}
+
+#[test]
+fn it_can_create_unix_ms_now() {
+    let engine = new_rhai_test_engine();
+    let st = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("can get system time")
+        .as_millis() as i64;
+    let unix_ms_now: i64 = engine
+        .eval(r#"unix_ms_now()"#)
+        .expect("can get unix_ms_now() timestamp");
+    // Always difficult to do timing tests. unix_ms_now() should execute within a second of st,
+    // so...
+    assert!(st <= unix_ms_now && unix_ms_now <= st + 1000);
+}
+
+#[test]
+fn it_can_generate_uuid() {
+    let engine = new_rhai_test_engine();
+    let uuid_v4_rhai: String = engine.eval(r#"uuid_v4()"#).expect("can get uuid");
+    // attempt to parse back to UUID..
+    let uuid_parsed = Uuid::parse_str(uuid_v4_rhai.as_str()).expect("can parse uuid from string");
+    // finally validate that parsed string equals the returned value
+    assert_eq!(uuid_v4_rhai, uuid_parsed.to_string());
+}
+
+#[test]
+fn it_can_sha256_string() {
+    let engine = new_rhai_test_engine();
+    let hash = sha2::Sha256::digest("hello world".as_bytes());
+    let hash_rhai: String = engine
+        .eval(r#"sha256::digest("hello world")"#)
+        .expect("can decode string");
+    assert_eq!(hash_rhai, hex::encode(hash));
+}
+
+async fn base_globals_function(fn_name: &str) -> Result<bool, Box<rhai::EvalAltResult>> {
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"global_variables_test.rhai"}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Downcast our generic plugin. We know it must be Rhai
+    let it: &dyn std::any::Any = dyn_plugin.as_any();
+    let rhai_instance: &Rhai = it.downcast_ref::<Rhai>().expect("downcast");
+
+    // Get a scope to use for our test
+    let scope = rhai_instance.scope.clone();
+
+    let mut guard = scope.lock();
+
+    // Call our rhai test function. If it doesn't return an error, the test failed.
+    rhai_instance
+        .engine
+        .call_fn(&mut guard, &rhai_instance.ast, fn_name, ())
+}
+
+#[tokio::test]
+async fn it_can_find_router_global_variables() {
+    if let Err(error) = base_globals_function("process_router_global_variables").await {
+        panic!("test failed: {error:?}");
+    }
+}
+
+#[tokio::test]
+async fn it_can_process_om_subgraph_forbidden() {
+    if let Err(error) = call_rhai_function("process_subgraph_response_om_forbidden").await {
+        let processed_error = process_error(error);
+        assert_eq!(processed_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            processed_error.message,
+            Some("I have raised a 403".to_string())
+        );
+    } else {
+        // Test failed
+        panic!("error processed incorrectly");
+    }
+}
+
+#[tokio::test]
+async fn it_can_process_om_subgraph_forbidden_with_graphql_payload() {
+    let error = call_rhai_function("process_subgraph_response_om_forbidden_graphql")
+        .await
+        .unwrap_err();
+
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status, StatusCode::FORBIDDEN);
+    assert_response_eq_ignoring_error_id!(
+        processed_error.body.unwrap(),
+        graphql::Response::builder()
+            .errors(vec![{
+                Error::builder()
+                    .message("I have raised a 403")
+                    .extension_code("ACCESS_DENIED")
+                    .build()
+            }])
+            .build()
+    );
+}
+
+#[tokio::test]
+async fn it_can_process_om_subgraph_200_with_graphql_data() {
+    let error = call_rhai_function("process_subgraph_response_om_200_graphql")
+        .await
+        .unwrap_err();
+
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status, StatusCode::OK);
+    assert_eq!(
+        processed_error.body,
+        Some(
+            graphql::Response::builder()
+                .data(serde_json::json!({ "name": "Ada Lovelace"}))
+                .build()
+        )
+    );
+}
+
+#[tokio::test]
+async fn it_can_process_string_subgraph_forbidden() {
+    if let Err(error) = call_rhai_function("process_subgraph_response_string").await {
+        let processed_error = process_error(error);
+        assert_eq!(processed_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            processed_error.message,
+            Some("I have raised an error".to_string())
+        );
+    } else {
+        // Test failed
+        panic!("error processed incorrectly");
+    }
+}
+
+#[tokio::test]
+async fn it_can_process_ok_subgraph_forbidden() {
+    let error = call_rhai_function("process_subgraph_response_om_ok")
+        .await
+        .unwrap_err();
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status, StatusCode::OK);
+    assert_eq!(
+        processed_error.message,
+        Some("I have raised a 200".to_string())
+    );
+}
+
+#[tokio::test]
+async fn it_cannot_process_om_subgraph_missing_message_and_body() {
+    if let Err(error) = call_rhai_function("process_subgraph_response_om_missing_message").await {
+        let processed_error = process_error(error);
+        assert_eq!(processed_error.status, StatusCode::BAD_REQUEST);
+        // The throw carries no message of its own, so the client gets the status code's reason
+        // phrase rather than a dump of the thrown object.
+        assert_eq!(processed_error.message, Some("Bad Request".to_string()));
+    } else {
+        // Test failed
+        panic!("error processed incorrectly");
+    }
+}
+
+// What a client must see is the same however the failure was reached, so the redaction tests below
+// assert it in one place. A macro rather than a function because each stage has its own response
+// type, and all they have in common is the shape asserted here.
+macro_rules! assert_client_sees_only_the_redacted_message {
+    ($response:expr) => {{
+        let mut response = $response;
+        assert_eq!(
+            response.response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let body = response.next_response().await.expect("there is a response");
+        let message = &body.errors.first().expect("the request failed").message;
+        assert_eq!(message, "Internal Server Error");
+    }};
+}
+
+// A failure the script author did not choose - the Rhai engine's own, or one raised by a router
+// Rhai function - describes the script's internals, so the client gets the status code's reason
+// phrase and the real error goes to the logs.
+#[tokio::test]
+async fn it_redacts_engine_errors_from_client_responses() -> Result<(), BoxError> {
+    async {
+        let (mock_service, handle) =
+            tower_test::mock::pair::<execution::Request, execution::Response>();
+        let dyn_plugin = create_plugin("rhai_engine_error.rhai").await?;
+
+        // execution_service calls a function that does not exist, so the engine fails before any
+        // router function is reached.
+        let mut service = dyn_plugin.execution_service(mock_service.boxed_clone());
+        let fake_req = http_ext::Request::fake_builder()
+            .body(Request::builder().query(String::new()).build())
+            .build()?;
+        let req = ExecutionRequest::fake_builder()
+            .context(Context::new())
+            .supergraph_request(fake_req)
+            .build();
+
+        assert_client_sees_only_the_redacted_message!(service.ready().await?.call(req).await?);
+
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+        Ok(())
+    }
+    // The snapshot of the logs is what holds the router to still recording the real error.
+    .with_subscriber(assert_snapshot_subscriber!())
+    .await
+}
+
+#[tokio::test]
+async fn it_redacts_a_router_function_error() -> Result<(), BoxError> {
+    async {
+        let (mock_service, handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+        let dyn_plugin = create_plugin("rhai_redacted_error.rhai").await?;
+
+        // supergraph_service reads a header that is not there. The error names the header, which
+        // the logs keep and the client must not see.
+        let mut service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let req = SupergraphRequest::fake_builder()
+            .context(Context::new())
+            .build()?;
+
+        assert_client_sees_only_the_redacted_message!(service.ready().await?.call(req).await?);
+
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+        Ok(())
+    }
+    .with_subscriber(assert_snapshot_subscriber!())
+    .await
+}
+
+// The router's own Rhai functions describe what went wrong in terms of the script's inputs, such as
+// the environment variables it reads or the headers it expects, so clients must not see the text.
+#[test]
+fn it_redacts_router_function_errors() {
+    let engine = new_rhai_test_engine();
+    for (script, logged) in [
+        (
+            r#"env::get("THIS_SHOULD_NOT_EXIST")"#,
+            "could not expand variable: THIS_SHOULD_NOT_EXIST",
+        ),
+        (r#"base64::decode("$$$")"#, "Invalid symbol 36, offset 0."),
+        ("status_code_from_int(1000)", "invalid status code"),
+        (r#"json::decode("{")"#, "EOF while parsing"),
+        (r#"headers["x-missing"]"#, "header 'x-missing' not found"),
+        (
+            r#"headers["bad name"] = "value""#,
+            "invalid HTTP header name",
+        ),
+        (
+            r#"headers["x-name"] = "bad\nvalue""#,
+            "failed to parse header value",
+        ),
+        (r#"uri.host = "bad host""#, "invalid uri character"),
+    ] {
+        let mut scope = Scope::new();
+        scope.push("headers", HeaderMap::new());
+        scope.push("uri", http::Uri::from_static("http://localhost:4000/"));
+        let error = engine
+            .eval_with_scope::<Dynamic>(&mut scope, script)
+            .expect_err("the router function fails");
+
+        let processed_error = process_error(error);
+        assert_eq!(
+            processed_error.message.as_deref(),
+            Some("Internal Server Error"),
+            "{script}"
+        );
+        let internal_detail = processed_error
+            .internal_detail
+            .expect("the real error is kept for the logs");
+        assert!(
+            internal_detail.contains(logged),
+            "{script}: {internal_detail}"
+        );
+    }
+}
+
+// Catching a router function's error is how a script chooses what the client sees instead. `err` is
+// an error object rather than a string, as the upgrade note says.
+#[test]
+fn it_returns_a_message_thrown_after_catching_a_router_function_error() {
+    let engine = new_rhai_test_engine();
+    let error = engine
+        .eval::<()>(
+            r#"
+            try {
+                env::get("THIS_SHOULD_NOT_EXIST");
+            } catch (err) {
+                if type_of(err) == "string" || err == err.to_string() {
+                    throw "caught a string";
+                }
+                throw "caught: " + err.to_string();
+            }"#,
+        )
+        .expect_err("the script throws");
+
+    let processed_error = process_error(error);
+    assert_eq!(
+        processed_error.message.as_deref(),
+        Some(
+            "caught: could not expand variable: THIS_SHOULD_NOT_EXIST, environment variable not found"
+        )
+    );
+}
+
+// The response stream ending before there is a primary response is not a callback failure, but the
+// client still gets a redacted message, so the log is the only record of what actually happened.
+#[tokio::test]
+async fn it_redacts_an_empty_response_stream() -> Result<(), BoxError> {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            let response = SupergraphResponse::fake_builder()
+                .context(req.context)
+                .build()
+                .unwrap();
+            // Throw away the primary response, leaving map_response nothing to be handed.
+            responder.send_response(response.map(|_| futures::stream::empty().boxed()));
+        });
+
+        let dyn_plugin = create_plugin("rhai_empty_response.rhai").await?;
+        let mut service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let req = SupergraphRequest::fake_builder()
+            .context(Context::new())
+            .build()?;
+
+        assert_client_sees_only_the_redacted_message!(service.ready().await?.call(req).await?);
+
+        crate::plugin::test::await_mock_driver(driver).await;
+        Ok(())
+    }
+    // The snapshot is what holds the router to recording a cause the client no longer sees.
+    .with_subscriber(assert_snapshot_subscriber!())
+    .await
+}
+
+#[test]
+fn it_returns_a_thrown_string_without_the_rhai_wrapper() {
+    let engine = new_rhai_test_engine();
+    let error = engine
+        .eval::<()>(r#"throw "failed to convert header to a str";"#)
+        .expect_err("the script throws");
+
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        processed_error.message,
+        Some("failed to convert header to a str".to_string()),
+        "the author's string is theirs to return, but nothing around it is"
+    );
+}
+
+#[test]
+fn it_redacts_a_throw_whose_message_is_empty() {
+    let engine = new_rhai_test_engine();
+    // The expected status is spelled out rather than read back off the result, so that a throw
+    // losing the status it asked for fails here too - the reason phrase alone would move with it.
+    for (script, status, message) in [
+        (
+            r#"throw "";"#,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+        ),
+        (
+            r#"throw #{ status: 400, message: "" };"#,
+            StatusCode::BAD_REQUEST,
+            "Bad Request",
+        ),
+    ] {
+        let error = engine.eval::<()>(script).expect_err("the script throws");
+
+        let processed_error = process_error(error);
+        assert_eq!(processed_error.status, status, "{script}");
+        assert_eq!(
+            processed_error.message.as_deref(),
+            Some(message),
+            "an empty message is not one a client can act on: {script}"
+        );
+    }
+}
+
+// A thrown scalar carries no message that can be returned without dumping the thrown value, which
+// is the disclosure this redaction exists to stop, so the author's value is dropped. Documented in
+// the Rhai customization docs alongside the other redacted cases.
+#[test]
+fn it_redacts_a_throw_that_is_not_a_string_or_a_map() {
+    let engine = new_rhai_test_engine();
+    for script in ["throw 42;", r#"throw ["a", "b"];"#, "throw true;"] {
+        let error = engine.eval::<()>(script).expect_err("the script throws");
+
+        let processed_error = process_error(error);
+        assert_eq!(
+            processed_error.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{script}"
+        );
+        assert_eq!(
+            processed_error.message.as_deref(),
+            Some("Internal Server Error"),
+            "the thrown value must not reach the client: {script}"
+        );
+    }
+}
+
+// A map the router cannot read loses everything in it, including parts it could have read. Split out
+// from the scalar cases because this is the one a script author is liable to hit by accident, and
+// the only one where a message they did write is dropped.
+#[test]
+fn it_redacts_a_throw_whose_map_cannot_be_read() {
+    let engine = new_rhai_test_engine();
+    // `status` is not a status code, so deserializing the map fails as a whole - the `message`
+    // beside it is never read, and the status the author asked for is lost with it.
+    let error = engine
+        .eval::<()>(r#"throw #{ status: "four hundred", message: "nope" };"#)
+        .expect_err("the script throws");
+
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        processed_error.message.as_deref(),
+        Some("Internal Server Error"),
+        "a map that cannot be read must not be dumped to the client either"
+    );
+}
+
+#[test]
+fn it_redacts_a_throw_with_an_unrecognised_status() {
+    let engine = new_rhai_test_engine();
+    let error = engine
+        .eval::<()>("throw #{ status: 599 };")
+        .expect_err("the script throws");
+
+    let processed_error = process_error(error);
+    assert_eq!(processed_error.status.as_u16(), 599);
+    assert_eq!(processed_error.message, Some("Unknown Error".to_string()));
+}
+
+#[test]
+fn it_keeps_the_internal_detail_out_of_the_client_message() {
+    let engine = new_rhai_test_engine();
+    let error = engine
+        .eval::<()>("this_function_does_not_exist();")
+        .expect_err("the function does not exist");
+
+    let processed_error = process_error(error);
+    assert_eq!(
+        processed_error.message,
+        Some("Internal Server Error".to_string())
+    );
+    let internal_detail = processed_error
+        .internal_detail
+        .expect("the real error is kept for the logs");
+    assert!(
+        internal_detail.contains("this_function_does_not_exist"),
+        "the logs have to keep the reason the client no longer sees: {internal_detail}"
+    );
+}
+
+#[tokio::test]
+async fn it_mentions_source_when_syntax_error_occurs() {
+    let err: Box<dyn std::error::Error> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"syntax_errors.rhai"}"#)
+                .unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+    assert!(err.to_string().contains("syntax_errors.rhai"));
+}
+
+#[test]
+fn it_cannot_expand_missing_environment_variable() {
+    assert!(std::env::var("THIS_SHOULD_NOT_EXIST").is_err());
+    let engine = new_rhai_test_engine();
+    let mut error = engine
+        .eval::<String>(r#"env::get("THIS_SHOULD_NOT_EXIST")"#)
+        .expect_err("the variable is not set");
+    reveal_router_function_error(&mut error);
+    assert_eq!(
+        error.to_string(),
+        "Runtime error: could not expand variable: THIS_SHOULD_NOT_EXIST, environment variable not found"
+    );
+}
+
+// POSIX specifies HOME is always set
+#[test]
+fn it_can_expand_environment_variable() {
+    let home = std::env::var("HOME").expect("can always read HOME");
+    let engine = new_rhai_test_engine();
+    let env_variable: String = engine
+        .eval(
+            r#"
+        env::get("HOME")"#,
+        )
+        .expect("can use env");
+    assert_eq!(home, env_variable);
+}
+
+#[test]
+fn it_can_compare_method_strings() {
+    let mut engine = new_rhai_test_engine();
+    engine.register_fn(
+        "new_method",
+        |method: &str| -> Result<Method, Box<EvalAltResult>> {
+            Method::from_str(&method.to_uppercase()).map_err(|e| e.to_string().into())
+        },
+    );
+
+    let method: bool = engine
+        .eval(
+            r#"
+        let get = new_method("GEt").to_string();
+        get == "GET"
+        "#,
+        )
+        .expect("can compare properly");
+    assert!(method);
+}
+
+#[tokio::test]
+async fn test_router_service_adds_timestamp_header() -> Result<(), BoxError> {
+    let (mock_service, mut handle) =
+        tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        responder.send_response(
+            SupergraphResponse::fake_builder()
+                .header("x-custom-header", "CUSTOM_VALUE")
+                .context(req.context)
+                .build()
+                .unwrap(),
+        );
+    });
+
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"remove_header.rhai"}"#)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+    let context = Context::new();
+    context.insert("test", 5i64).unwrap();
+    let supergraph_req = SupergraphRequest::fake_builder()
+        .header("x-custom-header", "CUSTOM_VALUE")
+        .context(context)
+        .build()?;
+
+    let service_response = router_service.ready().await?.call(supergraph_req).await?;
+    assert_eq!(StatusCode::OK, service_response.response.status());
+
+    let headers = service_response.response.headers().clone();
+    assert!(headers.get("x-custom-header").is_none());
+
+    crate::plugin::test::await_mock_driver(driver).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn it_can_access_demand_control_context() -> Result<(), BoxError> {
+    let (mock_service, mut handle) =
+        tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        responder.send_response(
+            SupergraphResponse::fake_builder()
+                .context(req.context)
+                .build()
+                .unwrap(),
+        );
+    });
+
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(r#"{"scripts":"tests/fixtures", "main":"demand_control.rhai"}"#)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+    let context = Context::new();
+    context.insert_estimated_cost(50.0).unwrap();
+    context.insert_actual_cost(35.0).unwrap();
+    context
+        .insert_cost_strategy("test_strategy".to_string())
+        .unwrap();
+    context.insert_cost_result("COST_OK".to_string()).unwrap();
+    let estimated_cost_by_subgraph =
+        CostBySubgraph::from(&[("products", 40.0), ("users", 10.0)][..]);
+    context.insert_estimated_cost_by_subgraph(estimated_cost_by_subgraph)?;
+    let actual_cost_by_subgraph = CostBySubgraph::from(&[("products", 29.0), ("users", 6.0)][..]);
+    context.insert_actual_cost_by_subgraph(actual_cost_by_subgraph)?;
+    context.insert_cost_by_subgraph_result("products".to_string(), "COST_OK".to_string())?;
+    context.insert_cost_by_subgraph_result("users".to_string(), "COST_OK".to_string())?;
+
+    let supergraph_req = SupergraphRequest::fake_builder().context(context).build()?;
+
+    let service_response = router_service.ready().await?.call(supergraph_req).await?;
+    assert_eq!(StatusCode::OK, service_response.response.status());
+
+    let headers = service_response.response.headers();
+    for (key, expected_value) in [
+        ("demand-control-estimate", "50.0"),
+        ("demand-control-actual", "35.0"),
+        ("demand-control-strategy", "test_strategy"),
+        ("demand-control-result", "COST_OK"),
+        ("demand-control-estimate-subgraph-products", "40.0"),
+        ("demand-control-estimate-subgraph-users", "10.0"),
+        ("demand-control-estimate-subgraphs", "2"),
+        ("demand-control-actual-subgraph-products", "29.0"),
+        ("demand-control-actual-subgraph-users", "6.0"),
+        ("demand-control-actual-subgraphs", "2"),
+        ("demand-control-result-subgraph-products", "COST_OK"),
+        ("demand-control-result-subgraph-users", "COST_OK"),
+        ("demand-control-result-subgraphs", "2"),
+    ] {
+        let header_value = headers
+            .get(key)
+            .unwrap_or_else(|| panic!("headers should have value for key `{key}`"))
+            .to_str()
+            .unwrap_or_else(|_| panic!("value for key `{key}` should be a string"));
+        assert_eq!(header_value, expected_value, "key = `{key}`");
+    }
+
+    crate::plugin::test::await_mock_driver(driver).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rhai_header_removal_with_non_utf8_header() -> Result<(), BoxError> {
+    let bytes = b"\x80";
+    // Prove that the bytes are not valid UTF-8
+    assert!(String::from_utf8(bytes.to_vec()).is_err());
+
+    let (mock_service, mut handle) =
+        tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+    let driver = tokio::spawn(async move {
+        let (req, responder) = handle.next_request().await.unwrap();
+        let mut response_builder = SupergraphResponse::fake_builder().context(req.context);
+        let header_value = HeaderValue::from_bytes(bytes).unwrap();
+        response_builder = response_builder.header("x-binary-header", header_value);
+        responder.send_response(response_builder.build().unwrap());
+    });
+
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"non_utf8_header_removal.rhai"}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+    let context = Context::new();
+    let supergraph_req = SupergraphRequest::fake_builder().context(context).build()?;
+
+    let mut service_response = router_service.ready().await?.call(supergraph_req).await?;
+
+    assert_eq!(StatusCode::OK, service_response.response.status());
+
+    // Removing a non-UTF-8 header should be OK
+    let body = service_response.next_response().await.unwrap();
+    assert!(
+        body.errors.is_empty(),
+        "removing a non-UTF-8 header should not fail: {:?}",
+        body.errors
+    );
+
+    // Check that the header was actually removed
+    let headers = service_response.response.headers().clone();
+    assert!(
+        headers.get("x-binary-header").is_none(),
+        "x-binary-header should have been removed but it's still present"
+    );
+
+    crate::plugin::test::await_mock_driver(driver).await;
+    Ok(())
+}
+
+async fn test_supergraph_error_logging(script_name: &str) -> Result<(), BoxError> {
+    let (mock_service, handle) = tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+
+    let dyn_plugin = create_plugin(script_name).await?;
+
+    let mut service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+    let req = SupergraphRequest::fake_builder()
+        .context(Context::new())
+        .build()?;
+
+    let _response = service.ready().await?.call(req).await?;
+    crate::plugin::test::assert_no_mock_calls(handle).await;
+    Ok(())
+}
+
+async fn create_plugin(script_name: &str) -> Result<Box<dyn DynPlugin>, BoxError> {
+    let config = format!(
+        r#"{{"scripts":"tests/fixtures", "main":"{}"}}"#,
+        script_name
+    );
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(&Value::from_str(&config)?)
+        .await?;
+    Ok(dyn_plugin)
+}
+
+async fn test_execution_error_logging(script_name: &str) -> Result<(), BoxError> {
+    let (mock_service, handle) =
+        tower_test::mock::pair::<execution::Request, execution::Response>();
+    let dyn_plugin = create_plugin(script_name).await?;
+    let mut service = dyn_plugin.execution_service(mock_service.boxed_clone());
+    let fake_req = http_ext::Request::fake_builder()
+        .body(Request::builder().query(String::new()).build())
+        .build()?;
+    let req = ExecutionRequest::fake_builder()
+        .context(Context::new())
+        .supergraph_request(fake_req)
+        .build();
+
+    let _response = service.ready().await?.call(req).await?;
+    crate::plugin::test::assert_no_mock_calls(handle).await;
+    Ok(())
+}
+
+async fn test_router_error_logging(script_name: &str) -> Result<(), BoxError> {
+    let (mock_service, handle) = tower_test::mock::pair::<router::Request, router::Response>();
+
+    let dyn_plugin = create_plugin(script_name).await?;
+
+    let mut service = dyn_plugin.router_service(mock_service.boxed_clone());
+    let req = crate::services::RouterRequest::fake_builder()
+        .context(Context::new())
+        .build()?;
+
+    let _response = service.ready().await?.call(req).await?;
+    crate::plugin::test::assert_no_mock_calls(handle).await;
+    Ok(())
+}
+
+async fn test_subgraph_error_logging(script_name: &str) -> Result<(), BoxError> {
+    let (mock_service, handle) = tower_test::mock::pair::<subgraph::Request, subgraph::Response>();
+
+    let dyn_plugin = create_plugin(script_name).await?;
+
+    let mut service = dyn_plugin.subgraph_service("test_subgraph", mock_service.boxed_clone());
+    let req = SubgraphRequest::fake_builder()
+        .context(Context::new())
+        .build();
+
+    let _response = service.ready().await?.call(req).await?;
+    crate::plugin::test::assert_no_mock_calls(handle).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_supergraph_error_logging_without_body() -> Result<(), BoxError> {
+    test_supergraph_error_logging("error_without_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_supergraph_error_logging_with_body() -> Result<(), BoxError> {
+    test_supergraph_error_logging("error_with_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_execution_error_logging_without_body() -> Result<(), BoxError> {
+    test_execution_error_logging("error_without_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_execution_error_logging_with_body() -> Result<(), BoxError> {
+    test_execution_error_logging("error_with_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_router_error_logging_without_body() -> Result<(), BoxError> {
+    test_router_error_logging("error_without_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_router_error_logging_with_body() -> Result<(), BoxError> {
+    test_router_error_logging("error_with_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_subgraph_error_logging_without_body() -> Result<(), BoxError> {
+    test_subgraph_error_logging("error_without_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+#[tokio::test]
+async fn test_subgraph_error_logging_with_body() -> Result<(), BoxError> {
+    test_subgraph_error_logging("error_with_body.rhai")
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
+}
+
+// Helper for calling property mutation test functions
+async fn call_property_mutation_test(
+    fn_name: &str,
+    arg: impl Sync + Send + 'static,
+) -> Result<(), Box<rhai::EvalAltResult>> {
+    let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(
+            &Value::from_str(
+                r#"{"scripts":"tests/fixtures", "main":"test_property_mutations.rhai"}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let it: &dyn std::any::Any = dyn_plugin.as_any();
+    let rhai_instance: &Rhai = it.downcast_ref::<Rhai>().expect("downcast");
+
+    let scope = rhai_instance.scope.clone();
+    let mut guard = scope.lock();
+
+    let wrapped_arg = Arc::new(Mutex::new(Some(arg)));
+
+    rhai_instance
+        .engine
+        .call_fn(&mut guard, &rhai_instance.ast, fn_name, (wrapped_arg,))
+}
+
+#[tokio::test]
+async fn test_supergraph_header_mutation() {
+    let request = SupergraphRequest::fake_builder().build().unwrap();
+    call_property_mutation_test("test_supergraph_header_mutation", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn test_supergraph_body_mutation() {
+    let request = SupergraphRequest::fake_builder().build().unwrap();
+    call_property_mutation_test("test_supergraph_body_mutation", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn test_execution_header_mutation() {
+    let request = ExecutionRequest::fake_builder().build();
+    call_property_mutation_test("test_execution_header_mutation", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn test_router_header_mutation() {
+    let request = RhaiRouterFirstRequest::default();
+    call_property_mutation_test("test_router_header_mutation", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn test_subgraph_read_only_headers() {
+    let request = SubgraphRequest::fake_builder().build();
+    call_property_mutation_test("test_subgraph_read_only_headers", request)
+        .await
+        .expect("test failed");
+}
+
+#[tokio::test]
+async fn test_subgraph_property_chain_with_split() {
+    let supergraph_req = http::Request::builder()
+        .header("cookie", "session=abc; user=john; theme=dark")
+        .body(graphql::Request::builder().query(String::new()).build())
+        .unwrap();
+
+    let request = SubgraphRequest::fake_builder()
+        .supergraph_request(Arc::new(supergraph_req))
+        .build();
+
+    call_property_mutation_test("test_subgraph_property_chain_with_split", request)
+        .await
+        .expect("test failed - property chains should work with read-only properties");
+}
+
+#[tokio::test]
+async fn test_subgraph_property_chain_with_trim() {
+    let supergraph_req = http::Request::builder()
+        .header("auth", "  token  ")
+        .body(graphql::Request::builder().query(String::new()).build())
+        .unwrap();
+
+    let request = SubgraphRequest::fake_builder()
+        .supergraph_request(Arc::new(supergraph_req))
+        .build();
+
+    call_property_mutation_test("test_subgraph_property_chain_with_trim", request)
+        .await
+        .expect("test failed - property chains should work with read-only properties");
+}
+
+#[tokio::test]
+async fn test_complex_property_chain() {
+    let supergraph_req = http::Request::builder()
+        .header("cookie", " session=abc ; user=john")
+        .body(graphql::Request::builder().query(String::new()).build())
+        .unwrap();
+
+    let request = SubgraphRequest::fake_builder()
+        .supergraph_request(Arc::new(supergraph_req))
+        .build();
+
+    call_property_mutation_test("test_complex_property_chain", request)
+        .await
+        .expect("test failed - complex property chains should work");
+}
+
+#[tokio::test]
+async fn test_rhai_metric_router_request() {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<router::Request, router::Response>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(
+                router::Response::fake_builder()
+                    .context(req.context)
+                    .build()
+                    .unwrap(),
+            );
+        });
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.router_service(mock_service.boxed_clone());
+        let req = router::Request::fake_builder().build().unwrap();
+        let _ = router_service.ready().await.unwrap().call(req).await;
+        crate::plugin::test::await_mock_driver(driver).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            1,
+            "rhai.stage" = "RouterRequest",
+            "rhai.succeeded" = true
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_supergraph_request() {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(
+                SupergraphResponse::fake_builder()
+                    .context(req.context)
+                    .build()
+                    .unwrap(),
+            );
+        });
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let req = SupergraphRequest::fake_builder().build().unwrap();
+        let _ = router_service.ready().await.unwrap().call(req).await;
+        crate::plugin::test::await_mock_driver(driver).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            1,
+            "rhai.stage" = "SupergraphRequest",
+            "rhai.succeeded" = true
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_subgraph_request() {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SubgraphRequest, subgraph::Response>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(
+                subgraph::Response::fake_builder()
+                    .context(req.context)
+                    .build(),
+            );
+        });
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.subgraph_service("test", mock_service.boxed_clone());
+        let req = SubgraphRequest::fake_builder().build();
+        let _ = router_service.ready().await.unwrap().call(req).await;
+        crate::plugin::test::await_mock_driver(driver).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            1,
+            "rhai.stage" = "SubgraphRequest",
+            "rhai.succeeded" = true
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_failed_callback() {
+    async {
+        // The supergraph_service in test_metrics_fail.rhai throws before calling the inner
+        // service, so the mock is never reached.
+        let (mock_service, handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics_fail.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let req = SupergraphRequest::fake_builder().build().unwrap();
+        let _ = router_service.ready().await.unwrap().call(req).await;
+        drop(router_service);
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            1,
+            "rhai.stage" = "SupergraphRequest",
+            "rhai.succeeded" = false
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_no_callback_no_emission() {
+    async {
+        let (mock_service, handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics_empty.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No supergraph_service callback registered — plugin returns original service unchanged
+        // and no metric is emitted
+        let _service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+
+        assert_histogram_not_exists!(
+            "apollo.router.operations.rhai.duration",
+            f64,
+            "rhai.stage" = "SupergraphRequest"
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_subgraph_response() {
+    async {
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SubgraphRequest, subgraph::Response>();
+        let driver = tokio::spawn(async move {
+            let (req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(
+                subgraph::Response::fake_builder()
+                    .context(req.context)
+                    .build(),
+            );
+        });
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics_response.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.subgraph_service("test", mock_service.boxed_clone());
+        let req = SubgraphRequest::fake_builder().build();
+        let _ = router_service.ready().await.unwrap().call(req).await;
+        crate::plugin::test::await_mock_driver(driver).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            1,
+            "rhai.stage" = "SubgraphResponse",
+            "rhai.succeeded" = true
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+#[tokio::test]
+async fn test_rhai_metric_deferred_response_causes_multiple_executions() {
+    async {
+        let ctx = Context::default();
+        let deferred_response = SupergraphResponse::fake_stream_builder()
+            .responses(vec![
+                graphql::Response::builder().build(),
+                graphql::Response::builder().build(),
+            ])
+            .context(ctx.clone())
+            .build()
+            .unwrap();
+
+        let (mock_service, mut handle) =
+            tower_test::mock::pair::<SupergraphRequest, SupergraphResponse>();
+        let driver = tokio::spawn(async move {
+            let (_req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(deferred_response);
+        });
+
+        let dyn_plugin: Box<dyn crate::plugin::DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.rhai")
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &serde_json::Value::from_str(
+                    r#"{"scripts":"tests/fixtures", "main":"test_metrics_response.rhai"}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut router_service = dyn_plugin.supergraph_service(mock_service.boxed_clone());
+        let req = SupergraphRequest::fake_builder().build().unwrap();
+        let resp = router_service
+            .ready()
+            .await
+            .unwrap()
+            .call(req)
+            .await
+            .unwrap();
+        // Drive the response stream to completion so the deferred-chunk metric fires.
+        let _chunks: Vec<_> = resp.response.into_body().collect().await;
+        crate::plugin::test::await_mock_driver(driver).await;
+
+        assert_histogram_count!(
+            "apollo.router.operations.rhai.duration",
+            2,
+            "rhai.stage" = "SupergraphResponse",
+            "rhai.succeeded" = true
+        );
+    }
+    .with_metrics()
+    .await;
+}
+
+/// A script that throws from a subgraph request callback answers the request itself, so the
+/// subgraph's circuit records nothing for it.
+#[tokio::test]
+async fn a_subgraph_request_a_script_throws_on_records_no_circuit_outcome() {
+    use crate::plugins::circuit_breaker::test_support::assert_router_answers_record_nothing;
+    use crate::plugins::circuit_breaker::test_support::subgraph_request;
+
+    let plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+        .find(|factory| factory.name == "apollo.rhai")
+        .expect("Plugin not found")
+        .create_instance_without_schema(&serde_json::json!({
+            "scripts": "tests/fixtures",
+            "main": "turn_away_subgraph_request.rhai",
+        }))
+        .await
+        .unwrap();
+
+    assert_router_answers_record_nothing(
+        async |subgraph| plugin.subgraph_service("products", subgraph),
+        || subgraph_request("SendOn"),
+        || subgraph_request("TurnAway"),
+    )
+    .await;
+}

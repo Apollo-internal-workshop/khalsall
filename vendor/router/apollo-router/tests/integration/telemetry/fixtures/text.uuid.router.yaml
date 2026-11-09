@@ -1,0 +1,23 @@
+telemetry:
+  instrumentation:
+    events:
+      router:
+        # Standard events
+        request: info
+        response: info
+        error: info
+  exporters:
+    tracing:
+      propagation:
+        trace_context: true
+      otlp:
+        enabled: true
+        batch_processor:
+          scheduled_delay: 100ms
+        endpoint: default
+    logging:
+      stdout:
+        format:
+          text:
+            display_trace_id: uuid
+            display_span_id: true

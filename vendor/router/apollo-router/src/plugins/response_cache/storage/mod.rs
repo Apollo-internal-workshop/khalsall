@@ -1,0 +1,262 @@
+mod config;
+mod error;
+pub(super) mod redis;
+
+use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
+
+use apollo_federation::connectors::runtime::mapping::Problem;
+pub(super) use error::Error;
+use tokio_util::time::FutureExt;
+
+use super::cache_control::CacheControl;
+use crate::plugins::response_cache::cache_tag::CacheScope;
+use crate::plugins::response_cache::cache_tag::CacheTag;
+use crate::plugins::response_cache::invalidation::InvalidationKind;
+use crate::plugins::response_cache::invalidation_labels::InvalidationLabels;
+use crate::plugins::response_cache::metrics::record_fetch_duration;
+use crate::plugins::response_cache::metrics::record_fetch_error;
+use crate::plugins::response_cache::metrics::record_insert_duration;
+use crate::plugins::response_cache::metrics::record_insert_error;
+use crate::plugins::response_cache::metrics::record_invalidation_duration;
+
+type StorageResult<T> = Result<T, Error>;
+
+/// A `Document` is a unit of data to be stored in the cache, including any cache-tag entries
+/// it indexes under, its TTL, cache-control information, etc.
+///
+/// The cache-tag entries on a Document are pre-filtered by the plugin layer based on the
+/// subgraph's configured invalidation indexes; the storage layer's job is purely to render
+/// each entry into its Redis ZSET key via [`CacheTag::to_redis_key`] and persist the document
+/// data and tag memberships. No invalidation policy lives here.
+#[derive(Debug, Clone)]
+pub(super) struct Document {
+    pub(super) key: String,
+    pub(super) data: serde_json_bytes::Value,
+    pub(super) control: CacheControl,
+    pub(super) cache_tags: Vec<CacheTag>,
+    /// The fine-grained tag values (schema `@cacheTag` or `apolloCacheTags`/
+    /// `apolloEntityCacheTags` extensions) to persist alongside this document so a later cache
+    /// hit can rebuild the CDN `Cache-Tag` header for it, independent of `cache_tags` above.
+    /// `cache_tags` is pre-filtered by the Redis `IndexMode::CacheTag` index setting — this
+    /// field is populated whenever CDN invalidation wants it too, even if that index is off, so
+    /// enabling CDN invalidation alone never silently changes what gets `ZADD`ed into Redis.
+    pub(super) cdn_invalidation_tags: Vec<String>,
+    pub(super) expire: Duration,
+    /// Which scope's index namespace this document's cache-tag entries are written under.
+    /// Defaults to [`CacheScope::Subgraph`]; connector store paths set [`CacheScope::Connector`].
+    pub(super) scope: CacheScope,
+    /// Connector response-mapping problems produced while mapping the response this document
+    /// holds, persisted so a later cache hit can replay them. Without this, mapping problems
+    /// would be reported once — on the request that missed — and then disappear for the whole
+    /// TTL, leaving `ConnectorSelector::ResponseMappingProblems` and the cache debugger showing
+    /// a clean connector for a response that has problems. Always empty on the subgraph path.
+    pub(super) mapping_problems: Vec<Problem>,
+    /// The HTTP status the connector's upstream actually returned, persisted so a cache hit can
+    /// report the same status a miss did. A connector may declare a non-2xx status successful
+    /// via `@connect(errors: { is_success: ... })`, in which case that response is cached and
+    /// defaulting a hit to `200` would contradict the operator's own schema. `None` on the
+    /// subgraph path, which has no upstream status to replay.
+    pub(super) status: Option<u16>,
+}
+
+/// A `CacheEntry` is a unit of data returned from the cache. It contains the cache key, value, and
+/// cache_control data.
+#[derive(Debug, Clone)]
+pub(super) struct CacheEntry {
+    pub(super) key: String,
+    pub(super) data: serde_json_bytes::Value,
+    pub(super) control: CacheControl,
+    /// Invalidation labels are those labels used to invalidate cached data; they pick out data
+    /// uniquely or, if the label applies more coarsely, to sets of data. They're used for Redis
+    /// cache invalidation through the invalidation endpoint and by CDNs through their CDN-specific
+    /// endpoints; for CDNs, they're emitted as a header and separated by a delimiter, which are
+    /// both configurable
+    pub(super) invalidation_labels: Option<InvalidationLabels>,
+    /// Connector response-mapping problems recorded when this entry was stored. See
+    /// [`Document::mapping_problems`]; empty for subgraph entries and for entries stored before
+    /// mapping problems were persisted.
+    pub(super) mapping_problems: Vec<Problem>,
+    /// The upstream HTTP status recorded when this entry was stored. See [`Document::status`];
+    /// `None` for subgraph entries and for connector entries stored before the status was
+    /// persisted, in which case the cache-hit path falls back to `200`.
+    pub(super) status: Option<u16>,
+}
+
+/// The `CacheStorage` trait defines an API that the backing storage layer must implement for
+/// response caching: fetch, insert, and invalidate.
+pub(super) trait CacheStorage {
+    /// Timeout to apply to insert command.
+    fn insert_timeout(&self) -> Duration;
+
+    /// Timeout to apply to fetch command.
+    fn fetch_timeout(&self) -> Duration;
+
+    /// Timeout to apply to invalidate command.
+    fn invalidate_timeout(&self) -> Duration;
+
+    #[doc(hidden)]
+    async fn internal_insert(&self, document: Document, subgraph_name: &str) -> StorageResult<()>;
+
+    /// Insert the `document` obtained from `subgraph_name`. Command will be timed out after
+    /// `self.insert_timeout()`.
+    async fn insert(&self, document: Document, subgraph_name: &str) -> StorageResult<()> {
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_insert(document, subgraph_name)
+                .timeout(self.insert_timeout())
+                .await,
+        );
+
+        record_insert_duration(now.elapsed(), subgraph_name, 1);
+        result.inspect_err(|err| record_insert_error(err, subgraph_name))
+    }
+
+    #[doc(hidden)]
+    async fn internal_insert_in_batch(
+        &self,
+        documents: Vec<Document>,
+        subgraph_name: &str,
+    ) -> StorageResult<()>;
+
+    /// Insert the `document`s obtained from `subgraph_name`. Command will be timed out after
+    /// `self.insert_timeout()`.
+    async fn insert_in_batch(
+        &self,
+        documents: Vec<Document>,
+        subgraph_name: &str,
+    ) -> StorageResult<()> {
+        let batch_size = documents.len();
+
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_insert_in_batch(documents, subgraph_name)
+                .timeout(self.insert_timeout())
+                .await,
+        );
+
+        record_insert_duration(now.elapsed(), subgraph_name, batch_size);
+        result.inspect_err(|err| record_insert_error(err, subgraph_name))
+    }
+
+    #[doc(hidden)]
+    async fn internal_fetch(&self, cache_key: &str) -> StorageResult<CacheEntry>;
+
+    /// Fetch the value belonging to `cache_key`. Command will be timed out after `self.fetch_timeout()`.
+    async fn fetch(&self, cache_key: &str, subgraph_name: &str) -> StorageResult<CacheEntry> {
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_fetch(cache_key)
+                .timeout(self.fetch_timeout())
+                .await,
+        );
+
+        record_fetch_duration(now.elapsed(), subgraph_name, 1);
+        result.inspect_err(|err| record_fetch_error(err, subgraph_name))
+    }
+
+    #[doc(hidden)]
+    async fn internal_fetch_multiple(
+        &self,
+        cache_keys: &[&str],
+    ) -> StorageResult<Vec<StorageResult<CacheEntry>>>;
+
+    /// Fetch the values belonging to `cache_keys`. Command will be timed out after `self.fetch_timeout()`.
+    async fn fetch_multiple(
+        &self,
+        cache_keys: &[&str],
+        subgraph_name: &str,
+    ) -> StorageResult<Vec<Option<CacheEntry>>> {
+        let batch_size = cache_keys.len();
+
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_fetch_multiple(cache_keys)
+                .timeout(self.fetch_timeout())
+                .await,
+        );
+
+        record_fetch_duration(now.elapsed(), subgraph_name, batch_size);
+
+        // go through values to record partial errors
+        let values = result
+            .inspect_err(|err| record_fetch_error(err, subgraph_name))?
+            .into_iter()
+            .map(|value| {
+                value
+                    .inspect_err(|err| record_fetch_error(err, subgraph_name))
+                    .ok()
+            })
+            .collect();
+        Ok(values)
+    }
+
+    #[doc(hidden)]
+    async fn internal_invalidate_by_subgraph(
+        &self,
+        scope: CacheScope,
+        subgraph_name: &str,
+    ) -> StorageResult<u64>;
+
+    /// Invalidate all data associated with `subgraph_names` within `scope`. Command will be
+    /// timed out after `self.invalidate_timeout()`.
+    async fn invalidate_by_subgraph(
+        &self,
+        scope: CacheScope,
+        subgraph_name: &str,
+        invalidation_kind: InvalidationKind,
+    ) -> StorageResult<u64> {
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_invalidate_by_subgraph(scope, subgraph_name)
+                .timeout(self.invalidate_timeout())
+                .await,
+        );
+
+        record_invalidation_duration(now.elapsed(), invalidation_kind);
+        result
+    }
+
+    #[doc(hidden)]
+    async fn internal_invalidate(
+        &self,
+        scope: CacheScope,
+        invalidation_keys: Vec<String>,
+        subgraph_names: Vec<String>,
+    ) -> StorageResult<HashMap<String, u64>>;
+
+    /// Invalidate all data associated with at least one of the `invalidation_keys` **and** at
+    /// least one of the `subgraph_names`, within `scope`. Command will be timed out after
+    /// `self.invalidate_timeout()`.
+    async fn invalidate(
+        &self,
+        scope: CacheScope,
+        invalidation_keys: Vec<String>,
+        subgraph_names: Vec<String>,
+        invalidation_kind: InvalidationKind,
+    ) -> StorageResult<HashMap<String, u64>> {
+        let now = Instant::now();
+        let result = flatten_storage_error(
+            self.internal_invalidate(scope, invalidation_keys, subgraph_names)
+                .timeout(self.invalidate_timeout())
+                .await,
+        );
+
+        record_invalidation_duration(now.elapsed(), invalidation_kind);
+        result
+    }
+
+    #[cfg(all(
+        test,
+        any(not(feature = "ci"), all(target_arch = "x86_64", target_os = "linux"))
+    ))]
+    async fn truncate_namespace_for_test(&self) -> StorageResult<()>;
+}
+
+fn flatten_storage_error<V, E>(value: Result<Result<V, Error>, E>) -> Result<V, Error>
+where
+    E: Into<Error>,
+{
+    value.map_err(Into::into).flatten()
+}

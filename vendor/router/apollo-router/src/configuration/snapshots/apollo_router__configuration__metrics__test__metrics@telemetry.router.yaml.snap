@@ -1,0 +1,38 @@
+---
+source: apollo-router/src/configuration/metrics.rs
+expression: "& metrics.non_zero()"
+---
+- name: apollo.router.config.telemetry
+  data:
+    datapoints:
+      - value: 1
+        attributes:
+          opt.events: true
+          opt.events.connector: true
+          opt.events.router: true
+          opt.events.subgraph: true
+          opt.events.supergraph: true
+          opt.instruments: true
+          opt.instruments.connector: true
+          opt.instruments.default_attribute_requirement_level: false
+          opt.instruments.graphql: true
+          opt.instruments.router: true
+          opt.instruments.subgraph: true
+          opt.instruments.supergraph: true
+          opt.metrics.otlp: true
+          opt.metrics.prometheus: true
+          opt.spans: true
+          opt.spans.default_attribute_requirement_level: recommended
+          opt.spans.router: true
+          opt.spans.subgraph: true
+          opt.spans.supergraph: true
+          opt.tracing.common.preview_datadog_agent_sampling: true
+          opt.tracing.common.sampler: false
+          opt.tracing.datadog: true
+          opt.tracing.datadog.enable_span_mapping: true
+          opt.tracing.datadog.fixed_span_names: true
+          opt.tracing.datadog.resource_mapping: true
+          opt.tracing.datadog.sampler: always_on
+          opt.tracing.datadog.span_metrics: true
+          opt.tracing.otlp: true
+          opt.tracing.propagation.datadog: true

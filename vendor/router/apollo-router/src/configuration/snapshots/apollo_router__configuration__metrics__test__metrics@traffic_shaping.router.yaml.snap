@@ -1,0 +1,22 @@
+---
+source: apollo-router/src/configuration/metrics.rs
+assertion_line: 704
+expression: "& metrics.non_zero()"
+---
+- name: apollo.router.config.http2
+  data:
+    datapoints:
+      - value: 1
+        attributes: {}
+- name: apollo.router.config.traffic_shaping
+  data:
+    datapoints:
+      - value: 1
+        attributes:
+          opt.router.rate_limit: true
+          opt.router.timeout: true
+          opt.subgraph.compression: true
+          opt.subgraph.deduplicate_query: true
+          opt.subgraph.http2: true
+          opt.subgraph.rate_limit: true
+          opt.subgraph.timeout: true

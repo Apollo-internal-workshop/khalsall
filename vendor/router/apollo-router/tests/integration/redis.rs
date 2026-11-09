@@ -1,0 +1,1090 @@
+// The redis cache keys in this file have to change whenever the following change:
+// * the supergraph schema
+// * federation version
+//
+// How to get the new cache key:
+// If you have redis running locally, you can skip step 1 and proceed with steps 2-3.
+// 1. run `docker-compose up -d` and connect to the redis container by running `docker-compose exec redis /bin/bash`.
+// 2. Run the `redis-cli` command from the shell and start the redis `monitor` command.
+// 3. Run the failing test and yank the updated cache key from the redis logs. It will be the key following `SET`, for example:
+// ```bash
+// 1724831727.472732 [0 127.0.0.1:56720] "SET"
+// "plan:0:v2.8.5:70f115ebba5991355c17f4f56ba25bb093c519c4db49a30f3b10de279a4e3fa4:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:4f9f0183101b2f249a364b98adadfda6e5e2001d1f2465c988428cf1ac0b545f"
+// "{\"Ok\":{\"usage_reporting\":{...},\"root\":{...},\"query\":{...},...}}"
+// "EX" "10"
+// ```
+
+use std::collections::HashMap;
+
+use apollo_router::services::router;
+use apollo_router::services::supergraph;
+use fred::cmd;
+use fred::prelude::Client as RedisClient;
+use fred::prelude::Config as RedisConfig;
+use fred::prelude::Value as RedisValue;
+use fred::prelude::*;
+use futures::StreamExt;
+use http::Method;
+use serde_json::json;
+use tokio::task::JoinSet;
+use tower::BoxError;
+use tower::ServiceExt;
+use uuid::Uuid;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
+
+use crate::integration::IntegrationTest;
+use crate::integration::common::Query;
+use crate::integration::common::graph_os_enabled;
+use crate::integration::common::namespace;
+use crate::integration::redis_monitor::Monitor as RedisMonitor;
+
+const REDIS_STANDALONE_PORT: [&str; 1] = ["6379"];
+const REDIS_CLUSTER_PORTS: [&str; 6] = ["7000", "7001", "7002", "7003", "7004", "7005"];
+
+fn make_redis_url(ports: &[&str]) -> Option<String> {
+    let port = ports.first()?;
+    let scheme = if ports.len() == 1 {
+        "redis"
+    } else {
+        "redis-cluster"
+    };
+    let url = format!("{scheme}://localhost:{port}");
+    Some(url)
+}
+
+#[cfg(feature = "mock_subgraphs_testing")]
+fn subgraphs_with_many_entities(count: usize) -> serde_json::Value {
+    let mut reviews = vec![];
+    let mut top_products = vec![];
+    for upc in 1..=count {
+        top_products.push(json!({ "upc": upc.to_string() }));
+        reviews.push(json!({
+            "__typename": "Product",
+            "upc": upc.to_string(),
+            "reviews": [{ "id": format!("r{upc}") }],
+        }));
+    }
+
+    json!({
+        "products": {
+            "headers": {"cache-control": "public"},
+            "query": { "topProducts": top_products },
+        },
+        "reviews": {
+            "headers": {"cache-control": "public"},
+            "entities": reviews,
+        },
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_planner_cache() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let namespace = namespace();
+    // If this test fails and the cache key format changed you'll need to update the key here.
+    // Look at the top of the file for instructions on getting the new cache key.
+    let known_cache_key = &format!(
+        "{namespace}:plan:router:{}:47939f0e964372951934fc662c9c2be675bc7116ec3e57029abe555284eb10a4:opname:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:metadata:f16bdcbfbe4cbc78bc4599b75ca159ade850734316069f5d7e65c6ac10974850",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let redis_url = make_redis_url(&REDIS_STANDALONE_PORT).unwrap();
+    let config = RedisConfig::from_url(&redis_url).unwrap();
+    let client = RedisClient::new(config, None, None, None);
+    let connection_task = client.init().await.unwrap();
+
+    client.del::<String, _>(known_cache_key).await.unwrap();
+
+    let supergraph = apollo_router::TestHarness::builder()
+        .with_subgraph_network_requests()
+        .configuration_json(json!({
+            "supergraph": {
+                "query_planning": {
+                    "cache": {
+                        "in_memory": {
+                            "limit": 2
+                        },
+                        "redis": {
+                            "urls": [redis_url],
+                            "namespace": namespace,
+                            "required_to_start": true,
+                            "ttl": "10s"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph.graphql"))
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .query(r#"{ topProducts { name name2:name } }"#)
+        .method(Method::POST)
+        .build()
+        .unwrap();
+
+    let _ = supergraph
+        .oneshot(request)
+        .await
+        .unwrap()
+        .next_response()
+        .await;
+
+    let s: String = match client.get(known_cache_key).await {
+        Ok(s) => s,
+        Err(e) => {
+            panic!(
+                "key {known_cache_key} not found: {e}\nIf you see this error, make sure the federation version you use matches the redis key."
+            );
+        }
+    };
+    let exp: i64 = client
+        .custom_raw(cmd!("EXPIRETIME"), vec![known_cache_key.to_string()])
+        .await
+        .and_then(|frame| frame.try_into())
+        .and_then(|value: RedisValue| value.convert())
+        .unwrap();
+    let query_plan_res: serde_json::Value = serde_json::from_str(&s).unwrap();
+    // ignore the usage reporting field for which the order of elements in `referenced_fields_by_type` can change
+    let query_plan = query_plan_res
+        .as_object()
+        .unwrap()
+        .get("Ok")
+        .unwrap()
+        .get("root");
+
+    insta::assert_json_snapshot!(query_plan);
+
+    // test expiration refresh
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let supergraph = apollo_router::TestHarness::builder()
+        .with_subgraph_network_requests()
+        .configuration_json(json!({
+            "supergraph": {
+                "query_planning": {
+                    "cache": {
+                        "in_memory": {
+                            "limit": 2
+                        },
+                        "redis": {
+                            "urls": [redis_url],
+                            "namespace": namespace,
+                            "required_to_start": true,
+                            "ttl": "10s"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph.graphql"))
+        .build_supergraph()
+        .await
+        .unwrap();
+
+    let request = supergraph::Request::fake_builder()
+        .query(r#"{ topProducts { name name2:name } }"#)
+        .method(Method::POST)
+        .build()
+        .unwrap();
+    let _ = supergraph
+        .oneshot(request)
+        .await
+        .unwrap()
+        .next_response()
+        .await;
+    let new_exp: i64 = client
+        .custom_raw(cmd!("EXPIRETIME"), vec![known_cache_key.to_string()])
+        .await
+        .and_then(|frame| frame.try_into())
+        .and_then(|value: RedisValue| value.convert())
+        .unwrap();
+
+    assert!(exp < new_exp);
+
+    client.quit().await.unwrap();
+    // calling quit ends the connection and event listener tasks
+    let _ = connection_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apq() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let namespace = namespace();
+
+    let redis_url = make_redis_url(&REDIS_STANDALONE_PORT).unwrap();
+    let config = RedisConfig::from_url(&redis_url).unwrap();
+    let client = RedisClient::new(config, None, None, None);
+    let connection_task = client.init().await.unwrap();
+
+    let config = json!({
+        "apq": {
+            "router": {
+                "cache": {
+                    "in_memory": {
+                        "limit": 2
+                    },
+                    "redis": {
+                        "urls": [redis_url],
+                        "namespace": namespace,
+                            "required_to_start": true,
+                        "ttl": "10s"
+                    }
+                }
+            }
+        }
+    });
+
+    let router = apollo_router::TestHarness::builder()
+        .with_subgraph_network_requests()
+        .configuration_json(config.clone())
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph.graphql"))
+        .build_router()
+        .await
+        .unwrap();
+
+    let query_hash = "4c45433039407593557f8a982dafd316a66ec03f0e1ed5fa1b7ef8060d76e8ec";
+
+    client
+        .del::<String, _>(&format!("{namespace}:apq:{query_hash}"))
+        .await
+        .unwrap();
+
+    let persisted = json!({
+        "version" : 1,
+        "sha256Hash" : query_hash
+    });
+
+    // an APQ should fail if we do not know about the hash
+    // it should not set a value in Redis
+    let request: router::Request = supergraph::Request::fake_builder()
+        .extension("persistedQuery", persisted.clone())
+        .method(Method::POST)
+        .build()
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let res = router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_graphql_response_stream()
+        .await
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        res.errors.first().unwrap().message,
+        "PersistedQueryNotFound"
+    );
+    let r: Option<String> = client.get(format!("apq:{query_hash}")).await.unwrap();
+    assert!(r.is_none());
+
+    // Now we register the query
+    // it should set a value in Redis
+    let request: router::Request = supergraph::Request::fake_builder()
+        .query(r#"{ topProducts { name name2:name } }"#)
+        .extension("persistedQuery", persisted.clone())
+        .method(Method::POST)
+        .build()
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let res = router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_graphql_response_stream()
+        .await
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(res.data.is_some());
+    assert!(res.errors.is_empty());
+
+    let s: Option<String> = client
+        .get(format!("{namespace}:apq:{query_hash}"))
+        .await
+        .unwrap();
+    insta::assert_snapshot!(s.unwrap());
+
+    // we start a new router with the same config
+    // it should have the same connection to Redis, but the in memory cache has been reset
+    let router = apollo_router::TestHarness::builder()
+        .with_subgraph_network_requests()
+        .configuration_json(config.clone())
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph.graphql"))
+        .build_router()
+        .await
+        .unwrap();
+
+    // a request with only the hash should succeed because it is stored in Redis
+    let request: router::Request = supergraph::Request::fake_builder()
+        .extension("persistedQuery", persisted.clone())
+        .method(Method::POST)
+        .build()
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let res = router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .into_graphql_response_stream()
+        .await
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(res.data.is_some());
+    assert!(res.errors.is_empty());
+
+    client.quit().await.unwrap();
+    // calling quit ends the connection and event listener tasks
+    let _ = connection_task.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_failure_blocks_startup() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let build_router = |required_to_start: bool| {
+        apollo_router::TestHarness::builder()
+            .with_subgraph_network_requests()
+            .configuration_json(json!({
+                "supergraph": {
+                    "query_planning": {
+                        "cache": {
+                            "in_memory": {
+                                "limit": 2
+                            },
+                            "redis": {
+                                // invalid port
+                                "urls": ["redis://127.0.0.1:6378"],
+                                "required_to_start": required_to_start
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap()
+            .schema(include_str!("../fixtures/supergraph.graphql"))
+            .build_supergraph()
+    };
+
+    // when redis is not required to start, the result should be Ok even with the invalid port
+    let router_result = build_router(false).await;
+    assert!(router_result.is_ok());
+
+    // when redis is required to start, this should error
+    let router_result = build_router(true).await;
+    assert!(router_result.is_err());
+
+    let err = router_result.unwrap_err();
+    // OSX has a different error code for connection refused
+    let e = err.to_string().replace("61", "111");
+    assert_eq!(
+        e,
+        "couldn't build Router service: IO Error: Os { code: 111, kind: ConnectionRefused, message: \"Connection refused\" }"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_planner_redis_update_query_fragments() {
+    // If this test fails and the cache key format changed you'll need to update
+    // the key here.  Look at the top of the file for instructions on getting
+    // the new cache key.
+    //
+    // You first need to follow the process and update the key in
+    // `test_redis_query_plan_config_update`, and then update the key in this
+    // test.
+    //
+    // This test requires graphos license, so make sure you have
+    // "TEST_APOLLO_KEY" and "TEST_APOLLO_GRAPH_REF" env vars set, otherwise the
+    // test just passes locally.
+    test_redis_query_plan_config_update(
+        // This configuration turns the fragment generation option *off*.
+        include_str!("fixtures/query_planner_redis_config_update_query_fragments.router.yaml"),
+        &format!(
+            "plan:router:{}:14ece7260081620bb49f1f4934cf48510e5f16c3171181768bb46a5609d7dfb7:opname:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:metadata:02e0ce725b579eff2988e98b02560a48a3d9ecce9e7d3cef3d60dcf2fb366c42",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_planner_redis_update_defer() {
+    // If this test fails and the cache key format changed you'll need to update
+    // the key here.  Look at the top of the file for instructions on getting
+    // the new cache key.
+    //
+    // You first need to follow the process and update the key in
+    // `test_redis_query_plan_config_update`, and then update the key in this
+    // test.
+    //
+    // This test requires graphos license, so make sure you have
+    // "TEST_APOLLO_KEY" and "TEST_APOLLO_GRAPH_REF" env vars set, otherwise the
+    // test just passes locally.
+    test_redis_query_plan_config_update(
+        include_str!("fixtures/query_planner_redis_config_update_defer.router.yaml"),
+        &format!(
+            "plan:router:{}:14ece7260081620bb49f1f4934cf48510e5f16c3171181768bb46a5609d7dfb7:opname:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:metadata:0651b0f75af604e69a6c0f5323f1a1231e7178acd8679d8e3a154640f51c5aa2",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_planner_redis_update_type_conditional_fetching() {
+    // If this test fails and the cache key format changed you'll need to update
+    // the key here.  Look at the top of the file for instructions on getting
+    // the new cache key.
+    //
+    // You first need to follow the process and update the key in
+    // `test_redis_query_plan_config_update`, and then update the key in this
+    // test.
+    //
+    // This test requires graphos license, so make sure you have
+    // "TEST_APOLLO_KEY" and "TEST_APOLLO_GRAPH_REF" env vars set, otherwise the
+    // test just passes locally.
+    test_redis_query_plan_config_update(
+        include_str!(
+            "fixtures/query_planner_redis_config_update_type_conditional_fetching.router.yaml"
+        ),
+        &format!(
+            "plan:router:{}:14ece7260081620bb49f1f4934cf48510e5f16c3171181768bb46a5609d7dfb7:opname:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:metadata:2a38e8672a9f4de5b5d88a9faa9a6243fa5aa686f394a9f0ff8a787fc5a5172a",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .await;
+}
+
+async fn test_redis_query_plan_config_update(updated_config: &str, new_cache_key: &str) {
+    if !graph_os_enabled() {
+        return;
+    }
+    // This test shows that the redis key changes when the query planner config
+    // changes.  The test starts a router with a specific config, executes a
+    // query, and checks the redis cache key.  Then it updates the config,
+    // executes the query again, and checks the redis cache key.
+    let mut router = IntegrationTest::builder()
+        .config(include_str!(
+            "fixtures/query_planner_redis_config_update.router.yaml"
+        ))
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+    router.clear_redis_cache().await;
+
+    // If the tests above are failing, this is the key that needs to be changed first.
+    let starting_key = &format!(
+        "plan:router:{}:14ece7260081620bb49f1f4934cf48510e5f16c3171181768bb46a5609d7dfb7:opname:3973e022e93220f9212c18d0d0c543ae7c309e46640da93a4a0314de999f5112:metadata:f16bdcbfbe4cbc78bc4599b75ca159ade850734316069f5d7e65c6ac10974850",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_ne!(
+        starting_key, new_cache_key,
+        "starting_key (cache key for the initial config) and new_cache_key (cache key with the updated config) should not be equal. This either means that the cache key is not being generated correctly, or that the test is not actually checking the updated key."
+    );
+
+    router
+        .execute_query(Query::default().with_anonymous())
+        .await;
+    router.assert_redis_cache_contains(starting_key).await;
+    router.update_config(updated_config).await;
+    router.assert_reloaded().await;
+    router
+        .execute_query(Query::default().with_anonymous())
+        .await;
+    router.assert_redis_cache_contains(new_cache_key).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_connections_are_closed_on_router_reload() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let router_config = include_str!("fixtures/redis_connection_closure.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    let expected_metric = r#"apollo_router_cache_redis_clients{otel_scope_name="apollo/router"} 2"#;
+    router.assert_metrics_contains(expected_metric, None).await;
+
+    // check that reloading the schema yields the same number of redis connections
+    let new_router_config = format!("{router_config}\ninclude_subgraph_errors:\n  all: true");
+    router.update_config(&new_router_config).await;
+    router.assert_reloaded().await;
+
+    router.assert_metrics_contains(expected_metric, None).await;
+
+    let error_metric = "apollo_router_cache_redis_errors_total";
+    router.assert_metrics_does_not_contain(error_metric).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_emits_response_size_avg_metric() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let router_config = include_str!("fixtures/clustered_redis_query_planning.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // send a few different queries to ensure a redis cache hit; if you just send 1, it'll only hit
+    // the in-memory cache
+    router.execute_several_default_queries(2).await;
+
+    let experimental_response_avg_metric = r#"experimental_apollo_router_cache_redis_response_size_avg{kind="query planner",otel_scope_name="apollo/router"}"#;
+    router
+        .assert_metric_non_zero(experimental_response_avg_metric, None)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_emits_request_size_avg_metric() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let router_config = include_str!("fixtures/clustered_redis_query_planning.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // send a few different queries to ensure a redis cache hit; if you just send 1, it'll only hit
+    // the in-memory cache
+    router.execute_several_default_queries(2).await;
+
+    let experimental_response_avg_metric = r#"experimental_apollo_router_cache_redis_request_size_avg{kind="query planner",otel_scope_name="apollo/router"}"#;
+    router
+        .assert_metric_non_zero(experimental_response_avg_metric, None)
+        .await;
+}
+
+#[cfg(feature = "mock_subgraphs_testing")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_emits_configuration_error_metric() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let config = json!({
+        "include_subgraph_errors": {
+            "all": true,
+        },
+        "response_cache": {
+            "enabled": true,
+            "subgraph": {
+                "all": {
+                    "enabled": true,
+                    "ttl": "10m",
+                    "redis": {
+                        "urls": ["redis://127.0.0.1:1"], // port 1 is not Redis; connection will be refused
+                        "required_to_start": false, // don't fail startup, allow errors during runtime
+                    },
+                },
+            },
+        },
+        "telemetry": {
+            "exporters": {
+                "metrics": {
+                    "prometheus": {
+                        "enabled": true,
+                        "path": "/metrics",
+                    },
+                },
+            },
+        },
+        "experimental_mock_subgraphs": subgraphs_with_many_entities(10),
+    });
+
+    let mut router = IntegrationTest::builder()
+        .config(serde_yaml::to_string(&config).unwrap())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Execute queries that will attempt Redis operations and fail
+    for _ in 0..3 {
+        let query = Query::builder()
+            .body(json!({"query":"{ topProducts { reviews { id } } }","variables":{}}))
+            .build();
+        let (_trace_id, response) = router.execute_query(query).await;
+        // The query should still succeed (using fallback) even though Redis fails
+        assert_eq!(response.status(), 200);
+    }
+
+    router
+        .assert_metric_non_zero(
+            r#"apollo_router_cache_redis_errors_total{error_type="io",kind="response-cache",otel_scope_name="apollo/router"}"#,
+            None,
+        )
+        .await;
+
+    router.graceful_shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_uses_replicas_when_clustered() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let namespace = Uuid::new_v4().to_string();
+    let redis_monitor = RedisMonitor::new(&REDIS_CLUSTER_PORTS).await;
+
+    // NB: `reset_ttl` must be false in the config, otherwise GETs will be sent to primary
+    let router_config = include_str!("fixtures/clustered_redis_query_planning.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .redis_namespace(&namespace)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // send a few different queries to ensure a redis cache hit; if you just send 1, it'll only hit
+    // the in-memory cache
+    router.execute_several_default_queries(2).await;
+
+    let redis_monitor_output = redis_monitor.collect().await;
+    assert!(
+        redis_monitor_output
+            .namespaced(&namespace)
+            .command_sent_to_replicas_only("GET")
+    );
+
+    let replicas_output = redis_monitor_output.replicas(true);
+    assert!(replicas_output.command_sent_to_all("READONLY"));
+
+    let primaries_output = redis_monitor_output.replicas(false);
+    assert!(!primaries_output.command_sent_to_any("READONLY"));
+
+    // check that there were no I/O errors
+    let io_error = r#"apollo_router_cache_redis_errors_total{error_type="io",kind="query planner",otel_scope_name="apollo/router"}"#;
+    router.assert_metrics_does_not_contain(io_error).await;
+
+    // check that there were no parse errors; these might show up when fred can't read the cluster
+    // state properly
+    let parse_error = r#"apollo_router_cache_redis_errors_total{error_type="parse",kind="query planner",otel_scope_name="apollo/router"}"#;
+    router.assert_metrics_does_not_contain(parse_error).await;
+}
+
+/// A clustered router must keep its eager replica connections warm by PINGing them, otherwise a
+/// server-side idle timeout reaps them and triggers a self-sustaining pool-reconnect loop (RH-1402,
+/// regression from #9589's switch to eager `lazy_connections = false`). We assert the keep-alive
+/// PING actually reaches replica nodes; the sentinel argument attributes the PING to the router so
+/// unrelated PINGs (e.g. container health probes) can't cause a false pass. Before the fix the
+/// router never pinged replicas, so this PING is absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_pings_replicas_to_keep_them_alive_when_clustered() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let namespace = Uuid::new_v4().to_string();
+    let redis_monitor = RedisMonitor::new(&REDIS_CLUSTER_PORTS).await;
+
+    let router_config = include_str!("fixtures/clustered_redis_query_planning.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .redis_namespace(&namespace)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Establish the redis connection pool, including the replica connections.
+    router.execute_several_default_queries(2).await;
+
+    // The replica keep-alive fires one heartbeat interval (REDIS_HEARTBEAT_INTERVAL, 10s in
+    // `cache::redis`) after the pool is created, matching fred's primary heartbeat. Block until it
+    // reaches a replica (panics if it never does).
+    let sentinel = "apollo-router-replica-heartbeat";
+    redis_monitor
+        .wait_for(std::time::Duration::from_secs(30), |output| {
+            output
+                .replicas(true)
+                .command_with_arg_sent_to_any("PING", sentinel)
+        })
+        .await;
+
+    // The keep-alive is replica-only; primaries already get fred's built-in heartbeat. Check that
+    // against the final drained output.
+    let redis_monitor_output = redis_monitor.collect().await;
+    assert!(
+        !redis_monitor_output
+            .replicas(false)
+            .command_with_arg_sent_to_any("PING", sentinel),
+        "replica keep-alive PING should not target primary nodes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_doesnt_use_replicas_in_standalone_mode() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let namespace = Uuid::new_v4().to_string();
+    let redis_monitor = RedisMonitor::new(&REDIS_STANDALONE_PORT).await;
+
+    let router_config = include_str!("fixtures/redis_connection_closure.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(router_config)
+        .log("trace,jsonpath_lib=info")
+        .redis_namespace(&namespace)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Allow time for Redis pool to register both clients before asserting metrics
+    let expected_metric = r#"apollo_router_cache_redis_clients{otel_scope_name="apollo/router"} 2"#;
+    router
+        .assert_metrics_contains(expected_metric, Some(std::time::Duration::from_secs(30)))
+        .await;
+
+    // Snapshot the redis error counters BEFORE issuing queries. fred can emit transient IO
+    // events to its `error_rx` channel while the pool is still stabilising its initial
+    // connections (every event there is counted by `record_redis_error`), and those counter
+    // increments are independent of whether the router's actual query-time operations
+    // succeed. Asserting "metric not present" is therefore racy. We instead diff the
+    // counters across the query phase so we only fail if a NEW error is recorded while
+    // queries are being served.
+    let io_error = r#"apollo_router_cache_redis_errors_total{error_type="io",kind="query planner",otel_scope_name="apollo/router"}"#;
+    let parse_error = r#"apollo_router_cache_redis_errors_total{error_type="parse",kind="query planner",otel_scope_name="apollo/router"}"#;
+    let io_error_before = router.read_metric_counter_value(io_error).await;
+    let parse_error_before = router.read_metric_counter_value(parse_error).await;
+
+    // send a few different queries to ensure a redis cache hit; if you just send 1, it'll only hit
+    // the in-memory cache
+    let responses = router.execute_several_default_queries(2).await;
+    for response in responses {
+        let r = response.1.text().await;
+        eprintln!("{r:?}");
+    }
+
+    // No NEW I/O errors should be recorded while serving queries.
+    let io_error_after = router.read_metric_counter_value(io_error).await;
+    assert_eq!(
+        io_error_after, io_error_before,
+        "redis IO error counter increased during query execution ({io_error_before} -> {io_error_after}); '{io_error}'"
+    );
+
+    // No NEW parse errors either; these might show up when fred can't read the cluster
+    // state properly.
+    let parse_error_after = router.read_metric_counter_value(parse_error).await;
+    assert_eq!(
+        parse_error_after, parse_error_before,
+        "redis parse error counter increased during query execution ({parse_error_before} -> {parse_error_after}); '{parse_error}'"
+    );
+
+    let redis_monitor_output = redis_monitor.collect().await.namespaced(&namespace);
+    assert_eq!(redis_monitor_output.num_nodes(), 1);
+    assert!(redis_monitor_output.command_sent_to_any("GET"));
+}
+
+// NB: the `num_products` parameter determines how many `Product` entities will be requested from
+//  the `reviews` subgraph. This is useful to check that `get_multiple` works properly with different
+//  numbers of keys.
+#[rstest::rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_uses_replicas_in_clusters_for_mgets(#[values(1, 3, 5)] num_products: usize) {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let router_config = include_str!("fixtures/response_cache_redis_cluster.router.yaml");
+    let mut subgraph_overrides = HashMap::new();
+
+    let products = [
+        json!({"__typename":"Product","upc":"1","name":"Table","reviews":[{"id":"review1"}]}),
+        json!({"__typename":"Product","upc":"2","name":"Chair","reviews":[{"id":"review2"}]}),
+        json!({"__typename":"Product","upc":"3","name":"Desk","reviews":[{"id":"review3"}]}),
+        json!({"__typename":"Product","upc":"4","name":"Lamp","reviews":[{"id":"review4"}]}),
+        json!({"__typename":"Product","upc":"5","name":"Sofa","reviews":[{"id":"review5"}]}),
+    ];
+
+    let products_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {"topProducts": products[..num_products]}}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let reviews_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {
+            "_entities": [
+                {"__typename":"Review","id":"review1","author":{"__typename":"User","id":"user1"}},
+                {"__typename":"Review","id":"review2","author":{"__typename":"User","id":"user2"}},
+                {"__typename":"Review","id":"review3","author":{"__typename":"User","id":"user3"}},
+                {"__typename":"Review","id":"review4","author":{"__typename":"User","id":"user4"}},
+                {"__typename":"Review","id":"review5","author":{"__typename":"User","id":"user5"}}
+            ]
+        }}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let accounts_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {
+            "_entities": [
+                {"__typename":"User","id":"user1"},
+                {"__typename":"User","id":"user2"},
+                {"__typename":"User","id":"user3"},
+                {"__typename":"User","id":"user4"},
+                {"__typename":"User","id":"user5"}
+            ]
+        }}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let mock_products_subgraph = wiremock::MockServer::builder().start().await;
+    let mock_reviews_subgraph = wiremock::MockServer::builder().start().await;
+    let mock_accounts_subgraph = wiremock::MockServer::builder().start().await;
+
+    for (name, mock_server, response) in [
+        ("products", &mock_products_subgraph, products_response),
+        ("reviews", &mock_reviews_subgraph, reviews_response),
+        ("accounts", &mock_accounts_subgraph, accounts_response),
+    ] {
+        let http_method = Method::POST;
+        let mocked_response = Mock::given(method(http_method))
+            .and(path_regex(".*"))
+            .respond_with(response);
+
+        mocked_response.mount(mock_server).await;
+        subgraph_overrides.insert(name.to_string(), mock_server.uri());
+    }
+
+    let namespace = namespace();
+
+    let mut router = IntegrationTest::builder()
+        .redis_namespace(&namespace)
+        .config(router_config)
+        .subgraph_overrides(subgraph_overrides)
+        .log("trace,jsonpath_lib=info")
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    let redis_monitor = RedisMonitor::new(&REDIS_CLUSTER_PORTS).await;
+
+    // send a few different queries to ensure a redis cache hit
+    let mut join_set = JoinSet::new();
+    for _ in 0..5 {
+        let query = Query::builder()
+            .body(
+                json!({"query":"{ topProducts(first: 5) { name reviews { id } } }","variables":{}}),
+            )
+            .header("cache-control", "public")
+            .build();
+
+        join_set.spawn(router.execute_query(query));
+    }
+    let _ = join_set.join_all().await;
+
+    let redis_monitor_output = redis_monitor.collect().await.namespaced(&namespace);
+    assert!(redis_monitor_output.command_sent_to_replicas_only("GET"));
+
+    // check that there were no I/O errors
+    let io_error = r#"apollo_router_cache_redis_errors_total{error_type="io",kind="response-cache",otel_scope_name="apollo/router"}"#;
+    router.assert_metrics_does_not_contain(io_error).await;
+
+    // check that there were no parse errors; parse errors happen whenever a response from redis to
+    // fred can't be understood by fred, which can be redis config issues, type conversion
+    // shenanigans, or things like being in the middle of a transaction (pipeline) and trying to
+    // convert a value
+    let parse_error = r#"apollo_router_cache_redis_errors_total{error_type="parse""#;
+    router.assert_metrics_does_not_contain(parse_error).await;
+
+    // Use pattern matching instead of hardcoded hash to be resilient to hash changes
+    router
+        .assert_redis_cache_contains_key_matching("subgraph:reviews:type:Product")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_redis_in_standalone_mode_for_mgets() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let router_config = include_str!("fixtures/response_cache_redis_standalone.router.yaml");
+
+    // name, url
+    let mut subgraph_overrides = HashMap::new();
+
+    let products_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {
+            "topProducts": [
+                {"__typename":"Product","upc":"1","name":"Table","reviews":[{"id":"review1"}]},
+                {"__typename":"Product","upc":"2","name":"Chair","reviews":[{"id":"review2"}]},
+                {"__typename":"Product","upc":"3","name":"Desk","reviews":[{"id":"review3"}]},
+                {"__typename":"Product","upc":"4","name":"Lamp","reviews":[{"id":"review4"}]},
+                {"__typename":"Product","upc":"5","name":"Sofa","reviews":[{"id":"review5"}]}
+            ]
+        }}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let reviews_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {
+            "_entities": [
+                {"__typename":"Review","id":"review1","author":{"__typename":"User","id":"user1"}},
+                {"__typename":"Review","id":"review2","author":{"__typename":"User","id":"user2"}},
+                {"__typename":"Review","id":"review3","author":{"__typename":"User","id":"user3"}},
+                {"__typename":"Review","id":"review4","author":{"__typename":"User","id":"user4"}},
+                {"__typename":"Review","id":"review5","author":{"__typename":"User","id":"user5"}}
+            ]
+        }}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let accounts_response = ResponseTemplate::new(200)
+        .set_body_json(serde_json::json! {{"data": {
+            "_entities": [
+                {"__typename":"User","id":"user1"},
+                {"__typename":"User","id":"user2"},
+                {"__typename":"User","id":"user3"},
+                {"__typename":"User","id":"user4"},
+                {"__typename":"User","id":"user5"}
+            ]
+        }}})
+        .insert_header("cache-control", "max-age=500, public");
+
+    let mock_products_subgraph = wiremock::MockServer::builder().start().await;
+    let mock_reviews_subgraph = wiremock::MockServer::builder().start().await;
+    let mock_accounts_subgraph = wiremock::MockServer::builder().start().await;
+
+    for (name, mock_server, response) in [
+        ("products", &mock_products_subgraph, products_response),
+        ("reviews", &mock_reviews_subgraph, reviews_response),
+        ("accounts", &mock_accounts_subgraph, accounts_response),
+    ] {
+        let http_method = Method::POST;
+        let mocked_response = Mock::given(method(http_method))
+            .and(path_regex(".*"))
+            .respond_with(response);
+
+        mocked_response.mount(mock_server).await;
+        subgraph_overrides.insert(name.to_string(), mock_server.uri());
+    }
+
+    let namespace = namespace();
+    let redis_monitor = RedisMonitor::new(&REDIS_STANDALONE_PORT).await;
+
+    let mut router = IntegrationTest::builder()
+        .redis_namespace(&namespace)
+        .config(router_config)
+        .subgraph_overrides(subgraph_overrides)
+        .log("trace,jsonpath_lib=info")
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Allow time for the Redis pool to register both clients (pool_size: 2) before
+    // snapshotting error counters. fred can emit transient IO events to its `error_rx`
+    // channel while the pool is still stabilising its initial connections (every event
+    // there is counted by `record_redis_error`), so we must wait for the pool to settle.
+    let expected_metric = r#"apollo_router_cache_redis_clients{otel_scope_name="apollo/router"} 2"#;
+    router
+        .assert_metrics_contains(expected_metric, Some(std::time::Duration::from_secs(30)))
+        .await;
+
+    // Snapshot the redis error counters BEFORE issuing queries. Any transient IO/parse
+    // events recorded during pool warmup are independent of whether the router's actual
+    // query-time operations succeed. Asserting "metric not present" on a cumulative
+    // counter is therefore racy. We instead diff the counters across the query phase so
+    // we only fail if a NEW error is recorded while queries are being served.
+    let io_error = r#"apollo_router_cache_redis_errors_total{error_type="io",kind="response-cache",otel_scope_name="apollo/router"}"#;
+    let parse_error = r#"apollo_router_cache_redis_errors_total{error_type="parse",kind="response-cache",otel_scope_name="apollo/router"}"#;
+    let io_error_before = router.read_metric_counter_value(io_error).await;
+    let parse_error_before = router.read_metric_counter_value(parse_error).await;
+
+    // send a few different queries to ensure a redis cache hit
+    let mut join_set = JoinSet::new();
+    for _ in 0..5 {
+        let query = Query::builder()
+            .body(
+                json!({"query":"{ topProducts(first: 5) { name reviews { id } } }","variables":{}}),
+            )
+            .header("cache-control", "public")
+            .build();
+        join_set.spawn(router.execute_query(query));
+    }
+    let _ = join_set.join_all().await;
+
+    // when there's only 1 node, the MGET will be sent to it
+    let redis_monitor_output = redis_monitor.collect().await;
+    assert_eq!(redis_monitor_output.num_nodes(), 1);
+    assert!(redis_monitor_output.command_sent_to_any("MGET"));
+
+    // No NEW I/O errors should be recorded while serving queries.
+    let io_error_after = router.read_metric_counter_value(io_error).await;
+    assert_eq!(
+        io_error_after, io_error_before,
+        "redis IO error counter increased during query execution ({io_error_before} -> {io_error_after}); '{io_error}'"
+    );
+
+    // No NEW parse errors either; parse errors happen whenever a response from redis to
+    // fred can't be understood by fred, which can be redis config issues, type conversion
+    // shenanigans, or things like being in the middle of a transaction (pipeline) and trying to
+    // convert a value
+    let parse_error_after = router.read_metric_counter_value(parse_error).await;
+    assert_eq!(
+        parse_error_after, parse_error_before,
+        "redis parse error counter increased during query execution ({parse_error_before} -> {parse_error_after}); '{parse_error}'"
+    );
+
+    // Use pattern matching instead of hardcoded hash to be resilient to hash changes
+    router
+        .assert_redis_cache_contains_key_matching("subgraph:reviews:type:Product")
+        .await;
+}

@@ -1,0 +1,36 @@
+---
+source: apollo-router/src/plugins/telemetry/config_new/instruments.rs
+description: Subgraph response body size metric
+expression: "&metrics.all()"
+info:
+  telemetry:
+    instrumentation:
+      instruments:
+        router:
+          http.server.active_requests: false
+          http.server.request.duration: false
+          http.server.response.body.size: false
+        subgraph:
+          http.client.request.duration: false
+          http.client.request.body.size: false
+          http.client.response.body.size: true
+---
+- name: apollo.router.operations.fetch.duration
+  description: Duration of a subgraph fetch.
+  unit: s
+  data:
+    datapoints:
+      - sum: 0.1
+        count: 1
+        attributes:
+          has_errors: false
+          subgraph.name: products
+- name: http.client.response.body.size
+  description: Size of HTTP client response bodies.
+  unit: By
+  data:
+    datapoints:
+      - sum: 26
+        count: 1
+        attributes:
+          subgraph.name: products

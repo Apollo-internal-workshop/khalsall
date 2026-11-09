@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "router.fullname" . }}
+  labels:
+    {{- include "router.labels" . | nindent 4 }}
+    {{- if .Values.extraLabels }}
+    {{- include "apollographql.templatizeExtraLabels" . | trim | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetport }}
+      protocol: TCP
+      name: http
+    {{- /* When the health listener is co-located with the main listener,
+           rendering a second entry with the same port and protocol produces
+           an invalid Service (spec.ports duplicate value), so the health
+           port is only rendered when it differs from the main port. The
+           health endpoint remains reachable through the main port in the
+           co-located case. */}}
+    {{- $healthPort := (splitList ":" (index .Values.router.configuration "health_check").listen | last ) | default "8088" }}
+    {{- if ne (toString $healthPort) (toString .Values.service.port) }}
+    - port: {{ $healthPort }}
+      targetPort: health
+      protocol: TCP
+      name: health
+    {{- end }}
+    {{- if (.Values.router.configuration.response_cache).invalidation }}
+    - port: {{ (splitList ":" .Values.router.configuration.response_cache.invalidation.listen | last) }}
+      targetPort: invalidation
+      protocol: TCP
+      name: invalidation
+    {{- end }}
+    {{- if .Values.serviceMonitor.enabled }}
+    {{/* NOTE: metrics configuration moved under telemetry.exporters in Router 1.35.0 */}}
+    {{- if .Values.router.configuration.telemetry.exporters.metrics.prometheus.listen }}
+    - port: {{ (splitList ":" .Values.router.configuration.telemetry.exporters.metrics.prometheus.listen | last) | default "9090" }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- else if .Values.router.configuration.telemetry.metrics.prometheus.listen }}
+    - port: {{ (splitList ":" .Values.router.configuration.telemetry.metrics.prometheus.listen | last) | default "9090" }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+    {{- end }}
+  selector:
+    {{- include "router.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,20 @@
+# Router built from vendor/router (branch benjamn/connectors-mcp) so it understands
+# @connect(mcp:). Build once and push; deploys just reference the image. From the repo root:
+#   docker build --platform linux/amd64 -f router/Dockerfile.mcp -t router-mcp .
+# The supergraph is composed locally (GraphOS can't compose mcp: yet) and mounted at deploy time from
+# Secret Manager, as is router.yaml, so schema changes never need a new image.
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/*
+RUN rustup toolchain install 1.99.1 --profile minimal
+WORKDIR /src
+COPY vendor/router ./router
+RUN cd router && rustup run 1.99.1 cargo build -p apollo-router --bin router --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /dist
+COPY --from=build /src/router/target/release/router /dist/router
+# Default config; Cloud Run mounts the real one from Secret Manager over /dist/config/router.yaml
+COPY router/router.yaml /dist/config/router.yaml
+ENV PORT=8080
+ENTRYPOINT ["/dist/router", "--supergraph", "/dist/supergraph/supergraph.graphql", "--config", "/dist/config/router.yaml"]

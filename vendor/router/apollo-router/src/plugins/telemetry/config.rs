@@ -1,0 +1,1522 @@
+//! Configuration for the telemetry plugin.
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::num::NonZeroU32;
+
+use num_traits::ToPrimitive;
+use opentelemetry::Array;
+use opentelemetry::Value;
+use opentelemetry_sdk::metrics::Aggregation;
+#[cfg(test)]
+use opentelemetry_sdk::metrics::Instrument;
+use opentelemetry_sdk::metrics::Stream;
+use opentelemetry_sdk::trace::SpanLimits;
+use serde::Serialize;
+use tower::BoxError;
+
+use super::*;
+use crate::Configuration;
+use crate::plugins::telemetry::apollo::Config as ApolloTelemetryConfig;
+use crate::plugins::telemetry::metrics;
+use crate::plugins::telemetry::resource::ConfigResource;
+use crate::plugins::telemetry::tracing::datadog::DatadogAgentSampling;
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum Error {
+    #[error(
+        "field level instrumentation sampler must sample less frequently than tracing level sampler"
+    )]
+    InvalidFieldLevelInstrumentationSampler,
+    #[error(
+        "per-exporter sampler for 'telemetry.{exporter}' ({per_exporter:.4}) must not exceed the common tracing sampler ({common:.4}); \
+         setting it higher cannot increase sampling beyond what the common sampler allows"
+    )]
+    PerExporterSamplerExceedsCommon {
+        exporter: &'static str,
+        per_exporter: f64,
+        common: f64,
+    },
+}
+
+pub(in crate::plugins::telemetry) trait GenericWith<T>
+where
+    Self: Sized,
+{
+    fn with<B>(self, option: &Option<B>, apply: fn(Self, &B) -> Self) -> Self {
+        if let Some(option) = option {
+            return apply(self, option);
+        }
+        self
+    }
+}
+
+impl<T> GenericWith<T> for T where Self: Sized {}
+
+/// Telemetry configuration
+#[apollo_configuration::configuration]
+#[schemars(rename = "TelemetryConfig")]
+pub(crate) struct Conf {
+    /// Apollo reporting configuration
+    pub(crate) apollo: apollo::Config,
+
+    /// Instrumentation configuration
+    pub(crate) exporters: Exporters,
+
+    /// Instrumentation configuration
+    pub(crate) instrumentation: Instrumentation,
+}
+
+/// Exporter configuration
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct Exporters {
+    /// Logging configuration
+    pub(crate) logging: config_new::logging::Logging,
+    /// Metrics configuration
+    pub(crate) metrics: Metrics,
+    /// Tracing configuration
+    pub(crate) tracing: Tracing,
+}
+
+/// Instrumentation configuration
+#[apollo_configuration::configuration]
+pub(crate) struct Instrumentation {
+    /// Event configuration
+    pub(crate) events: config_new::events::Events,
+    /// Span configuration
+    pub(crate) spans: config_new::spans::Spans,
+    /// Instrument configuration
+    pub(crate) instruments: config_new::instruments::InstrumentsConfig,
+}
+
+impl Instrumentation {
+    pub(crate) fn validate_selectors(&self) -> Result<(), String> {
+        self.events.validate_selectors()?;
+        self.instruments.validate_selectors()?;
+        self.spans.validate_selectors()
+    }
+}
+
+/// Metrics configuration
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct Metrics {
+    /// Common metrics configuration across all exporters
+    pub(crate) common: MetricsCommon,
+    /// Open Telemetry native exporter configuration
+    pub(crate) otlp: otlp::Config,
+    /// Prometheus exporter configuration
+    pub(crate) prometheus: metrics::prometheus::Config,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct MetricsCommon {
+    /// Set a service.name resource in your metrics
+    pub(crate) service_name: Option<String>,
+    /// Set a service.namespace attribute in your metrics
+    pub(crate) service_namespace: Option<String>,
+    /// The Open Telemetry resource
+    // BTreeMap has no Validate impl.
+    #[config(skip_validate)]
+    pub(crate) resource: BTreeMap<String, AttributeValue>,
+    /// Custom buckets for all histograms
+    #[config(default = default_buckets())]
+    pub(crate) buckets: Vec<f64>,
+    /// Views applied on metrics
+    pub(crate) views: Vec<MetricView>,
+    /// Maximum number of distinct attribute combinations (cardinality)
+    ///
+    /// If not set, the OTel SDK default of 2000 applies.
+    pub(crate) cardinality_limit: Option<NonZeroU32>,
+}
+
+fn default_buckets() -> Vec<f64> {
+    vec![
+        0.001, 0.005, 0.015, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 5.0, 10.0,
+    ]
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct MetricView {
+    /// The instrument name you're targeting
+    #[config(required, validate = validate_view_name)]
+    pub(crate) name: String,
+    /// Rename the metric to this name
+    ///
+    /// This allows you to customize metric names for both OTLP and Prometheus exporters.
+    /// Note: Prometheus will apply additional transformations (dots to underscores, unit suffixes).
+    /// Apollo metrics are not affected by this rename - they will retain original names.
+    pub(crate) rename: Option<String>,
+    /// New description to set to the instrument
+    pub(crate) description: Option<String>,
+    /// New unit to set to the instrument
+    pub(crate) unit: Option<String>,
+    /// New aggregation settings to set
+    pub(crate) aggregation: Option<MetricAggregation>,
+    /// An allow-list of attribute keys that will be preserved for the instrument.
+    ///
+    /// Any attribute recorded for the instrument with a key not in this set will be
+    /// dropped. If the set is empty, all attributes will be dropped, if `None` all
+    /// attributes will be kept.
+    // HashSet has no Validate impl.
+    #[config(skip_validate)]
+    pub(crate) allowed_attribute_keys: Option<HashSet<String>>,
+    /// Maximum number of distinct attribute combinations (cardinality) for this instrument.
+    ///
+    /// Overrides the global `cardinality_limit` from `MetricsCommon` for this specific metric.
+    /// If neither this nor the global limit is set, the OTel SDK default of 2000 applies.
+    pub(crate) cardinality_limit: Option<NonZeroU32>,
+}
+
+/// Rejects a view name that isn't a valid instrument name pattern, such as an unclosed `[`, so the
+/// error points at the name instead of surfacing when the metrics pipeline is built.
+fn validate_view_name(name: &str, mut errors: apollo_configuration::ErrorCollector<'_>) {
+    if let Err(error) = InstrumentNameMatcher::new(name) {
+        errors.report_simple(error);
+    }
+}
+
+impl MetricView {
+    /// Creates a default view for a named instrument with the given parameters.
+    /// Pass `Some(buckets)` only for histogram instruments; the constructor
+    /// stores them as a `Histogram` aggregation default.
+    pub(crate) fn default_view(
+        name: &str,
+        histogram_buckets: Option<Vec<f64>>,
+        cardinality_limit: Option<NonZeroU32>,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: histogram_buckets.map(|buckets| MetricAggregation::Histogram { buckets }),
+            allowed_attribute_keys: None,
+            cardinality_limit,
+        }
+    }
+
+    /// Merges user-provided overrides into this view configuration.
+    /// User-specified (`Some`) fields take precedence; unspecified (`None`)
+    /// fields retain the values from `self`.
+    pub(crate) fn merge(self, user: Self) -> Self {
+        Self {
+            name: self.name,
+            rename: user.rename.or(self.rename),
+            description: user.description.or(self.description),
+            unit: user.unit.or(self.unit),
+            aggregation: user.aggregation.or(self.aggregation),
+            allowed_attribute_keys: user.allowed_attribute_keys.or(self.allowed_attribute_keys),
+            cardinality_limit: user.cardinality_limit.or(self.cardinality_limit),
+        }
+    }
+
+    /// Builds a Stream from this view configuration.
+    /// Use this when you've already matched the instrument by name.
+    pub(crate) fn into_stream(self) -> Stream {
+        let name = self.name.clone();
+        let mut stream = Stream::builder();
+        if let Some(new_name) = self.rename {
+            stream = stream.with_name(new_name);
+        }
+        if let Some(desc) = self.description {
+            stream = stream.with_description(desc);
+        }
+        if let Some(u) = self.unit {
+            stream = stream.with_unit(u);
+        }
+        if let Some(agg) = self.aggregation {
+            let aggregation = match agg {
+                MetricAggregation::Histogram { buckets } => Aggregation::ExplicitBucketHistogram {
+                    boundaries: buckets,
+                    record_min_max: true,
+                },
+                MetricAggregation::Drop => Aggregation::Drop,
+            };
+            stream = stream.with_aggregation(aggregation);
+        }
+        if let Some(keys) = self.allowed_attribute_keys {
+            stream = stream.with_allowed_attribute_keys(keys.into_iter().map(Key::new));
+        }
+        if let Some(limit) = self.cardinality_limit {
+            stream = stream.with_cardinality_limit(limit.get() as usize);
+        }
+        stream
+            .build()
+            .unwrap_or_else(|e| panic!("failed to build view for {name}: {e}"))
+    }
+
+    /// Converts this MetricView into a view function for OTel SDK 0.31+
+    #[cfg(test)]
+    pub(crate) fn into_view_fn(
+        self,
+    ) -> Result<impl Fn(&Instrument) -> Option<Stream> + Send + Sync + 'static, BoxError> {
+        let matcher = self.name_matcher()?;
+        let view = self;
+        Ok(move |instrument: &Instrument| {
+            if !matcher.matches(instrument.name()) {
+                return None;
+            }
+            Some(view.clone().into_stream())
+        })
+    }
+
+    /// Compiles this view's `name` into a matcher used to select instruments.
+    pub(crate) fn name_matcher(&self) -> Result<InstrumentNameMatcher, BoxError> {
+        InstrumentNameMatcher::new(&self.name)
+    }
+}
+
+/// Matches an instrument name against a metric view's configured `name`.
+///
+/// This restores the wildcard selection the OpenTelemetry SDK performed natively
+/// before the 0.31 View API migration, which replaced pattern-aware selection with a
+/// plain closure. `name` is a glob (`*`, `?`, `[...]`); a bare `*` or an empty name
+/// matches every instrument, and a name with no glob metacharacters matches exactly.
+#[derive(Clone, Debug)]
+pub(crate) enum InstrumentNameMatcher {
+    /// Matches every instrument (empty name or a bare `*`).
+    All,
+    /// Matches a single instrument name exactly.
+    Exact(String),
+    /// Matches instrument names against a glob pattern (`*`, `?`, `[...]`).
+    Pattern(globset::GlobMatcher),
+}
+
+impl InstrumentNameMatcher {
+    fn new(name: &str) -> Result<Self, BoxError> {
+        if name.is_empty() || name == "*" {
+            return Ok(Self::All);
+        }
+        // Only glob metacharacters opt a name into pattern matching, mirroring the pre-0.31 SDK.
+        if name.contains(['*', '?', '[', ']']) {
+            let glob = globset::Glob::new(name).map_err(|error| -> BoxError {
+                format!("invalid metric view name `{name}`: {error}").into()
+            })?;
+            return Ok(Self::Pattern(glob.compile_matcher()));
+        }
+        Ok(Self::Exact(name.to_string()))
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Exact(expected) => expected == name,
+            Self::Pattern(pattern) => pattern.is_match(name),
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) enum MetricAggregation {
+    /// An aggregation that summarizes a set of measurements as an histogram with
+    /// explicitly defined buckets.
+    Histogram {
+        #[config(required)]
+        buckets: Vec<f64>,
+    },
+    /// Simply drop the metrics matching this view
+    Drop,
+}
+
+/// Tracing configuration
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct Tracing {
+    /// A way to expose trace id in response headers
+    #[serde(alias = "experimental_response_trace_id")]
+    pub(crate) response_trace_id: ExposeTraceId,
+    /// Propagation configuration
+    pub(crate) propagation: Propagation,
+    /// Common configuration
+    pub(crate) common: TracingCommon,
+    /// OpenTelemetry native exporter configuration
+    pub(crate) otlp: otlp::Config,
+    /// Datadog exporter configuration
+    pub(crate) datadog: tracing::datadog::Config,
+}
+
+impl Tracing {
+    pub(crate) fn is_baggage_propagation_enabled(&self) -> bool {
+        self.propagation.baggage
+    }
+
+    pub(crate) fn is_trace_context_propagation_enabled(&self) -> bool {
+        self.propagation.trace_context || self.otlp.enabled
+    }
+
+    pub(crate) fn is_datadog_propagation_enabled(&self) -> bool {
+        self.propagation.datadog.unwrap_or(false) || self.datadog.enabled
+    }
+
+    pub(crate) fn is_aws_xray_propagation_enabled(&self) -> bool {
+        self.propagation.aws_xray
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct ExposeTraceId {
+    /// Expose the trace_id in response headers
+    pub(crate) enabled: bool,
+    /// Choose the header name to expose trace_id (default: apollo-trace-id)
+    #[schemars(with = "Option<String>")]
+    pub(crate) header_name: Option<apollo_configuration::types::HeaderName>,
+    /// Format of the trace ID in response headers
+    pub(crate) format: TraceIdFormat,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq)]
+pub(crate) enum TraceIdFormat {
+    /// Format the Trace ID as a hexadecimal number
+    ///
+    /// (e.g. Trace ID 16 -> 00000000000000000000000000000010)
+    #[config(default)]
+    Hexadecimal,
+    /// Format the Trace ID as a hexadecimal number
+    ///
+    /// (e.g. Trace ID 16 -> 00000000000000000000000000000010)
+    OpenTelemetry,
+    /// Format the Trace ID as a decimal number
+    ///
+    /// (e.g. Trace ID 16 -> 16)
+    Decimal,
+
+    /// Datadog
+    Datadog,
+
+    /// UUID format with dashes
+    /// (eg. 67e55044-10b1-426f-9247-bb680e5fe0c8)
+    Uuid,
+}
+
+impl TraceIdFormat {
+    pub(crate) fn format(&self, trace_id: TraceId) -> String {
+        match self {
+            TraceIdFormat::Hexadecimal | TraceIdFormat::OpenTelemetry => {
+                format!("{trace_id:032x}")
+            }
+            TraceIdFormat::Decimal => format!("{}", u128::from_be_bytes(trace_id.to_bytes())),
+            TraceIdFormat::Datadog => trace_id.to_datadog(),
+            TraceIdFormat::Uuid => Uuid::from_bytes(trace_id.to_bytes()).to_string(),
+        }
+    }
+}
+
+/// Apollo usage report signature normalization algorithm
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq, Serialize)]
+pub(crate) enum ApolloSignatureNormalizationAlgorithm {
+    /// Use the algorithm that matches the JavaScript-based implementation.
+    Legacy,
+    /// Use a new algorithm that includes input object forms, normalized aliases and variable names, and removes some
+    /// edge cases from the JS implementation that affected normalization.
+    #[config(default)]
+    Enhanced,
+}
+
+/// Apollo usage report reference generation modes.
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq)]
+pub(crate) enum ApolloMetricsReferenceMode {
+    /// Use the extended mode to report input object fields and enum value references as well as object fields.
+    #[config(default)]
+    Extended,
+    /// Use the standard mode that only reports referenced object fields.
+    Standard,
+}
+
+/// Configure propagation of traces. In general you won't have to do this as these are automatically configured
+/// along with any exporter you configure.
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct Propagation {
+    /// Select a custom request header to set your own trace_id (header value must be convertible from hexadecimal to set a correct trace_id)
+    pub(crate) request: RequestPropagation,
+    /// Propagate baggage https://www.w3.org/TR/baggage/
+    pub(crate) baggage: bool,
+    /// Propagate trace context https://www.w3.org/TR/trace-context/
+    pub(crate) trace_context: bool,
+    /// Propagate Datadog
+    pub(crate) datadog: Option<bool>,
+    /// Propagate AWS X-Ray
+    pub(crate) aws_xray: bool,
+}
+
+#[apollo_configuration::configuration]
+#[derive(Default, PartialEq)]
+pub(crate) struct RequestPropagation {
+    /// Choose the header name to expose trace_id (default: apollo-trace-id)
+    #[config(required)]
+    #[schemars(with = "String")]
+    pub(crate) header_name: Option<apollo_configuration::types::HeaderName>,
+
+    /// The trace ID format that will be used when propagating to subgraph services.
+    pub(crate) format: TraceIdFormat,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+#[non_exhaustive]
+pub(crate) struct TracingCommon {
+    /// The trace service name
+    pub(crate) service_name: Option<String>,
+    /// The trace service namespace
+    pub(crate) service_namespace: Option<String>,
+    /// The sampler, always_on, always_off or a decimal between 0.0 and 1.0
+    #[config(default = default_sampler())]
+    pub(crate) sampler: SamplerOption,
+    /// Use datadog agent sampling. This means that all spans will be sent to the Datadog agent
+    /// and the `sampling.priority` attribute will be used to control if the span will then be sent to Datadog
+    pub(crate) preview_datadog_agent_sampling: Option<bool>,
+    /// Whether to use parent based sampling
+    #[config(default = true)]
+    pub(crate) parent_based_sampler: bool,
+    /// The maximum events per span before discarding
+    #[config(default = SpanLimits::default().max_events_per_span)]
+    pub(crate) max_events_per_span: u32,
+    /// The maximum attributes per span before discarding
+    #[config(default = SpanLimits::default().max_attributes_per_span)]
+    pub(crate) max_attributes_per_span: u32,
+    /// The maximum links per span before discarding
+    #[config(default = SpanLimits::default().max_links_per_span)]
+    pub(crate) max_links_per_span: u32,
+    /// The maximum attributes per event before discarding
+    #[config(default = SpanLimits::default().max_attributes_per_event)]
+    pub(crate) max_attributes_per_event: u32,
+    /// The maximum attributes per link before discarding
+    #[config(default = SpanLimits::default().max_attributes_per_link)]
+    pub(crate) max_attributes_per_link: u32,
+    /// The Open Telemetry resource
+    // BTreeMap has no Validate impl.
+    #[config(skip_validate)]
+    pub(crate) resource: BTreeMap<String, AttributeValue>,
+}
+
+impl ConfigResource for TracingCommon {
+    fn service_name(&self) -> &Option<String> {
+        &self.service_name
+    }
+    fn service_namespace(&self) -> &Option<String> {
+        &self.service_namespace
+    }
+    fn resource(&self) -> &BTreeMap<String, AttributeValue> {
+        &self.resource
+    }
+}
+
+impl ConfigResource for MetricsCommon {
+    fn service_name(&self) -> &Option<String> {
+        &self.service_name
+    }
+    fn service_namespace(&self) -> &Option<String> {
+        &self.service_namespace
+    }
+    fn resource(&self) -> &BTreeMap<String, AttributeValue> {
+        &self.resource
+    }
+}
+
+fn default_sampler() -> SamplerOption {
+    SamplerOption::Always(Sampler::AlwaysOn)
+}
+
+#[apollo_configuration::configuration]
+#[derive(Serialize, PartialEq)]
+#[serde(untagged)]
+#[allow(missing_docs)] // only public-but-hidden for tests
+pub enum AttributeValue {
+    /// bool values
+    Bool(bool),
+    /// i64 values
+    I64(i64),
+    /// f64 values
+    F64(f64),
+    /// String values
+    String(String),
+    /// Array of homogeneous values
+    #[allow(private_interfaces)]
+    Array(AttributeArray),
+}
+
+impl AttributeValue {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            AttributeValue::Bool(_) => None,
+            AttributeValue::I64(v) => Some(*v as f64),
+            AttributeValue::F64(v) => Some(*v),
+            AttributeValue::String(v) => v.parse::<f64>().ok(),
+            AttributeValue::Array(_) => None,
+        }
+    }
+}
+
+impl From<String> for AttributeValue {
+    fn from(value: String) -> Self {
+        AttributeValue::String(value)
+    }
+}
+
+impl From<&'static str> for AttributeValue {
+    fn from(value: &'static str) -> Self {
+        AttributeValue::String(value.to_string())
+    }
+}
+
+impl From<bool> for AttributeValue {
+    fn from(value: bool) -> Self {
+        AttributeValue::Bool(value)
+    }
+}
+
+impl From<f64> for AttributeValue {
+    fn from(value: f64) -> Self {
+        AttributeValue::F64(value)
+    }
+}
+
+impl From<i64> for AttributeValue {
+    fn from(value: i64) -> Self {
+        AttributeValue::I64(value)
+    }
+}
+
+impl std::fmt::Display for AttributeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeValue::Bool(val) => write!(f, "{val}"),
+            AttributeValue::I64(val) => write!(f, "{val}"),
+            AttributeValue::F64(val) => write!(f, "{val}"),
+            AttributeValue::String(val) => write!(f, "{val}"),
+            AttributeValue::Array(val) => write!(f, "{val}"),
+        }
+    }
+}
+
+impl PartialOrd for AttributeValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (AttributeValue::Bool(b1), AttributeValue::Bool(b2)) => b1.partial_cmp(b2),
+            (AttributeValue::F64(f1), AttributeValue::F64(f2)) => f1.partial_cmp(f2),
+            (AttributeValue::I64(i1), AttributeValue::I64(i2)) => i1.partial_cmp(i2),
+            (AttributeValue::String(s1), AttributeValue::String(s2)) => s1.partial_cmp(s2),
+            // Mismatched numerics are comparable
+            (AttributeValue::F64(f1), AttributeValue::I64(i)) => {
+                i.to_f64().as_ref().and_then(|f2| f1.partial_cmp(f2))
+            }
+            (AttributeValue::I64(i), AttributeValue::F64(f)) => i.to_f64()?.partial_cmp(f),
+            // Arrays and other mismatched types are incomparable
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<serde_json::Value> for AttributeValue {
+    type Error = ();
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        match value {
+            serde_json::Value::Null => Err(()),
+            serde_json::Value::Bool(v) => Ok(AttributeValue::Bool(v)),
+            serde_json::Value::Number(v) if v.is_i64() => {
+                Ok(AttributeValue::I64(v.as_i64().expect("i64 checked")))
+            }
+            serde_json::Value::Number(v) if v.is_f64() => {
+                Ok(AttributeValue::F64(v.as_f64().expect("f64 checked")))
+            }
+            serde_json::Value::String(v) => Ok(AttributeValue::String(v)),
+            serde_json::Value::Array(v) => {
+                if v.iter().all(|v| v.is_boolean()) {
+                    Ok(AttributeValue::Array(AttributeArray::Bool(
+                        v.iter()
+                            .map(|v| v.as_bool().expect("all bools checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_f64()) {
+                    Ok(AttributeValue::Array(AttributeArray::F64(
+                        v.iter()
+                            .map(|v| v.as_f64().expect("all f64 checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_i64()) {
+                    Ok(AttributeValue::Array(AttributeArray::I64(
+                        v.iter()
+                            .map(|v| v.as_i64().expect("all i64 checked"))
+                            .collect(),
+                    )))
+                } else if v.iter().all(|v| v.is_string()) {
+                    Ok(AttributeValue::Array(AttributeArray::String(
+                        v.iter()
+                            .map(|v| v.as_str().expect("all strings checked").to_string())
+                            .collect(),
+                    )))
+                } else {
+                    Err(())
+                }
+            }
+            serde_json::Value::Object(_v) => Err(()),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<AttributeValue> for opentelemetry::Value {
+    fn from(value: AttributeValue) -> Self {
+        match value {
+            AttributeValue::Bool(v) => Value::Bool(v),
+            AttributeValue::I64(v) => Value::I64(v),
+            AttributeValue::F64(v) => Value::F64(v),
+            AttributeValue::String(v) => Value::String(v.into()),
+            AttributeValue::Array(v) => Value::Array(v.into()),
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(Serialize, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum AttributeArray {
+    /// Array of bools
+    Bool(Vec<bool>),
+    /// Array of integers
+    I64(Vec<i64>),
+    /// Array of floats
+    F64(Vec<f64>),
+    /// Array of strings
+    String(Vec<String>),
+}
+
+impl std::fmt::Display for AttributeArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttributeArray::Bool(val) => write!(f, "{val:?}"),
+            AttributeArray::I64(val) => write!(f, "{val:?}"),
+            AttributeArray::F64(val) => write!(f, "{val:?}"),
+            AttributeArray::String(val) => write!(f, "{val:?}"),
+        }
+    }
+}
+
+impl From<AttributeArray> for opentelemetry::Array {
+    fn from(array: AttributeArray) -> Self {
+        match array {
+            AttributeArray::Bool(v) => Array::Bool(v),
+            AttributeArray::I64(v) => Array::I64(v),
+            AttributeArray::F64(v) => Array::F64(v),
+            AttributeArray::String(v) => Array::String(v.into_iter().map(|v| v.into()).collect()),
+        }
+    }
+}
+
+impl From<opentelemetry::Array> for AttributeArray {
+    fn from(array: opentelemetry::Array) -> Self {
+        match array {
+            opentelemetry::Array::Bool(v) => AttributeArray::Bool(v),
+            opentelemetry::Array::I64(v) => AttributeArray::I64(v),
+            opentelemetry::Array::F64(v) => AttributeArray::F64(v),
+            opentelemetry::Array::String(v) => {
+                AttributeArray::String(v.into_iter().map(|v| v.into()).collect())
+            }
+            _ => unreachable!("unexpected opentelemetry::Array variant"),
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+#[serde(untagged)]
+pub(crate) enum SamplerOption {
+    /// Sample a given fraction. Fractions >= 1 will always sample.
+    TraceIdRatioBased(f64),
+    Always(Sampler),
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) enum Sampler {
+    /// Always sample
+    AlwaysOn,
+    /// Never sample
+    AlwaysOff,
+}
+
+impl From<Sampler> for opentelemetry_sdk::trace::Sampler {
+    fn from(s: Sampler) -> Self {
+        match s {
+            Sampler::AlwaysOn => opentelemetry_sdk::trace::Sampler::AlwaysOn,
+            Sampler::AlwaysOff => opentelemetry_sdk::trace::Sampler::AlwaysOff,
+        }
+    }
+}
+
+impl From<SamplerOption> for opentelemetry_sdk::trace::Sampler {
+    fn from(s: SamplerOption) -> Self {
+        match s {
+            SamplerOption::Always(s) => s.into(),
+            SamplerOption::TraceIdRatioBased(ratio) => {
+                opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio)
+            }
+        }
+    }
+}
+
+impl TracingCommon {
+    /// Configures a TracerProviderBuilder with sampler, span limits, and resource settings.
+    pub(crate) fn configure_tracer_provider_builder(
+        &self,
+        builder: opentelemetry_sdk::trace::TracerProviderBuilder,
+    ) -> opentelemetry_sdk::trace::TracerProviderBuilder {
+        let mut sampler: opentelemetry_sdk::trace::Sampler = self.sampler.clone().into();
+        if self.parent_based_sampler {
+            sampler = parent_based(sampler);
+        }
+
+        let builder = builder
+            .with_span_limits(SpanLimits {
+                max_events_per_span: self.max_events_per_span,
+                max_attributes_per_span: self.max_attributes_per_span,
+                max_links_per_span: self.max_links_per_span,
+                max_attributes_per_event: self.max_attributes_per_event,
+                max_attributes_per_link: self.max_attributes_per_link,
+            })
+            .with_resource(self.to_resource());
+
+        if self.preview_datadog_agent_sampling.unwrap_or_default() {
+            builder.with_sampler(DatadogAgentSampling::new(
+                sampler,
+                self.parent_based_sampler,
+            ))
+        } else {
+            builder.with_sampler(sampler)
+        }
+    }
+}
+
+fn parent_based(sampler: opentelemetry_sdk::trace::Sampler) -> opentelemetry_sdk::trace::Sampler {
+    opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(sampler))
+}
+
+fn sampler_option_to_ratio(s: &SamplerOption) -> f64 {
+    match s {
+        SamplerOption::TraceIdRatioBased(r) => r.clamp(0.0, 1.0),
+        SamplerOption::Always(Sampler::AlwaysOn) => 1.0,
+        SamplerOption::Always(Sampler::AlwaysOff) => 0.0,
+    }
+}
+
+impl Conf {
+    pub(crate) fn calculate_field_level_instrumentation_ratio(&self) -> Result<f64, Error> {
+        // Because when Datadog is enabled the global sampling is overridden to always_on
+        if self
+            .exporters
+            .tracing
+            .common
+            .preview_datadog_agent_sampling
+            .unwrap_or_default()
+        {
+            let field_ratio = match &self.apollo.field_level_instrumentation_sampler {
+                SamplerOption::TraceIdRatioBased(ratio) => *ratio,
+                SamplerOption::Always(Sampler::AlwaysOn) => 1.0,
+                SamplerOption::Always(Sampler::AlwaysOff) => 0.0,
+            };
+
+            return Ok(field_ratio);
+        }
+        Ok(
+            match (
+                &self.exporters.tracing.common.sampler,
+                &self.apollo.field_level_instrumentation_sampler,
+            ) {
+                // Error conditions
+                (
+                    SamplerOption::TraceIdRatioBased(global_ratio),
+                    SamplerOption::TraceIdRatioBased(field_ratio),
+                ) if field_ratio > global_ratio => {
+                    Err(Error::InvalidFieldLevelInstrumentationSampler)?
+                }
+                (
+                    SamplerOption::Always(Sampler::AlwaysOff),
+                    SamplerOption::Always(Sampler::AlwaysOn),
+                ) => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
+                (
+                    SamplerOption::Always(Sampler::AlwaysOff),
+                    SamplerOption::TraceIdRatioBased(ratio),
+                ) if *ratio != 0.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
+                (
+                    SamplerOption::TraceIdRatioBased(ratio),
+                    SamplerOption::Always(Sampler::AlwaysOn),
+                ) if *ratio != 1.0 => Err(Error::InvalidFieldLevelInstrumentationSampler)?,
+
+                // Happy paths
+                (_, SamplerOption::TraceIdRatioBased(ratio)) if *ratio == 0.0 => 0.0,
+                (SamplerOption::TraceIdRatioBased(ratio), _) if *ratio == 0.0 => 0.0,
+                (_, SamplerOption::Always(Sampler::AlwaysOn)) => 1.0,
+                // the `field_ratio` should be a ratio of the entire set of requests. But FTV1 would only be reported
+                // if a trace was generated with the Apollo exporter, which has its own sampling `global_ratio`.
+                // in telemetry::request_ftv1, we activate FTV1 if the current trace is sampled and depending on
+                // the ratio returned by this function.
+                // This means that:
+                // - field_ratio cannot be larger than global_ratio (see above, we return an error in that case)
+                // - we have to divide field_ratio by global_ratio
+                // Example: we want to measure FTV1 on 30% of total requests, but we the Apollo tracer samples at 50%.
+                // If we measure FTV1 on 60% (0.3 / 0.5) of these sampled requests, that amounts to 30% of the total traffic
+                (
+                    SamplerOption::TraceIdRatioBased(global_ratio),
+                    SamplerOption::TraceIdRatioBased(field_ratio),
+                ) => field_ratio / global_ratio,
+                (
+                    SamplerOption::Always(Sampler::AlwaysOn),
+                    SamplerOption::TraceIdRatioBased(field_ratio),
+                ) => *field_ratio,
+                (_, _) => 0.0,
+            },
+        )
+    }
+
+    /// Validates that no per-exporter sampler exceeds the common tracing sampler.
+    /// Setting a per-exporter sampler higher than the common sampler cannot increase
+    /// the number of exported spans and is almost certainly a misconfiguration.
+    pub(crate) fn validate_per_exporter_samplers(&self) -> Result<(), Error> {
+        let common_ratio = sampler_option_to_ratio(&self.exporters.tracing.common.sampler);
+
+        // OTLP sampler is always applied (even in Datadog agent sampling mode), so always validate.
+        let mut exporters = vec![
+            ("apollo", self.apollo.sampler.as_ref()),
+            (
+                "exporters.tracing.otlp",
+                self.exporters.tracing.otlp.sampler.as_ref(),
+            ),
+        ];
+
+        // In Datadog agent sampling mode the Datadog exporter ignores its per-exporter sampler
+        // (it must forward all spans unfiltered so the agent can make its own decisions).
+        // Validation is skipped for Datadog in that mode since the sampler has no effect.
+        let datadog_agent_sampling = self
+            .exporters
+            .tracing
+            .common
+            .preview_datadog_agent_sampling
+            .unwrap_or_default();
+        if !datadog_agent_sampling {
+            exporters.push((
+                "exporters.tracing.datadog",
+                self.exporters.tracing.datadog.sampler.as_ref(),
+            ));
+        }
+
+        for (name, sampler) in exporters {
+            if let Some(sampler) = sampler {
+                let per_exporter_ratio = sampler_option_to_ratio(sampler);
+                if per_exporter_ratio > common_ratio {
+                    return Err(Error::PerExporterSamplerExceedsCommon {
+                        exporter: name,
+                        per_exporter: per_exporter_ratio,
+                        common: common_ratio,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The telemetry config, when the configuration has a `telemetry` section.
+    fn configured(configuration: &Configuration) -> Option<&Conf> {
+        configuration.typed_plugin_config("apollo.telemetry")
+    }
+
+    pub(crate) fn metrics_reference_mode(
+        configuration: &Configuration,
+    ) -> ApolloMetricsReferenceMode {
+        Self::configured(configuration)
+            .map(|conf| conf.apollo.metrics_reference_mode)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn signature_normalization_algorithm(
+        configuration: &Configuration,
+    ) -> ApolloSignatureNormalizationAlgorithm {
+        Self::configured(configuration)
+            .map(|conf| conf.apollo.signature_normalization_algorithm.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn apollo(configuration: &Configuration) -> ApolloTelemetryConfig {
+        Self::configured(configuration)
+            .map(|conf| conf.apollo.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::MeterProviderBuilder;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
+    use opentelemetry_sdk::runtime;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_attribute_value_from_json() {
+        assert_eq!(
+            AttributeValue::try_from(json!("foo")),
+            Ok(AttributeValue::String("foo".to_string()))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(1)),
+            Ok(AttributeValue::I64(1))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(1.1)),
+            Ok(AttributeValue::F64(1.1))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(true)),
+            Ok(AttributeValue::Bool(true))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!(["foo", "bar"])),
+            Ok(AttributeValue::Array(AttributeArray::String(vec![
+                "foo".to_string(),
+                "bar".to_string()
+            ])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([1, 2])),
+            Ok(AttributeValue::Array(AttributeArray::I64(vec![1, 2])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([1.1, 1.5])),
+            Ok(AttributeValue::Array(AttributeArray::F64(vec![1.1, 1.5])))
+        );
+        assert_eq!(
+            AttributeValue::try_from(json!([true, false])),
+            Ok(AttributeValue::Array(AttributeArray::Bool(vec![
+                true, false
+            ])))
+        );
+
+        // Mixed array conversions
+        AttributeValue::try_from(json!(["foo", true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([1, true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([1.1, true])).expect_err("mixed conversion must fail");
+        AttributeValue::try_from(json!([true, "bar"])).expect_err("mixed conversion must fail");
+    }
+
+    #[test]
+    fn instrument_name_matcher_exact_and_wildcards() {
+        let matcher = |name: &str| {
+            MetricView::default_view(name, None, None)
+                .name_matcher()
+                .expect("valid glob")
+        };
+
+        // Exact (no wildcard chars)
+        assert!(matcher("request.duration").matches("request.duration"));
+        assert!(!matcher("request.duration").matches("request.size"));
+
+        // `*` = zero or more characters; `.` in the pattern is a literal
+        assert!(matcher("request.*").matches("request.duration"));
+        assert!(matcher("request.*").matches("request.size"));
+        assert!(matcher("request.*").matches("request."));
+        assert!(!matcher("request.*").matches("response.duration"));
+        assert!(!matcher("request.*").matches("requests")); // requires the literal '.'
+
+        // `?` = exactly one character
+        assert!(matcher("request.coun?").matches("request.count"));
+        assert!(!matcher("request.coun?").matches("request.coun"));
+        assert!(!matcher("request.coun?").matches("request.counts"));
+
+        // `[...]` = one character from a set
+        assert!(matcher("request.[cs]ount").matches("request.count"));
+        assert!(matcher("request.[cs]ount").matches("request.sount"));
+        assert!(!matcher("request.[cs]ount").matches("request.bount"));
+
+        // Catch-alls: bare `*` and empty string match everything
+        assert!(matcher("*").matches("anything.at.all"));
+        assert!(matcher("").matches("anything.at.all"));
+
+        // Metacharacters other than the glob syntax stay literal: the `.` must
+        // match a literal dot.
+        assert!(matcher("a.b*").matches("a.bcd"));
+        assert!(!matcher("a.b*").matches("axbcd"));
+    }
+
+    #[test]
+    fn instrument_name_matcher_rejects_invalid_pattern() {
+        let error = MetricView::default_view("request.[cs", None, None)
+            .name_matcher()
+            .expect_err("unbalanced bracket must be rejected");
+        assert!(error.to_string().contains("request.[cs"));
+    }
+
+    /// A view name that isn't a valid pattern fails the configuration parse, and the error points at the name's value.
+    #[test]
+    fn metric_view_names_are_validated_when_the_configuration_is_parsed() {
+        let parse = |name: &str| {
+            crate::configuration::parse_configuration(
+                &format!(
+                    "telemetry:\n  exporters:\n    metrics:\n      common:\n        views:\n          - name: \"{name}\"\n"
+                ),
+                crate::configuration::expansion::Expansion::builder().build(),
+                crate::configuration::Migration::None,
+            )
+        };
+
+        let error = parse("request.[cs")
+            .expect_err("an unclosed bracket is not a valid pattern")
+            .to_string();
+        assert!(
+            error.contains("invalid metric view name `request.[cs`"),
+            "{error}"
+        );
+        assert!(error.contains("[6:19]"), "{error}");
+
+        parse("request.*").expect("a valid pattern parses");
+    }
+
+    #[test]
+    fn test_metric_view_rename_deserialization() {
+        // Test deserialization of MetricView with rename field
+        let json_config = json!({
+            "name": "http.server.request.duration",
+            "rename": "apollo.router.http.duration"
+        });
+
+        let view: MetricView = serde_json::from_value(json_config).expect("should deserialize");
+        assert_eq!(view.name, "http.server.request.duration");
+        assert_eq!(view.rename, Some("apollo.router.http.duration".to_string()));
+        assert_eq!(view.description, None);
+        assert_eq!(view.unit, None);
+        assert_eq!(view.aggregation, None);
+        assert_eq!(view.allowed_attribute_keys, None);
+    }
+
+    #[test]
+    fn test_metric_view_without_rename() {
+        // Test backward compatibility - MetricView without rename field
+        let json_config = json!({
+            "name": "http.server.request.duration",
+            "description": "HTTP request duration"
+        });
+
+        let view: MetricView = serde_json::from_value(json_config).expect("should deserialize");
+        assert_eq!(view.name, "http.server.request.duration");
+        assert_eq!(view.rename, None);
+        assert_eq!(view.description, Some("HTTP request duration".to_string()));
+    }
+
+    #[test]
+    fn test_metric_view_with_all_fields() {
+        // Test MetricView with rename combined with other fields
+        let json_config = json!({
+            "name": "http.server.request.duration",
+            "rename": "custom.metric.name",
+            "description": "Custom description",
+            "unit": "s",
+            "aggregation": {
+                "histogram": {
+                    "buckets": [0.1, 0.5, 1.0, 5.0]
+                }
+            }
+        });
+
+        let view: MetricView = serde_json::from_value(json_config).expect("should deserialize");
+        assert_eq!(view.name, "http.server.request.duration");
+        assert_eq!(view.rename, Some("custom.metric.name".to_string()));
+        assert_eq!(view.description, Some("Custom description".to_string()));
+        assert_eq!(view.unit, Some("s".to_string()));
+        assert!(view.aggregation.is_some());
+    }
+
+    #[test]
+    fn test_merge_user_overrides_all_fields() {
+        let default = MetricView::default_view("my.histogram", Some(vec![0.1, 0.5, 1.0]), None);
+        let user = MetricView {
+            name: "my.histogram".to_string(),
+            rename: Some("renamed.histogram".to_string()),
+            description: Some("User description".to_string()),
+            unit: Some("ms".to_string()),
+            aggregation: Some(MetricAggregation::Histogram {
+                buckets: vec![1.0, 5.0, 10.0],
+            }),
+            allowed_attribute_keys: Some(HashSet::from(["key1".to_string()])),
+            cardinality_limit: NonZeroU32::new(5000),
+        };
+
+        let merged = default.merge(user);
+        assert_eq!(merged.name, "my.histogram");
+        assert_eq!(merged.rename, Some("renamed.histogram".to_string()));
+        assert_eq!(merged.description, Some("User description".to_string()));
+        assert_eq!(merged.unit, Some("ms".to_string()));
+        assert_eq!(
+            merged.aggregation,
+            Some(MetricAggregation::Histogram {
+                buckets: vec![1.0, 5.0, 10.0]
+            })
+        );
+        assert_eq!(
+            merged.allowed_attribute_keys,
+            Some(HashSet::from(["key1".to_string()]))
+        );
+        assert_eq!(merged.cardinality_limit, NonZeroU32::new(5000));
+    }
+
+    #[test]
+    fn test_merge_user_specifies_nothing_preserves_defaults() {
+        let default_buckets = vec![0.1, 0.5, 1.0];
+        let default = MetricView::default_view("my.histogram", Some(default_buckets.clone()), None);
+        let user = MetricView {
+            name: "my.histogram".to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: None,
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        let merged = default.merge(user);
+        assert_eq!(merged.name, "my.histogram");
+        assert_eq!(merged.rename, None);
+        assert_eq!(merged.description, None);
+        assert_eq!(merged.unit, None);
+        assert_eq!(
+            merged.aggregation,
+            Some(MetricAggregation::Histogram {
+                buckets: default_buckets
+            }),
+            "default histogram aggregation should be preserved when user specifies none"
+        );
+        assert_eq!(merged.allowed_attribute_keys, None);
+        assert_eq!(merged.cardinality_limit, None);
+    }
+
+    #[test]
+    fn test_merge_partial_override_preserves_default_aggregation() {
+        let default_buckets = vec![0.001, 0.005, 0.015, 0.05, 0.1];
+        let default = MetricView::default_view(
+            "http.server.request.duration",
+            Some(default_buckets.clone()),
+            None,
+        );
+        let user = MetricView {
+            name: "http.server.request.duration".to_string(),
+            rename: None,
+            description: Some("Custom description".to_string()),
+            unit: None,
+            aggregation: None,
+            allowed_attribute_keys: Some(HashSet::from([
+                "http.method".to_string(),
+                "http.status_code".to_string(),
+            ])),
+            cardinality_limit: None,
+        };
+
+        let merged = default.merge(user);
+        assert_eq!(
+            merged.aggregation,
+            Some(MetricAggregation::Histogram {
+                buckets: default_buckets
+            }),
+            "default histogram buckets should be inherited when user doesn't specify aggregation"
+        );
+        assert_eq!(merged.description, Some("Custom description".to_string()));
+        assert_eq!(
+            merged.allowed_attribute_keys,
+            Some(HashSet::from([
+                "http.method".to_string(),
+                "http.status_code".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_merge_user_drop_overrides_default_histogram() {
+        let default = MetricView::default_view("noisy.metric", Some(vec![0.1, 0.5, 1.0]), None);
+        let user = MetricView {
+            name: "noisy.metric".to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: Some(MetricAggregation::Drop),
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        let merged = default.merge(user);
+        assert_eq!(
+            merged.aggregation,
+            Some(MetricAggregation::Drop),
+            "user Drop aggregation should override default histogram"
+        );
+    }
+
+    /// Helper to extract histogram bounds from exported metrics
+    fn get_histogram_bounds(
+        exporter: &InMemoryMetricExporter,
+        metric_name: &str,
+    ) -> Option<Vec<f64>> {
+        let metrics = exporter.get_finished_metrics().ok()?;
+        for resource_metrics in metrics {
+            for scope_metrics in resource_metrics.scope_metrics() {
+                for metric in scope_metrics.metrics() {
+                    if metric.name() == metric_name
+                        && let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+                            MetricData::Histogram(histogram),
+                        ) = metric.data()
+                        && let Some(dp) = histogram.data_points().next()
+                    {
+                        return Some(dp.bounds().collect());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Helper to check if a metric exists in exported metrics
+    fn metric_exists(exporter: &InMemoryMetricExporter, metric_name: &str) -> bool {
+        let Ok(metrics) = exporter.get_finished_metrics() else {
+            return false;
+        };
+        metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .any(|m| m.name() == metric_name)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_user_custom_buckets_are_applied() {
+        let exporter = InMemoryMetricExporter::default();
+        let custom_buckets = vec![0.005, 0.05, 0.5, 5.0];
+
+        // Create a view with custom histogram buckets
+        let view = MetricView {
+            name: "test.histogram".to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: Some(MetricAggregation::Histogram {
+                buckets: custom_buckets.clone(),
+            }),
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        let meter_provider = MeterProviderBuilder::default()
+            .with_reader(PeriodicReader::builder(exporter.clone(), runtime::Tokio).build())
+            .with_view(view.into_view_fn().unwrap())
+            .build();
+
+        // Record a histogram value
+        let meter = meter_provider.meter("test");
+        let histogram = meter.f64_histogram("test.histogram").build();
+        histogram.record(0.1, &[]);
+
+        meter_provider.force_flush().unwrap();
+
+        let bounds =
+            get_histogram_bounds(&exporter, "test.histogram").expect("histogram should exist");
+        assert_eq!(
+            bounds, custom_buckets,
+            "histogram should use user-specified custom buckets"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_merged_view_inherits_default_buckets() {
+        let exporter = InMemoryMetricExporter::default();
+        let default_buckets = vec![0.001, 0.01, 0.1, 1.0, 10.0];
+
+        // Create a default view with histogram buckets
+        let default_view =
+            MetricView::default_view("test.histogram", Some(default_buckets.clone()), None);
+
+        // User view specifies only description, not aggregation
+        let user_view = MetricView {
+            name: "test.histogram".to_string(),
+            rename: None,
+            description: Some("Custom description".to_string()),
+            unit: None,
+            aggregation: None, // No aggregation specified - should inherit defaults
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        // Merge views - user view should inherit default buckets
+        let merged = default_view.merge(user_view);
+
+        let meter_provider = MeterProviderBuilder::default()
+            .with_reader(PeriodicReader::builder(exporter.clone(), runtime::Tokio).build())
+            .with_view(merged.into_view_fn().unwrap())
+            .build();
+
+        let meter = meter_provider.meter("test");
+        let histogram = meter.f64_histogram("test.histogram").build();
+        histogram.record(0.05, &[]);
+
+        meter_provider.force_flush().unwrap();
+
+        let bounds =
+            get_histogram_bounds(&exporter, "test.histogram").expect("histogram should exist");
+        assert_eq!(
+            bounds, default_buckets,
+            "merged view should inherit default buckets when user doesn't specify aggregation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_aggregation_suppresses_metric() {
+        let exporter = InMemoryMetricExporter::default();
+
+        // Create a view with Drop aggregation
+        let view = MetricView {
+            name: "dropped.histogram".to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: Some(MetricAggregation::Drop),
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        let meter_provider = MeterProviderBuilder::default()
+            .with_reader(PeriodicReader::builder(exporter.clone(), runtime::Tokio).build())
+            .with_view(view.into_view_fn().unwrap())
+            .build();
+
+        let meter = meter_provider.meter("test");
+        let histogram = meter.f64_histogram("dropped.histogram").build();
+        histogram.record(1.0, &[]);
+
+        meter_provider.force_flush().unwrap();
+
+        assert!(
+            !metric_exists(&exporter, "dropped.histogram"),
+            "metric with Drop aggregation should not be exported"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_user_buckets_override_merged_defaults() {
+        let exporter = InMemoryMetricExporter::default();
+        let default_buckets = vec![0.001, 0.01, 0.1, 1.0, 10.0];
+        let user_buckets = vec![1.0, 5.0, 10.0, 50.0];
+
+        // Create a default view with histogram buckets
+        let default_view = MetricView::default_view("test.histogram", Some(default_buckets), None);
+
+        // User view specifies custom aggregation - should override defaults
+        let user_view = MetricView {
+            name: "test.histogram".to_string(),
+            rename: None,
+            description: None,
+            unit: None,
+            aggregation: Some(MetricAggregation::Histogram {
+                buckets: user_buckets.clone(),
+            }),
+            allowed_attribute_keys: None,
+            cardinality_limit: None,
+        };
+
+        // Merge views - user aggregation should take precedence
+        let merged = default_view.merge(user_view);
+
+        let meter_provider = MeterProviderBuilder::default()
+            .with_reader(PeriodicReader::builder(exporter.clone(), runtime::Tokio).build())
+            .with_view(merged.into_view_fn().unwrap())
+            .build();
+
+        let meter = meter_provider.meter("test");
+        let histogram = meter.f64_histogram("test.histogram").build();
+        histogram.record(2.5, &[]);
+
+        meter_provider.force_flush().unwrap();
+
+        let bounds =
+            get_histogram_bounds(&exporter, "test.histogram").expect("histogram should exist");
+        assert_eq!(
+            bounds, user_buckets,
+            "user-specified buckets should override default buckets in merged view"
+        );
+    }
+
+    #[test]
+    fn per_exporter_sampler_validation_passes_when_below_common() {
+        let mut conf = Conf::default();
+        conf.exporters.tracing.common.sampler = SamplerOption::TraceIdRatioBased(0.1);
+        conf.exporters.tracing.otlp.sampler = Some(SamplerOption::TraceIdRatioBased(0.02));
+        conf.apollo.sampler = Some(SamplerOption::TraceIdRatioBased(0.05));
+        assert!(conf.validate_per_exporter_samplers().is_ok());
+    }
+
+    #[test]
+    fn per_exporter_sampler_validation_passes_when_equal_to_common() {
+        let mut conf = Conf::default();
+        conf.exporters.tracing.common.sampler = SamplerOption::TraceIdRatioBased(0.1);
+        conf.exporters.tracing.otlp.sampler = Some(SamplerOption::TraceIdRatioBased(0.1));
+        assert!(conf.validate_per_exporter_samplers().is_ok());
+    }
+
+    #[test]
+    fn per_exporter_sampler_validation_errors_when_exceeds_common() {
+        let mut conf = Conf::default();
+        conf.exporters.tracing.common.sampler = SamplerOption::TraceIdRatioBased(0.1);
+        conf.exporters.tracing.otlp.sampler = Some(SamplerOption::TraceIdRatioBased(0.5));
+        let err = conf.validate_per_exporter_samplers().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("telemetry.exporters.tracing.otlp"),
+            "error should name the offending exporter: {msg}"
+        );
+    }
+
+    #[test]
+    fn per_exporter_sampler_validation_skipped_for_datadog_in_agent_sampling_mode() {
+        let mut conf = Conf::default();
+        conf.exporters.tracing.common.sampler = SamplerOption::TraceIdRatioBased(0.1);
+        conf.exporters.tracing.common.preview_datadog_agent_sampling = Some(true);
+        // In Datadog agent sampling mode the Datadog exporter ignores its sampler, so a value
+        // exceeding the common sampler should not produce a validation error.
+        conf.exporters.tracing.datadog.sampler = Some(SamplerOption::TraceIdRatioBased(0.5));
+        assert!(conf.validate_per_exporter_samplers().is_ok());
+    }
+
+    #[test]
+    fn per_exporter_sampler_validation_still_applies_to_otlp_in_datadog_agent_sampling_mode() {
+        let mut conf = Conf::default();
+        conf.exporters.tracing.common.sampler = SamplerOption::TraceIdRatioBased(0.1);
+        conf.exporters.tracing.common.preview_datadog_agent_sampling = Some(true);
+        // OTLP sampler is still applied in Datadog agent sampling mode, so it must not exceed
+        // the common sampler.
+        conf.exporters.tracing.otlp.sampler = Some(SamplerOption::TraceIdRatioBased(0.5));
+        let err = conf.validate_per_exporter_samplers().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("telemetry.exporters.tracing.otlp"),
+            "error should name the offending exporter: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_metric_view_cardinality_limit_rejects_zero() {
+        let json_config = json!({
+            "name": "http.server.request.duration",
+            "cardinality_limit": 0
+        });
+        assert!(
+            serde_json::from_value::<MetricView>(json_config).is_err(),
+            "cardinality_limit: 0 should be rejected"
+        );
+    }
+}

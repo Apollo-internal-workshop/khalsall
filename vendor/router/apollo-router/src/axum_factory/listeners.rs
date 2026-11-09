@@ -1,0 +1,1127 @@
+//! Listeners and endpoints
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
+
+use axum::Router;
+use axum::response::*;
+use bytesize::ByteSize;
+use futures::channel::oneshot;
+use futures::prelude::*;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::TokioIo;
+use hyper_util::rt::TokioTimer;
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::server::conn::auto::Http1Builder;
+use hyper_util::server::graceful::GracefulConnection;
+use hyper_util::service::TowerToHyperService;
+use multimap::MultiMap;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::time::FutureExt;
+use tower::Layer;
+use tower::ServiceBuilder;
+use tower::ServiceExt;
+use tower_http::add_extension::AddExtensionLayer;
+use tower_http::normalize_path::NormalizePathLayer;
+use tower_service::Service;
+
+use crate::ListenAddr;
+use crate::axum_factory::ENDPOINT_CALLBACK;
+use crate::axum_factory::Endpoint;
+use crate::axum_factory::connection_handle::ConnectionHandle;
+use crate::axum_factory::utils::ConnectionInfo;
+use crate::axum_factory::utils::ConnectionRouterService;
+use crate::configuration::Configuration;
+use crate::http_server_factory::Listener;
+use crate::http_server_factory::NetworkStream;
+use crate::layers::InternalServiceBuilderExt as _;
+use crate::metrics::FutureMetricsExt;
+use crate::plugins::limits::LimitsPlugin;
+use crate::plugins::limits::http2_header_list;
+use crate::plugins::telemetry::pipeline_bypass::record_rejected_request;
+use crate::router::ApolloRouterError;
+use crate::services::Plugins;
+use crate::services::router::pipeline_handle::PipelineHandle;
+
+static MAX_FILE_HANDLES_WARN: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ListenAddrAndRouter(pub(crate) ListenAddr, pub(crate) Router);
+
+#[derive(Debug)]
+pub(crate) struct ListenersAndRouters {
+    pub(crate) main: ListenAddrAndRouter,
+    pub(crate) extra: MultiMap<ListenAddr, Router>,
+}
+
+/// Merging [`axum::Router`]`s that use the same path panics (yes it doesn't raise an error, it panics.)
+///
+/// In order to not crash the router if paths clash using hot reload, we make sure the configuration is consistent,
+/// and raise an error instead.
+pub(super) fn ensure_endpoints_consistency(
+    configuration: &Configuration,
+    endpoints: &MultiMap<ListenAddr, Endpoint>,
+) -> Result<(), ApolloRouterError> {
+    // check the main endpoint
+    if let Some(supergraph_listen_endpoint) = endpoints.get_vec(&configuration.supergraph.listen)
+        && supergraph_listen_endpoint
+            .iter()
+            .any(|e| e.path == configuration.supergraph.path)
+        && let Some((ip, port)) = configuration.supergraph.listen.ip_and_port()
+    {
+        return Err(ApolloRouterError::SameRouteUsedTwice(
+            ip,
+            port,
+            configuration.supergraph.path.clone(),
+        ));
+    }
+
+    // check the extra endpoints
+    let mut listen_addrs_and_paths = HashSet::new();
+    for (listen, endpoints) in endpoints.iter_all() {
+        for endpoint in endpoints {
+            if let Some((ip, port)) = listen.ip_and_port()
+                && !listen_addrs_and_paths.insert((ip, port, endpoint.path.clone()))
+            {
+                return Err(ApolloRouterError::SameRouteUsedTwice(
+                    ip,
+                    port,
+                    endpoint.path.clone(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn extra_endpoints(
+    endpoints: MultiMap<ListenAddr, Endpoint>,
+    plugins: &Plugins,
+) -> MultiMap<ListenAddr, Router> {
+    let mut mm: MultiMap<ListenAddr, axum::Router> = Default::default();
+    mm.extend(endpoints.into_iter().map(|(listen_addr, e)| {
+        (
+            listen_addr,
+            e.into_iter()
+                .map(|e| endpoint_router(e, plugins))
+                .collect::<Vec<_>>(),
+        )
+    }));
+    mm
+}
+
+/// Builds a plugin endpoint's router, on any listener.
+///
+/// Plugin endpoints don't go through the router service stack, where graph requests get the HTTP/2
+/// header-list check, so they get the limits plugin's endpoint layer instead. HTTP/1.1 header
+/// limits need none: hyper enforces them on the connection, before any route is chosen.
+pub(super) fn endpoint_router(endpoint: Endpoint, plugins: &Plugins) -> Router {
+    let mut router = endpoint.into_router().layer(
+        ServiceBuilder::new()
+            .apply_plugin_layer(plugins, LimitsPlugin::endpoint_header_list_limit_layer),
+    );
+    if let Some(main_endpoint_layer) = ENDPOINT_CALLBACK.get() {
+        router = main_endpoint_layer(router);
+    }
+    router
+}
+
+/// Binding different listen addresses to the same port will "relax" the requirements, which
+/// could result in a security issue:
+/// If endpoint A is exposed to 127.0.0.1:4000/foo and endpoint B is exposed to 0.0.0.0:4000/bar
+/// 0.0.0.0:4000/foo would be accessible.
+///
+/// `ensure_listenaddrs_consistency` makes sure listen addresses that bind to the same port
+/// have the same IP:
+/// 127.0.0.1:4000 and 127.0.0.1:4000 will not trigger an error
+/// 127.0.0.1:4000 and 0.0.0.0:4001 will not trigger an error
+///
+/// 127.0.0.1:4000 and 0.0.0.0:4000 will trigger an error
+pub(super) fn ensure_listenaddrs_consistency(
+    configuration: &Configuration,
+    endpoints: &MultiMap<ListenAddr, Endpoint>,
+) -> Result<(), ApolloRouterError> {
+    let mut all_ports = HashMap::new();
+    if let Some((main_ip, main_port)) = configuration.supergraph.listen.ip_and_port() {
+        all_ports.insert(main_port, main_ip);
+    }
+
+    if configuration.health_check.enabled
+        && let Some((ip, port)) = configuration.health_check.listen.ip_and_port()
+        && let Some(previous_ip) = all_ports.insert(port, ip)
+        && ip != previous_ip
+    {
+        return Err(ApolloRouterError::DifferentListenAddrsOnSamePort(
+            previous_ip,
+            ip,
+            port,
+        ));
+    }
+
+    for addr in endpoints.keys() {
+        if let Some((ip, port)) = addr.ip_and_port()
+            && let Some(previous_ip) = all_ports.insert(port, ip)
+            && ip != previous_ip
+        {
+            return Err(ApolloRouterError::DifferentListenAddrsOnSamePort(
+                previous_ip,
+                ip,
+                port,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) async fn get_extra_listeners(
+    previous_listeners: Vec<(ListenAddr, Listener)>,
+    mut extra_routers: MultiMap<ListenAddr, Router>,
+) -> Result<Vec<((ListenAddr, Listener), axum::Router)>, ApolloRouterError> {
+    let mut listeners_and_routers: Vec<((ListenAddr, Listener), axum::Router)> =
+        Vec::with_capacity(extra_routers.len());
+
+    // reuse previous extra listen addrs
+    for (listen_addr, listener) in previous_listeners.into_iter() {
+        if let Some(routers) = extra_routers.remove(&listen_addr) {
+            listeners_and_routers.push((
+                (listen_addr, listener),
+                routers
+                    .iter()
+                    .fold(axum::Router::new(), |acc, r| acc.merge(r.clone())),
+            ));
+        }
+    }
+
+    // populate the new listen addrs
+    for (listen_addr, routers) in extra_routers.into_iter() {
+        // if we received a TCP listener, reuse it, otherwise create a new one
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let listener = match listen_addr.clone() {
+            ListenAddr::SocketAddr(addr) => Listener::new_from_socket_addr(addr, None).await?,
+            #[cfg(unix)]
+            ListenAddr::UnixSocket(path) => Listener::Unix(
+                UnixListener::bind(path).map_err(ApolloRouterError::ServerCreationError)?,
+            ),
+        };
+        listeners_and_routers.push((
+            (listen_addr, listener),
+            routers
+                .iter()
+                .fold(axum::Router::new(), |acc, r| acc.merge(r.clone())),
+        ));
+    }
+
+    Ok(listeners_and_routers)
+}
+
+// Drive a connection until graceful shutdown.
+async fn handle_connection<C, E: AsRef<dyn std::error::Error + Send + Sync>>(
+    connection: C,
+    mut connection_handle: ConnectionHandle,
+    connection_shutdown: CancellationToken,
+    connection_shutdown_timeout: Duration,
+    received_first_request: Arc<AtomicBool>,
+) where
+    C: Future<Output = Result<(), E>>,
+    C: GracefulConnection<Error = E>,
+{
+    let connection_start = Instant::now();
+    tokio::pin!(connection);
+    tokio::select! {
+        // the connection finished first
+        res = &mut connection => {
+            // Hyper rejects requests with oversized headers (431) or URI (414) before they
+            // reach the axum service layer, so those responses are invisible to the normal
+            // metrics/tracing middleware. We detect them here from the connection error and
+            // emit metrics manually so they remain observable.
+            if let Err(ref err) = res &&
+                 let Some(status_code) = classify_hyper_rejection(err.as_ref()) {
+                    record_rejected_request(status_code, connection_start);
+                }
+        }
+        // the shutdown receiver was triggered first,
+        // so we tell the connection to do a graceful shutdown
+        // on the next request, then we wait for it to finish
+        _ = connection_shutdown.cancelled() => {
+            connection_handle.shutdown();
+            connection.as_mut().graceful_shutdown();
+            // Only wait for the connection to close gracfully if we recieved a request.
+            // On hyper 0.x awaiting the connection would potentially hang forever if no request was recieved.
+            if received_first_request.load(Ordering::Relaxed) {
+                // The connection may still not shutdown so we apply a timeout from the configuration
+                // Connections stuck terminating will keep the pipeline and everything related to that pipeline
+                // in memory.
+
+                if connection.timeout(connection_shutdown_timeout).await.is_err() {
+                    tracing::warn!(
+                        timeout = connection_shutdown_timeout.as_secs(),
+                        server.address = connection_handle.address.to_string(),
+                        schema.id = connection_handle.pipeline_ref.schema_id,
+                        config.hash = connection_handle.pipeline_ref.config_hash,
+                        launch.id = connection_handle.pipeline_ref.launch_id,
+                        "connection shutdown exceeded, forcing close",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_error(io_error: std::io::Error) {
+    match io_error.kind() {
+        // this is already handled by mio and tokio
+        //std::io::ErrorKind::WouldBlock => todo!(),
+
+        // should be treated as EAGAIN
+        // https://man7.org/linux/man-pages/man2/accept.2.html
+        // Linux accept() (and accept4()) passes already-pending network
+        // errors on the new socket as an error code from accept().  This
+        // behavior differs from other BSD socket implementations.  For
+        // reliable operation the application should detect the network
+        // errors defined for the protocol after accept() and treat them
+        // like EAGAIN by retrying.  In the case of TCP/IP, these are
+        // ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH,
+        // EOPNOTSUPP, and ENETUNREACH.
+        //
+        // those errors are not supported though: needs the unstable io_error_more feature
+        // std::io::ErrorKind::NetworkDown => todo!(),
+        // std::io::ErrorKind::HostUnreachable => todo!(),
+        // std::io::ErrorKind::NetworkUnreachable => todo!(),
+
+        //ECONNABORTED
+        std::io::ErrorKind::ConnectionAborted|
+        //EINTR
+        std::io::ErrorKind::Interrupted|
+        // EINVAL
+        std::io::ErrorKind::InvalidInput|
+        std::io::ErrorKind::PermissionDenied |
+        std::io::ErrorKind::TimedOut |
+        std::io::ErrorKind::ConnectionReset|
+        std::io::ErrorKind::NotConnected => {
+            // the socket was invalid (maybe timedout waiting in accept queue, or was closed)
+            // we should ignore that and get to the next one
+        }
+
+        // ignored errors, these should not happen with accept()
+        std::io::ErrorKind::NotFound |
+        std::io::ErrorKind::AddrInUse |
+        std::io::ErrorKind::AddrNotAvailable |
+        std::io::ErrorKind::BrokenPipe|
+        std::io::ErrorKind::AlreadyExists |
+        std::io::ErrorKind::InvalidData |
+        std::io::ErrorKind::WriteZero |
+        std::io::ErrorKind::Unsupported |
+        std::io::ErrorKind::UnexpectedEof |
+        std::io::ErrorKind::OutOfMemory => {
+        }
+
+        // EPROTO, EOPNOTSUPP, EBADF, EFAULT, EMFILE, ENOBUFS, ENOMEM, ENOTSOCK
+        // We match on _ because max open file errors fall under ErrorKind::Uncategorized
+        _ => {
+            match io_error.raw_os_error() {
+                Some(libc::EMFILE) | Some(libc::ENFILE) => {
+                    tracing::error!(
+                        "reached the max open file limit, cannot accept any new connection"
+                    );
+                    MAX_FILE_HANDLES_WARN.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Adds the state a single connection needs to the app: its [`ConnectionInfo`], the router
+/// service its requests run through, and the flag recording whether it has seen a request.
+fn with_connection_state<S, ReqBody, ResBody>(
+    app: S,
+    connection_info: Option<ConnectionInfo>,
+    router_service: Option<ConnectionRouterService>,
+    received_first_request: Arc<AtomicBool>,
+) -> tower::util::BoxCloneService<http::Request<ReqBody>, http::Response<ResBody>, S::Error>
+where
+    S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S::Error: 'static,
+    S::Future: Send + 'static,
+    ReqBody: 'static,
+    ResBody: 'static,
+{
+    ServiceBuilder::new()
+        .option_layer(connection_info.map(AddExtensionLayer::new))
+        .option_layer(router_service.map(AddExtensionLayer::new))
+        .layer_fn(|inner| IdleConnectionChecker::new(received_first_request.clone(), inner))
+        .service(app)
+        .boxed_clone()
+}
+
+pub(super) fn serve_router_on_listen_addr(
+    router: axum::Router,
+    pipeline_handle: Arc<PipelineHandle>,
+    // `None` for listeners that never serve GraphQL requests (eg. health, metrics):
+    // they never read the `ConnectionRouterService` extension.
+    router_service: Option<ConnectionRouterService>,
+    address: ListenAddr,
+    mut listener: Listener,
+    configuration: Arc<Configuration>,
+    all_connections_stopped_sender: mpsc::Sender<()>,
+) -> (impl Future<Output = Listener>, oneshot::Sender<()>) {
+    let opt_max_http1_headers = configuration.limits.router.http1_max_request_headers;
+    let opt_max_http1_buf_size = configuration.limits.router.http1_max_request_buf_size;
+    let http2_max_headers_list_bytes = configuration.limits.router.http2_header_list_limit();
+    let connection_shutdown_timeout = configuration.supergraph.connection_shutdown_timeout;
+    let header_read_timeout = configuration.server.http.header_read_timeout;
+    let tls_handshake_timeout = configuration.server.http.tls_handshake_timeout;
+
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+    // this server reproduces most of hyper::server::Server's behaviour
+    // we select over the stop_listen_receiver channel and the listener's
+    // accept future. If the channel received something or the sender
+    // was dropped, we stop using the listener and send it back through
+    // listener_receiver
+    let server = async move {
+        tokio::pin!(shutdown_receiver);
+
+        let connection_shutdown = CancellationToken::new();
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_receiver => {
+                    break;
+                }
+                res = listener.accept() => {
+                    let app = NormalizePathLayer::trim_trailing_slash().layer(router.clone());
+                    let connection_shutdown = connection_shutdown.clone();
+                    let connection_stop_signal = all_connections_stopped_sender.clone();
+                    let address = address.clone();
+                    let pipeline_handle = pipeline_handle.clone();
+
+                    match res {
+                        Ok(res) => {
+                            if MAX_FILE_HANDLES_WARN.load(Ordering::SeqCst) {
+                                tracing::info!("can accept connections again");
+                                MAX_FILE_HANDLES_WARN.store(false, Ordering::SeqCst);
+                            }
+
+                            let router_service = router_service.clone();
+
+                            tokio::task::spawn(async move {
+                                // this sender must be moved into the session to track that it is still running
+                                let _connection_stop_signal = connection_stop_signal;
+                                let connection_handle = ConnectionHandle::new(pipeline_handle, address);
+
+                                // Development note: the following describes the different network
+                                // streams and how to think about them when modifying the logic
+                                // below. In general, a change to one stream (eg, TLS) should also
+                                // have similar changes to the others unless there's a very good
+                                // reason why it shouldn't be applied more broadly. Any changes to
+                                // how the connections are configured should be centralized in
+                                // configure_connections()
+                                //
+                                //  Here are some pratical examples of each network stream below:
+                                //    - TCP :: after TLS termination (eg, reverse proxy), dev
+                                //    servers, or testing environments; ie, whenever https isn't
+                                //    used
+                                //    - Unix :: unix sockets, which are used widely in sidecars or
+                                //    when commnicating on the same machine, but can also be used
+                                //    by reverse proxies
+                                //    - TLS :: encrypted requests, often when the router is used to
+                                //    expose its graph to the public internet (ie, not behind a proxy)
+
+                                match res {
+                                    NetworkStream::Tcp(stream) => {
+                                        let received_first_request = Arc::new(AtomicBool::new(false));
+
+                                        let app = with_connection_state(
+                                            app,
+                                            Some(ConnectionInfo {
+                                                peer_address: stream.peer_addr().ok(),
+                                                server_address: stream.local_addr().ok(),
+                                            }),
+                                            router_service,
+                                            received_first_request.clone(),
+                                        );
+
+                                        stream
+                                            .set_nodelay(true)
+                                            .expect(
+                                                "this should not fail unless the socket is invalid",
+                                            );
+                                        let tokio_stream = TokioIo::new(stream);
+                                        let hyper_service = TowerToHyperService::new(app);
+
+                                        let mut builder = Builder::new(TokioExecutor::new());
+                                        let config = configure_connection(&mut builder, header_read_timeout, opt_max_http1_headers, opt_max_http1_buf_size, http2_max_headers_list_bytes);
+                                        let connection = config.serve_connection_with_upgrades(tokio_stream, hyper_service);
+                                        handle_connection(connection, connection_handle, connection_shutdown, connection_shutdown_timeout, received_first_request).await;
+                                    }
+                                    #[cfg(unix)]
+                                    NetworkStream::Unix(stream) => {
+                                        let received_first_request = Arc::new(AtomicBool::new(false));
+                                        let app = with_connection_state(
+                                            app,
+                                            None,
+                                            router_service,
+                                            received_first_request.clone(),
+                                        );
+                                        let tokio_stream = TokioIo::new(stream);
+                                        let hyper_service = TowerToHyperService::new(app);
+                                        let mut builder = Builder::new(TokioExecutor::new());
+                                        let config = configure_connection(&mut builder, header_read_timeout, opt_max_http1_headers, opt_max_http1_buf_size, http2_max_headers_list_bytes);
+                                        let connection = config.serve_connection_with_upgrades(tokio_stream, hyper_service);
+                                        handle_connection(connection, connection_handle, connection_shutdown, connection_shutdown_timeout, received_first_request).await;
+                                    },
+                                    NetworkStream::Tls { stream, acceptor } => {
+                                        // Perform TLS handshake with a timeout to prevent DoS attacks.
+                                        // If a client connects with plain TCP and doesn't initiate TLS,
+                                        // the handshake will timeout and the connection will be closed.
+                                        let tls_stream = match tokio::time::timeout(tls_handshake_timeout, acceptor.accept(stream)).await {
+                                            Ok(Ok(tls_stream)) => tls_stream,
+                                            Ok(Err(e)) => {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    "TLS handshake failed, closing connection"
+                                                );
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                tracing::debug!(
+                                                    timeout = ?tls_handshake_timeout,
+                                                    "TLS handshake timed out, closing connection"
+                                                );
+                                                return;
+                                            }
+                                        };
+
+                                        let received_first_request = Arc::new(AtomicBool::new(false));
+                                        let app = with_connection_state(
+                                            app,
+                                            None,
+                                            router_service,
+                                            received_first_request.clone(),
+                                        );
+
+                                        tls_stream.get_ref().0
+                                            .set_nodelay(true)
+                                            .expect(
+                                                "this should not fail unless the socket is invalid",
+                                            );
+
+                                        let hyper_service = TowerToHyperService::new(app);
+
+                                        let tokio_stream = TokioIo::new(tls_stream);
+
+                                        let mut builder = Builder::new(TokioExecutor::new());
+                                        let config = configure_connection(&mut builder, header_read_timeout, opt_max_http1_headers, opt_max_http1_buf_size, http2_max_headers_list_bytes);
+                                        let connection = config
+                                            .serve_connection_with_upgrades(tokio_stream, hyper_service);
+
+                                        handle_connection(connection, connection_handle, connection_shutdown, connection_shutdown_timeout, received_first_request).await;
+                                    }
+                                }
+                            }.with_current_meter_provider());
+                        }
+                        Err(e) => process_error(e).await
+                    }
+                }
+            }
+        }
+
+        // the shutdown receiver was triggered so we break out of
+        // the server loop, tell the currently active connections to stop
+        // then return the TCP listen socket
+        connection_shutdown.cancel();
+        listener
+    };
+    (server, shutdown_sender)
+}
+
+/// Configures a connection, no matter whether it's TLS, TCP, or UDS (ie, unix sockets) with
+/// whatever parameters are configured by the end-user in their router config
+///
+/// NOTE: centralize all connection configuration changes here so that the behavior of the
+/// connections remains in-step
+fn configure_connection(
+    conn_builder: &mut Builder<TokioExecutor>,
+    header_read_timeout: Duration,
+    opt_max_http1_headers: Option<usize>,
+    opt_max_http1_buf_size: Option<ByteSize>,
+    http2_max_headers_list_bytes: ByteSize,
+) -> Http1Builder<'_, TokioExecutor> {
+    // NOTE: this is a builder that auto-detects http1/http2, so we can configure both and rely on
+    // it to figure out whether we have an http1 or http2 connection
+    //
+    // h2 is given a larger limit than the configured one so that requests just over it reach the
+    // Router's own header-list check, which rejects them with a 431 that telemetry records.
+    conn_builder
+        .http2()
+        .max_header_list_size(http2_header_list::advertised_size(
+            http2_max_headers_list_bytes,
+        ));
+
+    let mut builder = conn_builder.http1();
+
+    builder
+        .keep_alive(true)
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+
+    if let Some(max_headers) = opt_max_http1_headers {
+        builder.max_headers(max_headers);
+    }
+
+    if let Some(max_buf_size) = opt_max_http1_buf_size {
+        let max_buf_size = usize::try_from(max_buf_size.as_u64())
+            .inspect_err(|e| tracing::warn!("attempted to use an HTTP/2 header size limit greater than is allowed by an unsized integer (quite large, multiple GBs, but platform-specific): {e}"))
+            .unwrap_or(usize::MAX);
+        builder.max_buf_size(max_buf_size);
+    }
+
+    builder
+}
+
+/// Walk the error source chain to find a [`hyper::Error`] indicating that hyper rejected
+/// the request with a 431 or 414 before it reached the service layer.
+///
+/// Uses `is_parse_too_large()` (stable public API) as the primary gate. The Display string
+/// is used only to discriminate between the two variants that `is_parse_too_large` bundles
+/// together: `Parse::TooLarge` (431) and `Parse::UriTooLong` (414). If hyper ever changes
+/// that string we default to 431, the more common case.
+fn classify_hyper_rejection(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<u16> {
+    fn check(hyper_err: &hyper::Error) -> Option<u16> {
+        hyper_err.is_parse_too_large().then(|| {
+            if hyper_err.to_string() == "URI too long" {
+                414
+            } else {
+                431
+            }
+        })
+    }
+
+    if let Some(code) = err.downcast_ref::<hyper::Error>().and_then(check) {
+        return Some(code);
+    }
+    let mut source = err.source();
+    while let Some(e) = source {
+        if let Some(code) = e.downcast_ref::<hyper::Error>().and_then(check) {
+            return Some(code);
+        }
+        source = e.source();
+    }
+    None
+}
+
+#[derive(Clone)]
+struct IdleConnectionChecker<S> {
+    received_request: Arc<AtomicBool>,
+    inner: S,
+}
+
+impl<S: Clone> IdleConnectionChecker<S> {
+    fn new(b: Arc<AtomicBool>, service: S) -> Self {
+        IdleConnectionChecker {
+            received_request: b,
+            inner: service,
+        }
+    }
+}
+impl<S, B> Service<http::Request<B>> for IdleConnectionChecker<S>
+where
+    S: Service<http::Request<B>>,
+{
+    type Response = <S as Service<http::Request<B>>>::Response;
+
+    type Error = <S as Service<http::Request<B>>>::Error;
+
+    type Future = <S as Service<http::Request<B>>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        self.received_request.store(true, Ordering::Relaxed);
+        self.inner.call(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use axum::BoxError;
+    use http::HeaderMap;
+    use http::HeaderValue;
+    use mime::APPLICATION_JSON;
+    use reqwest::StatusCode;
+    use reqwest::header::CONTENT_TYPE;
+    use serde_json::json;
+    use tower::ServiceExt;
+    use tower::service_fn;
+
+    use super::*;
+    use crate::axum_factory::tests::init_with_config;
+    use crate::axum_factory::tests::init_with_plugins;
+    use crate::configuration::Sandbox;
+    use crate::configuration::Supergraph;
+    use crate::graphql;
+    use crate::metrics::FutureMetricsExt;
+    use crate::plugins::limits;
+    use crate::services::SupergraphResponse;
+    use crate::services::router;
+    use crate::services::router::body;
+
+    #[tokio::test]
+    async fn it_makes_sure_same_listenaddrs_are_accepted() {
+        let (supergraph_mock, supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        let configuration = Configuration::fake_builder().build().unwrap();
+
+        init_with_config(
+            crate::pipeline::from_supergraph_mock(supergraph_mock).await,
+            Arc::new(configuration),
+            MultiMap::new(),
+        )
+        .await
+        .unwrap();
+        crate::plugin::test::assert_no_mock_calls(supergraph_handle).await;
+    }
+
+    #[tokio::test]
+    async fn it_makes_sure_different_listenaddrs_but_same_port_are_not_accepted() {
+        let (supergraph_mock, supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        let configuration = Configuration::fake_builder()
+            .supergraph(
+                Supergraph::fake_builder()
+                    .listen(SocketAddr::from_str("127.0.0.1:4010").unwrap())
+                    .build(),
+            )
+            .sandbox(Sandbox::fake_builder().build())
+            .build()
+            .unwrap();
+
+        let endpoint = service_fn(|req: router::Request| async move {
+            Ok::<_, BoxError>(
+                router::Response::http_response_builder()
+                    .response(
+                        http::Response::builder().body::<crate::services::router::Body>(
+                            body::from_bytes("this is a test".to_string()),
+                        )?,
+                    )
+                    .context(req.context)
+                    .build()
+                    .unwrap(),
+            )
+        })
+        .boxed_clone();
+
+        let mut web_endpoints = MultiMap::new();
+        web_endpoints.insert(
+            SocketAddr::from_str("0.0.0.0:4010").unwrap().into(),
+            Endpoint::from_router_service("/".to_string(), endpoint),
+        );
+
+        let error = init_with_config(
+            crate::pipeline::from_supergraph_mock(supergraph_mock).await,
+            Arc::new(configuration),
+            web_endpoints,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            "tried to bind 127.0.0.1 and 0.0.0.0 on port 4010",
+            error.to_string()
+        );
+        crate::plugin::test::assert_no_mock_calls(supergraph_handle).await;
+    }
+
+    #[tokio::test]
+    async fn it_makes_sure_extra_endpoints_cant_use_the_same_listenaddr_and_path() {
+        let (supergraph_mock, supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        let configuration = Configuration::fake_builder()
+            .supergraph(
+                Supergraph::fake_builder()
+                    .listen(SocketAddr::from_str("127.0.0.1:4010").unwrap())
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let endpoint = service_fn(|req: router::Request| async move {
+            router::Response::http_response_builder()
+                .response(
+                    http::Response::builder().body::<crate::services::router::Body>(
+                        body::from_bytes("this is a test".to_string()),
+                    )?,
+                )
+                .context(req.context)
+                .build()
+        })
+        .boxed_clone();
+
+        let mut mm = MultiMap::new();
+        mm.insert(
+            SocketAddr::from_str("127.0.0.1:4010").unwrap().into(),
+            Endpoint::from_router_service("/".to_string(), endpoint),
+        );
+
+        let error = init_with_config(
+            crate::pipeline::from_supergraph_mock(supergraph_mock).await,
+            Arc::new(configuration),
+            mm,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            "tried to register two endpoints on `127.0.0.1:4010/`",
+            error.to_string()
+        );
+        crate::plugin::test::assert_no_mock_calls(supergraph_handle).await;
+    }
+    #[rstest::rstest]
+    #[case::config_does_not_include_slash("/graphql", "/graphql")]
+    #[case::config_does_not_include_slash("/graphql", "/graphql/")]
+    #[case::config_does_not_include_slash("/graphql", "/graphql//")]
+    #[case::config_includes_slash("/graphql/", "/graphql")]
+    #[case::config_includes_slash("/graphql/", "/graphql/")]
+    #[case::config_includes_slash("/graphql/", "/graphql//")]
+    #[case::config_includes_multiple_slashes("/graphql///", "/graphql")]
+    #[case::config_includes_multiple_slashes("/graphql///", "/graphql/")]
+    #[case::config_includes_multiple_slashes("/graphql///", "/graphql//")]
+    #[case::root("/", "")]
+    #[case::root("/", "/")]
+    #[case::wildcard("/graphql/{*rest}", "/graphql/foo/bar")]
+    #[case::wildcard("/graphql/{*rest}", "/graphql/foo/bar/")]
+    #[case::parameter("/graphql/{param}", "/graphql/test")]
+    #[case::parameter("/graphql/{param}", "/graphql/test/")]
+    #[tokio::test]
+    async fn it_supports_paths_regardless_of_trailing_slashes(
+        #[case] config_path: &str,
+        #[case] query_path: &str,
+    ) -> Result<(), BoxError> {
+        let configuration = Arc::new(
+            Configuration::fake_builder()
+                .supergraph(
+                    Supergraph::fake_builder()
+                        .path(config_path.to_string())
+                        .build(),
+                )
+                .build()?,
+        );
+
+        let (router_mock, mut router_handle) =
+            tower_test::mock::pair::<crate::services::SupergraphRequest, SupergraphResponse>();
+        let router_driver = tokio::spawn(async move {
+            let (req, responder) = router_handle.next_request().await.unwrap();
+            responder.send_response(SupergraphResponse::new_from_graphql_response(
+                graphql::Response::builder()
+                    .data(json!({"response": "yay"}))
+                    .build(),
+                req.context,
+            ));
+        });
+        let router_service = crate::pipeline::from_supergraph_mock_with_configuration(
+            router_mock,
+            configuration.clone(),
+        )
+        .await;
+
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(APPLICATION_JSON.essence_str()),
+        );
+
+        let (server, _) = init_with_config(router_service, configuration, MultiMap::new()).await?;
+
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .build()?;
+
+        let query_url = format!(
+            "{}{query_path}",
+            server.graphql_listen_address().as_ref().unwrap(),
+        );
+
+        let response = client
+            .post(&query_url)
+            .body(json!({ "query": "query { __typename }" }).to_string())
+            .send()
+            .await?;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        server.shutdown().await?;
+        crate::plugin::test::await_mock_driver(router_driver).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_returns_431_when_too_many_headers() {
+        let (supergraph_mock, supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        async {
+            // Configure a very low header limit to trigger hyper's 431 response.
+            let conf = Arc::new(
+                Configuration::fake_builder()
+                    .operation_limits(limits::Config {
+                        router: limits::RouterLimitsConfig {
+                            http1_max_request_headers: Some(5),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .build()
+                    .unwrap(),
+            );
+
+            let router_service = crate::pipeline::from_supergraph_mock(supergraph_mock).await;
+            let (server, _) = init_with_config(router_service, conf, MultiMap::new())
+                .await
+                .unwrap();
+
+            // Send far more headers than the 5-header limit allows.
+            let mut req_builder = reqwest::Client::new().get(format!(
+                "{}",
+                server.graphql_listen_address().as_ref().unwrap()
+            ));
+            for i in 0..20 {
+                req_builder = req_builder.header(format!("x-custom-{i}"), "value");
+            }
+
+            let response = req_builder.send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::from_u16(431).unwrap(),
+                "expected 431 Request Header Fields Too Large"
+            );
+            let _ = response.bytes().await;
+
+            server.shutdown().await.unwrap();
+
+            assert_histogram_count!(
+                "http.server.request.duration",
+                1,
+                "http.response.status_code" = 431i64
+            );
+        }
+        .with_metrics()
+        .await;
+        crate::plugin::test::assert_no_mock_calls(supergraph_handle).await;
+    }
+
+    #[tokio::test]
+    async fn it_returns_414_when_uri_too_long() {
+        let (supergraph_mock, supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        async {
+            // hyper's MAX_URI_LEN is hardcoded at 65534 bytes (u16::MAX - 1) and is not
+            // configurable. Exceeding it triggers Parse::UriTooLong → 414. No special router
+            // config is needed; the default configuration is sufficient.
+            //
+            // reqwest rejects URLs this long before even connecting, so we use a raw TCP
+            // stream and write the HTTP request manually.
+            let router_service = crate::pipeline::from_supergraph_mock(supergraph_mock).await;
+            let (server, _) = init_with_config(
+                router_service,
+                Arc::new(Configuration::fake_builder().build().unwrap()),
+                MultiMap::new(),
+            )
+            .await
+            .unwrap();
+
+            let listen_addr = server.graphql_listen_address().as_ref().unwrap();
+            let (ip, port) = listen_addr.ip_and_port().unwrap();
+            let mut stream = TcpStream::connect((ip, port)).await.unwrap();
+
+            // Path is 65535 bytes — one over MAX_URI_LEN (65534) — triggering UriTooLong.
+            let long_path = format!("/{}", "a".repeat(65534));
+            let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", long_path);
+            stream.write_all(request.as_bytes()).await.unwrap();
+
+            // Read just enough to verify the status line.
+            let mut buf = [0u8; 32];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(
+                buf[..n].starts_with(b"HTTP/1.1 414"),
+                "expected 414 URI Too Long, got: {}",
+                String::from_utf8_lossy(&buf[..n])
+            );
+
+            server.shutdown().await.unwrap();
+
+            assert_histogram_count!(
+                "http.server.request.duration",
+                1,
+                "http.response.status_code" = 414i64
+            );
+        }
+        .with_metrics()
+        .await;
+        crate::plugin::test::assert_no_mock_calls(supergraph_handle).await;
+    }
+
+    /// Browser-style cookies: one `cookie` field per ~100-byte crumb, totalling about `total` bytes
+    /// of header list.
+    fn cookie_crumbs(total: usize) -> Vec<String> {
+        (0..total / 138)
+            .map(|i| format!("c{i:04}={}", "v".repeat(94)))
+            .collect()
+    }
+
+    async fn send_h2c(
+        addr: &ListenAddr,
+        path: &str,
+        cookies: &[String],
+    ) -> http::Response<hyper::body::Incoming> {
+        let (ip, port) = addr.ip_and_port().unwrap();
+        let stream = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{ip}:{port}{path}"));
+        for cookie in cookies {
+            request = request.header("cookie", cookie);
+        }
+        sender
+            .send_request(
+                request
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct RouterSpanCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RouterSpanCounter {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == crate::plugins::telemetry::consts::ROUTER_SPAN_NAME {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn it_returns_a_router_431_for_http2_header_lists_over_the_limit() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // A current-thread runtime runs the server's tasks on this thread, under this subscriber.
+        let spans = RouterSpanCounter::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+        let conf = Arc::new(Configuration::fake_builder().build().unwrap());
+        let endpoint = service_fn(|req: router::Request| async move {
+            router::Response::http_response_builder()
+                .response(http::Response::builder().body(body::empty())?)
+                .context(req.context)
+                .build()
+        })
+        .boxed_clone();
+        let mut web_endpoints = MultiMap::new();
+        web_endpoints.insert(
+            conf.supergraph.listen.clone(),
+            Endpoint::from_router_service("/custom".to_string(), endpoint),
+        );
+        let (supergraph_mock, _supergraph_handle) = tower_test::mock::pair::<
+            crate::services::supergraph::Request,
+            crate::services::supergraph::Response,
+        >();
+        // The endpoint gets its check from the limits plugin in the registry.
+        let limits = crate::plugin::plugins()
+            .find(|factory| factory.name == "apollo.limits")
+            .unwrap()
+            .create_instance_without_schema(&serde_json::json!({}))
+            .await
+            .unwrap();
+        let plugins = Arc::new(Plugins::from_iter([("apollo.limits".to_string(), limits)]));
+        let (server, _) = init_with_plugins(
+            crate::pipeline::from_supergraph_mock(supergraph_mock).await,
+            conf,
+            web_endpoints,
+            plugins,
+        )
+        .await
+        .unwrap();
+        let addr = server.graphql_listen_address().clone().unwrap();
+
+        // Both sizes are under the advertised 64 KiB, so h2 passes them to the Router's header-list
+        // check. They cover the bands where h2 would send its own bare 431 (20 KiB) or close the
+        // connection (60 KiB) if it enforced the limit itself.
+        for size in [20 * 1024, 60 * 1024] {
+            let response = send_h2c(&addr, "/", &cookie_crumbs(size)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                APPLICATION_JSON.essence_str()
+            );
+        }
+        assert_eq!(spans.0.load(Ordering::SeqCst), 2, "one router span per 431");
+
+        // Over the advertised size, h2 sends its own bare 431 and the Router never sees the request.
+        let response = send_h2c(&addr, "/", &cookie_crumbs(96 * 1024)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert_eq!(response.headers().get(CONTENT_TYPE), None);
+        assert_eq!(spans.0.load(Ordering::SeqCst), 2, "not recorded");
+
+        let response = send_h2c(&addr, "/custom", &cookie_crumbs(4 * 1024)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send_h2c(&addr, "/custom", &cookie_crumbs(20 * 1024)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+
+        server.shutdown().await.unwrap();
+    }
+}

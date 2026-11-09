@@ -1,0 +1,10 @@
+substitutions:
+  _IMAGE: gcr.io/summit-enterprise-workshop/router-mcp:latest
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "--platform", "linux/amd64", "-f", "router/Dockerfile.mcp", "-t", "${_IMAGE}", "."]
+images:
+  - ${_IMAGE}
+options:
+  machineType: E2_HIGHCPU_32
+timeout: 3600s

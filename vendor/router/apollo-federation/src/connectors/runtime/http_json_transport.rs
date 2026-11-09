@@ -1,0 +1,663 @@
+use std::sync::Arc;
+
+use apollo_compiler::collections::IndexMap;
+use http::HeaderMap;
+use http::HeaderValue;
+use http::header::ACCEPT;
+use http::header::CONTENT_LENGTH;
+use http::header::CONTENT_TYPE;
+use parking_lot::Mutex;
+use serde_json_bytes::Value;
+use serde_json_bytes::json;
+use thiserror::Error;
+
+use super::form_encoding::encode_json_as_form;
+use crate::connectors::ApplyToError;
+use crate::connectors::HTTPMethod;
+use crate::connectors::Header;
+use crate::connectors::HeaderSource;
+use crate::connectors::HttpJsonTransport;
+use crate::connectors::MakeUriError;
+use crate::connectors::McpCall;
+use crate::connectors::OriginatingDirective;
+use crate::connectors::ProblemLocation;
+use crate::connectors::runtime::debug::ConnectorContext;
+use crate::connectors::runtime::debug::ConnectorDebugHttpRequest;
+use crate::connectors::runtime::debug::DebugRequest;
+use crate::connectors::runtime::debug::SelectionData;
+use crate::connectors::runtime::mapping::Problem;
+use crate::connectors::runtime::mapping::aggregate_apply_to_errors;
+use crate::connectors::runtime::mapping::aggregate_apply_to_errors_with_warning_locations;
+
+/// The default `Accept` header for a connector with an `http.stream` mode: plain JSON, or either
+/// of the streamed framings it understands.
+const STREAM_ACCEPT: &str = "application/json, text/event-stream, application/x-ndjson";
+
+/// Request to an HTTP transport
+#[derive(Debug)]
+pub struct HttpRequest {
+    pub inner: http::Request<String>,
+    pub debug: DebugRequest,
+}
+
+/// Response from an HTTP transport
+#[derive(Debug)]
+pub struct HttpResponse {
+    /// The response parts - the body is consumed by applying the JSON mapping
+    pub inner: http::response::Parts,
+}
+
+/// Request to an underlying transport
+#[derive(Debug)]
+pub enum TransportRequest {
+    /// A request to an HTTP transport
+    Http(Box<HttpRequest>),
+    /// A mapping-only request that skips the HTTP transport entirely.
+    /// The selection is applied against an empty object `{}`.
+    MappingOnly,
+}
+
+/// Response from an underlying transport
+#[derive(Debug)]
+pub enum TransportResponse {
+    /// A response from an HTTP transport
+    Http(HttpResponse),
+    /// A mapping-only response (no HTTP transport involved)
+    MappingOnly,
+}
+
+impl From<HttpRequest> for TransportRequest {
+    fn from(value: HttpRequest) -> Self {
+        Self::Http(Box::new(value))
+    }
+}
+
+impl From<HttpResponse> for TransportResponse {
+    fn from(value: HttpResponse) -> Self {
+        Self::Http(value)
+    }
+}
+
+pub fn make_request(
+    transport: &HttpJsonTransport,
+    inputs: IndexMap<String, Value>,
+    client_headers: &HeaderMap<HeaderValue>,
+    debug: &Option<Arc<Mutex<ConnectorContext>>>,
+) -> Result<(TransportRequest, Vec<Problem>), HttpJsonTransportError> {
+    let (uri, uri_apply_to_errors) = transport.make_uri(&inputs)?;
+    let uri_mapping_problems =
+        aggregate_apply_to_errors_with_warning_locations(uri_apply_to_errors);
+
+    let method = transport.method;
+    let request = http::Request::builder()
+        .method(transport.method.as_str())
+        .uri(uri);
+
+    // add the headers and if content-type is specified, we'll check that when constructing the body
+    let (mut request, is_form_urlencoded, header_apply_to_errors) = add_headers(
+        request,
+        client_headers,
+        &transport.headers,
+        &inputs,
+        transport.body.is_some() || transport.mcp.is_some(),
+    );
+    let header_mapping_problems =
+        aggregate_apply_to_errors_with_warning_locations(header_apply_to_errors);
+
+    // A connector that can fold a stream invites one, unless the author chose their own `Accept`.
+    // Servers that may answer either way (MCP, for one) require the client to accept both.
+    if transport.stream.is_some()
+        && !request
+            .headers_ref()
+            .is_some_and(|headers| headers.contains_key(ACCEPT))
+    {
+        request = request.header(ACCEPT, STREAM_ACCEPT);
+    }
+
+    let (json_body, form_body, body, content_length, body_apply_to_errors) =
+        if transport.body.is_some() || transport.mcp.is_some() {
+            let (json_body, apply_to_errors) = match transport.body {
+                Some(ref selection) => selection.apply_with_vars(&json!({}), &inputs),
+                None => (None, Vec::new()),
+            };
+            // An MCP tool call carries its arguments inside a JSON-RPC request
+            let json_body = match &transport.mcp {
+                Some(mcp) => Some(mcp_tools_call(mcp, json_body)),
+                None => json_body,
+            };
+            let mut form_body = None;
+            let (body, content_length) = if let Some(json_body) = json_body.as_ref() {
+                if is_form_urlencoded {
+                    let encoded = encode_json_as_form(json_body)
+                        .map_err(HttpJsonTransportError::FormBodySerialization)?;
+                    form_body = Some(encoded.clone());
+                    let len = encoded.len();
+                    (encoded, len)
+                } else {
+                    let bytes = serde_json::to_vec(json_body)?;
+                    let len = bytes.len();
+                    let body_string = serde_json::to_string(json_body)?;
+                    (body_string, len)
+                }
+            } else {
+                ("".into(), 0)
+            };
+            (json_body, form_body, body, content_length, apply_to_errors)
+        } else {
+            (None, None, "".into(), 0, vec![])
+        };
+
+    match method {
+        HTTPMethod::Post | HTTPMethod::Patch | HTTPMethod::Put => {
+            request = request.header(CONTENT_LENGTH, content_length);
+        }
+        _ => {}
+    }
+
+    let request = request
+        .body(body)
+        .map_err(HttpJsonTransportError::InvalidNewRequest)?;
+
+    let body_mapping_problems =
+        aggregate_apply_to_errors(body_apply_to_errors, ProblemLocation::RequestBody);
+
+    let all_problems: Vec<Problem> = uri_mapping_problems
+        .chain(body_mapping_problems)
+        .chain(header_mapping_problems)
+        .collect();
+
+    let debug_request = debug.as_ref().map(|_| {
+        if is_form_urlencoded {
+            Box::new(ConnectorDebugHttpRequest::new(
+                &request,
+                "form-urlencoded".to_string(),
+                form_body.map(|s| Value::String(s.into())).as_ref(),
+                transport.body.as_ref().map(|body| SelectionData {
+                    source: body.to_string(),
+                    transformed: body.to_string(), // no transformation so this is the same
+                    result: json_body,
+                }),
+                transport,
+            ))
+        } else {
+            Box::new(ConnectorDebugHttpRequest::new(
+                &request,
+                "json".to_string(),
+                json_body.as_ref(),
+                transport.body.as_ref().map(|body| SelectionData {
+                    source: body.to_string(),
+                    transformed: body.to_string(), // no transformation so this is the same
+                    result: json_body.clone(),
+                }),
+                transport,
+            ))
+        }
+    });
+
+    Ok((
+        TransportRequest::Http(Box::new(HttpRequest {
+            inner: request,
+            debug: (debug_request, all_problems.clone()),
+        })),
+        all_problems,
+    ))
+}
+
+/// The JSON-RPC request for an MCP `tools/call`, with the evaluated `arguments` mapping.
+///
+/// Each HTTP request carries exactly one JSON-RPC request, so its `id` only has to be unique within
+/// that request. A session layer that shares a session across requests renumbers it.
+fn mcp_tools_call(mcp: &McpCall, arguments: Option<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": mcp.tool.as_str(),
+            "arguments": arguments.unwrap_or_else(|| json!({})),
+        },
+    })
+}
+
+fn add_headers(
+    mut request: http::request::Builder,
+    incoming_supergraph_headers: &HeaderMap<HeaderValue>,
+    config: &[Header],
+    inputs: &IndexMap<String, Value>,
+    has_body: bool,
+) -> (
+    http::request::Builder,
+    bool,
+    Vec<(ProblemLocation, ApplyToError)>,
+) {
+    let mut content_type = None;
+    let mut warnings = Vec::new();
+
+    for header in config {
+        match &header.source {
+            HeaderSource::From(from) => {
+                let values = incoming_supergraph_headers.get_all(from);
+                let mut propagated = false;
+                for value in values {
+                    request = request.header(header.name.clone(), value.clone());
+                    propagated = true;
+                }
+                if !propagated {
+                    tracing::warn!("Header '{}' not found in incoming request", header.name);
+                }
+            }
+            HeaderSource::Value(value) => match value.interpolate(inputs) {
+                Ok((value, apply_to_errors)) => {
+                    warnings.extend(apply_to_errors.iter().cloned().map(|e| {
+                        (
+                            match header.originating_directive {
+                                OriginatingDirective::Source => ProblemLocation::SourceHeaders,
+                                OriginatingDirective::Connect => ProblemLocation::ConnectHeaders,
+                            },
+                            e,
+                        )
+                    }));
+
+                    if header.name == CONTENT_TYPE {
+                        content_type = Some(value.clone());
+                    }
+
+                    request = request.header(header.name.clone(), value);
+                }
+                Err(err) => {
+                    tracing::error!("Unable to interpolate header value: {:?}", err);
+                }
+            },
+        }
+    }
+
+    let is_form_urlencoded = if let Some(content_type) = content_type {
+        // We don't need to set a content type here because it is set earlier in this function
+        let mine_type = content_type
+            .to_str()
+            .unwrap_or_default()
+            .parse::<mime::Mime>()
+            .ok();
+        mine_type.as_ref() == Some(&mime::APPLICATION_WWW_FORM_URLENCODED)
+    } else {
+        // Only set this content type header as a default if one hasn't been specified. This allows the user to override the value.
+        if has_body {
+            request = request.header(CONTENT_TYPE, mime::APPLICATION_JSON.essence_str());
+        }
+        false
+    };
+
+    (request, is_form_urlencoded, warnings)
+}
+
+#[derive(Error, Debug)]
+pub enum HttpJsonTransportError {
+    #[error("Could not generate HTTP request: {0}")]
+    InvalidNewRequest(#[source] http::Error),
+    #[error("Could not serialize body: {0}")]
+    JsonBodySerialization(#[from] serde_json::Error),
+    #[error("Could not serialize body: {0}")]
+    FormBodySerialization(&'static str),
+    #[error(transparent)]
+    MakeUri(#[from] MakeUriError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use http::HeaderMap;
+    use http::HeaderValue;
+    use http::header::CONTENT_ENCODING;
+    use insta::assert_debug_snapshot;
+
+    use super::*;
+    use crate::connectors::HTTPMethod;
+    use crate::connectors::HeaderSource;
+    use crate::connectors::JSONSelection;
+    use crate::connectors::StreamMode;
+    use crate::connectors::StringTemplate;
+
+    #[test]
+    fn test_headers_to_add_no_directives() {
+        let incoming_supergraph_headers: HeaderMap<HeaderValue> = vec![
+            ("x-rename".parse().unwrap(), "renamed".parse().unwrap()),
+            ("x-rename".parse().unwrap(), "also-renamed".parse().unwrap()),
+            ("x-ignore".parse().unwrap(), "ignored".parse().unwrap()),
+            (CONTENT_ENCODING, "gzip".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+
+        let request = http::Request::builder();
+        let (request, ..) = add_headers(
+            request,
+            &incoming_supergraph_headers,
+            &[],
+            &IndexMap::with_hasher(Default::default()),
+            true,
+        );
+        let request = request.body("").unwrap();
+        assert_eq!(request.headers().len(), 1);
+        assert!(request.headers().get("content-type").is_some());
+    }
+
+    #[test]
+    fn test_headers_to_add_with_config() {
+        let incoming_supergraph_headers: HeaderMap<HeaderValue> = vec![
+            ("x-rename".parse().unwrap(), "renamed".parse().unwrap()),
+            ("x-rename".parse().unwrap(), "also-renamed".parse().unwrap()),
+            ("x-ignore".parse().unwrap(), "ignored".parse().unwrap()),
+            (CONTENT_ENCODING, "gzip".parse().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+
+        let config = vec![
+            Header::from_values(
+                "x-new-name".parse().unwrap(),
+                HeaderSource::From("x-rename".parse().unwrap()),
+                OriginatingDirective::Source,
+            ),
+            Header::from_values(
+                "x-insert".parse().unwrap(),
+                HeaderSource::Value("inserted".parse().unwrap()),
+                OriginatingDirective::Connect,
+            ),
+        ];
+
+        let request = http::Request::builder();
+        let (request, ..) = add_headers(
+            request,
+            &incoming_supergraph_headers,
+            &config,
+            &IndexMap::with_hasher(Default::default()),
+            true,
+        );
+        let request = request.body("").unwrap();
+        let result = request.headers();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.get("x-new-name"), Some(&"renamed".parse().unwrap()));
+        assert_eq!(result.get("x-insert"), Some(&"inserted".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_headers_no_content_type_when_no_body() {
+        let incoming_supergraph_headers: HeaderMap<HeaderValue> = vec![].into_iter().collect();
+
+        let config = vec![];
+
+        let request = http::Request::builder();
+        let (request, ..) = add_headers(
+            request,
+            &incoming_supergraph_headers,
+            &config,
+            &IndexMap::with_hasher(Default::default()),
+            false,
+        );
+        let request = request.body("").unwrap();
+        let result = request.headers();
+        assert_eq!(result.len(), 0);
+        assert!(result.get("content-type").is_none());
+    }
+
+    #[test]
+    fn test_headers_replace_default_content_type() {
+        let incoming_supergraph_headers: HeaderMap<HeaderValue> = vec![(
+            "content-type".parse().unwrap(),
+            "application/json".parse().unwrap(),
+        )]
+        .into_iter()
+        .collect();
+
+        let config = vec![Header::from_values(
+            "content-type".parse().unwrap(),
+            HeaderSource::Value("application/vnd.iaas.v1+json".parse().unwrap()),
+            OriginatingDirective::Connect,
+        )];
+
+        let request = http::Request::builder();
+        let (request, ..) = add_headers(
+            request,
+            &incoming_supergraph_headers,
+            &config,
+            &IndexMap::with_hasher(Default::default()),
+            true,
+        );
+        let request = request.body("").unwrap();
+        let result = request.headers();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get("content-type"),
+            Some(&"application/vnd.iaas.v1+json".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_headers_multiple_content_type() {
+        let incoming_supergraph_headers: HeaderMap<HeaderValue> = vec![(
+            "content-type".parse().unwrap(),
+            "application/json".parse().unwrap(),
+        )]
+        .into_iter()
+        .collect();
+
+        let config = vec![
+            Header::from_values(
+                "content-type".parse().unwrap(),
+                HeaderSource::Value("application/json".parse().unwrap()),
+                OriginatingDirective::Connect,
+            ),
+            Header::from_values(
+                "content-type".parse().unwrap(),
+                HeaderSource::Value("application/vnd.iaas.v1+json".parse().unwrap()),
+                OriginatingDirective::Connect,
+            ),
+        ];
+
+        let request = http::Request::builder();
+        let (request, ..) = add_headers(
+            request,
+            &incoming_supergraph_headers,
+            &config,
+            &IndexMap::with_hasher(Default::default()),
+            true,
+        );
+        let request = request.body("").unwrap();
+        let result = request.headers();
+
+        let content_type_values: Vec<&HeaderValue> =
+            result.get_all("content-type").iter().collect();
+        assert_eq!(content_type_values.len(), 2);
+        assert_eq!(content_type_values[0], "application/json");
+        assert_eq!(content_type_values[1], "application/vnd.iaas.v1+json");
+    }
+
+    #[test]
+    fn make_request() {
+        let mut vars = IndexMap::default();
+        vars.insert("$args".to_string(), json!({ "a": 42 }));
+
+        let req = super::make_request(
+            &HttpJsonTransport {
+                source_template: None,
+                connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+                method: HTTPMethod::Post,
+                body: Some(JSONSelection::parse("$args { a }").unwrap()),
+                ..Default::default()
+            },
+            vars,
+            &Default::default(),
+            &None,
+        )
+        .unwrap();
+
+        assert_debug_snapshot!(req, @r#"
+        (
+            Http(
+                HttpRequest {
+                    inner: Request {
+                        method: POST,
+                        uri: http://localhost:8080/,
+                        version: HTTP/1.1,
+                        headers: {
+                            "content-type": "application/json",
+                            "content-length": "8",
+                        },
+                        body: "{\"a\":42}",
+                    },
+                    debug: (
+                        None,
+                        [],
+                    ),
+                },
+            ),
+            [],
+        )
+        "#);
+
+        let TransportRequest::Http(http_request) = req.0 else {
+            panic!("expected Http transport request");
+        };
+        let HttpRequest { inner: req, .. } = *http_request;
+        let body = req.into_body();
+        insta::assert_snapshot!(body, @r#"{"a":42}"#);
+    }
+
+    fn accept_header_of(transport: &HttpJsonTransport) -> Vec<String> {
+        accept_header_with_client_headers(transport, &Default::default())
+    }
+
+    fn accept_header_with_client_headers(
+        transport: &HttpJsonTransport,
+        client_headers: &HeaderMap<HeaderValue>,
+    ) -> Vec<String> {
+        let (TransportRequest::Http(request), _) =
+            super::make_request(transport, IndexMap::default(), client_headers, &None).unwrap()
+        else {
+            panic!("expected Http transport request");
+        };
+        request
+            .inner
+            .headers()
+            .get_all(ACCEPT)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_stream_mode_accepts_streams_by_default() {
+        let transport = HttpJsonTransport {
+            connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+            stream: Some(StreamMode::Array),
+            ..Default::default()
+        };
+        assert_eq!(accept_header_of(&transport), vec![STREAM_ACCEPT]);
+    }
+
+    #[test]
+    fn a_stream_mode_keeps_the_authors_accept_header() {
+        let transport = HttpJsonTransport {
+            connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+            headers: vec![Header::from_values(
+                "accept".parse().unwrap(),
+                HeaderSource::Value("text/event-stream".parse().unwrap()),
+                OriginatingDirective::Connect,
+            )],
+            stream: Some(StreamMode::Array),
+            ..Default::default()
+        };
+        assert_eq!(accept_header_of(&transport), vec!["text/event-stream"]);
+    }
+
+    #[test]
+    fn a_stream_mode_keeps_a_propagated_accept_header_and_defaults_without_one() {
+        let transport = HttpJsonTransport {
+            connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+            headers: vec![Header::from_values(
+                "accept".parse().unwrap(),
+                HeaderSource::From("accept".parse().unwrap()),
+                OriginatingDirective::Connect,
+            )],
+            stream: Some(StreamMode::Array),
+            ..Default::default()
+        };
+
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(ACCEPT, HeaderValue::from_static("application/x-ndjson"));
+        assert_eq!(
+            accept_header_with_client_headers(&transport, &client_headers),
+            vec!["application/x-ndjson"]
+        );
+
+        // The client sent nothing to propagate, so the default applies
+        assert_eq!(accept_header_of(&transport), vec![STREAM_ACCEPT]);
+    }
+
+    #[test]
+    fn no_stream_mode_sends_no_accept_header() {
+        let transport = HttpJsonTransport {
+            connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+            ..Default::default()
+        };
+        assert!(accept_header_of(&transport).is_empty());
+    }
+
+    #[test]
+    fn make_request_form_encoded() {
+        let mut vars = IndexMap::default();
+        vars.insert("$args".to_string(), json!({ "a": 42 }));
+        let headers = vec![Header::from_values(
+            "content-type".parse().unwrap(),
+            HeaderSource::Value("application/x-www-form-urlencoded".parse().unwrap()),
+            OriginatingDirective::Connect,
+        )];
+
+        let req = super::make_request(
+            &HttpJsonTransport {
+                source_template: None,
+                connect_template: StringTemplate::from_str("http://localhost:8080/").unwrap(),
+                method: HTTPMethod::Post,
+                headers,
+                body: Some(JSONSelection::parse("$args { a }").unwrap()),
+                ..Default::default()
+            },
+            vars,
+            &Default::default(),
+            &None,
+        )
+        .unwrap();
+
+        assert_debug_snapshot!(req, @r#"
+        (
+            Http(
+                HttpRequest {
+                    inner: Request {
+                        method: POST,
+                        uri: http://localhost:8080/,
+                        version: HTTP/1.1,
+                        headers: {
+                            "content-type": "application/x-www-form-urlencoded",
+                            "content-length": "4",
+                        },
+                        body: "a=42",
+                    },
+                    debug: (
+                        None,
+                        [],
+                    ),
+                },
+            ),
+            [],
+        )
+        "#);
+
+        let TransportRequest::Http(http_request) = req.0 else {
+            panic!("expected Http transport request");
+        };
+        let HttpRequest { inner: req, .. } = *http_request;
+        let body = req.into_body();
+        insta::assert_snapshot!(body, @r#"a=42"#);
+    }
+}

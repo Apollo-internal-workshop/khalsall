@@ -1,0 +1,9 @@
+# Used by `gcloud builds submit .` (replaces .gitignore for the upload)
+.git
+.env
+.rover/bin
+vendor/router/target
+vendor/fedutils-build-plugins
+tickets-mcp/node_modules
+tickets-mcp/dist
+final

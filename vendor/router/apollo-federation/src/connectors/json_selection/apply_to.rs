@@ -1,0 +1,7548 @@
+/// ApplyTo is a trait for applying a JSONSelection to a JSON value, collecting
+/// any/all errors encountered in the process.
+use std::cell::RefCell;
+use std::hash::Hash;
+
+use apollo_compiler::collections::IndexMap;
+use apollo_compiler::collections::IndexSet;
+use serde_json_bytes::Map as JSONMap;
+use serde_json_bytes::Value as JSON;
+use serde_json_bytes::json;
+use shape::PrintLimits;
+use shape::Shape;
+use shape::ShapeCase;
+use shape::location::Location;
+use shape::location::SourceId;
+use shape::name::Name;
+use shape::name::NameCase;
+
+use super::Ref;
+use super::helpers::json_merge;
+use super::helpers::json_type_name;
+use super::immutable::InputPath;
+use super::known_var::KnownVariable;
+use super::lit_expr::LitExpr;
+use super::lit_expr::LitOp;
+use super::location::OffsetRange;
+use super::location::Ranged;
+use super::location::WithRange;
+use super::methods::ArrowMethod;
+use super::methods::common::with_arg_errors;
+use super::parser::*;
+use super::selection_trie::SelectionTrie;
+use crate::connectors::json_selection::helpers::missing_as_null;
+use crate::connectors::spec::ConnectSpec;
+
+pub(super) type VarsWithPathsMap<'a> = IndexMap<KnownVariable, (&'a JSON, InputPath<JSON>)>;
+
+impl JSONSelection {
+    // Applying a selection to a JSON value produces a new JSON value, along
+    // with any/all errors encountered in the process. The value is represented
+    // as an Option to allow for undefined/missing values (which JSON does not
+    // explicitly support), which are distinct from null values (which it does
+    // support).
+    pub fn apply_to(&self, data: &JSON) -> (Option<JSON>, Vec<ApplyToError>) {
+        self.apply_with_vars(data, &IndexMap::default())
+    }
+
+    pub fn apply_with_vars(
+        &self,
+        data: &JSON,
+        vars: &IndexMap<String, JSON>,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        // Using IndexSet over HashSet to preserve the order of the errors.
+        let mut errors = IndexSet::default();
+
+        let mut vars_with_paths: VarsWithPathsMap = IndexMap::default();
+        for (var_name, var_data) in vars {
+            vars_with_paths.insert(
+                KnownVariable::External(var_name.as_str().to_string()),
+                (var_data, InputPath::empty().append(json!(var_name))),
+            );
+        }
+        // The $ variable initially refers to the root data value, but is
+        // rebound by nested selection sets to refer to the root value the
+        // selection set was applied to.
+        vars_with_paths.insert(KnownVariable::Dollar, (data, InputPath::empty()));
+
+        let spec = self.spec();
+        let (value, apply_errors) =
+            self.apply_to_path(data, &vars_with_paths, &InputPath::empty(), spec);
+
+        // Since errors is an IndexSet, this line effectively deduplicates the
+        // errors, in an attempt to make them less verbose. However, now that we
+        // include both path and range information in the errors, there's an
+        // argument to be made that errors can no longer be meaningfully
+        // deduplicated, so we might consider sticking with a Vec<ApplyToError>.
+        errors.extend(apply_errors);
+
+        (value, errors.into_iter().collect())
+    }
+
+    pub fn shape(&self) -> Shape {
+        let context =
+            ShapeContext::new(SourceId::Other("JSONSelection".into())).with_spec(self.spec());
+
+        self.compute_output_shape(
+            // Relatively static/unchanging inputs to compute_output_shape,
+            // passed down by immutable shared reference.
+            &context,
+            // If we don't know anything about the shape of the input data, we
+            // can represent the data symbolically using the $root variable
+            // shape. Subproperties needed from this shape will show up as
+            // subpaths like $root.books.4.isbn in the output shape.
+            //
+            // While we do not currently have a $root variable available as a
+            // KnownVariable during apply_to_path execution, we might consider
+            // adding it, since it would align with the way we process other
+            // variable shapes. For now, $root exists only as a shape name that
+            // we are inventing right here.
+            Shape::name("$root", Vec::new()),
+        )
+    }
+
+    pub(crate) fn compute_output_shape(&self, context: &ShapeContext, input_shape: Shape) -> Shape {
+        debug_assert_eq!(context.spec(), self.spec());
+
+        let computable: &dyn ApplyToInternal = match &self.inner {
+            TopLevelSelection::Named(selection) => selection,
+            TopLevelSelection::Value(lit) => lit,
+        };
+
+        let dollar_shape = input_shape.clone();
+
+        if Some(&input_shape) == context.named_shapes().get("$root") {
+            // If the $root variable happens to be bound to the input shape,
+            // context does not need to be cloned or modified.
+            computable.compute_output_shape(context, input_shape, dollar_shape)
+        } else {
+            // Otherwise, we'll want to register the input_shape as $root in a
+            // cloned_context, so $root is reliably defined either way.
+            let cloned_context = context
+                .clone()
+                .with_named_shapes([("$root".to_string(), input_shape.clone())]);
+            computable.compute_output_shape(&cloned_context, input_shape, dollar_shape)
+        }
+    }
+}
+
+fn lookup_variable<'a>(
+    vars: &'a VarsWithPathsMap,
+    var_name: &str,
+) -> Option<(&'a JSON, &'a InputPath<JSON>)> {
+    let entry = if var_name == "$" {
+        vars.get(&KnownVariable::Dollar)
+    } else {
+        // Variables longer than $ may be stored either as
+        // KnownVariable::External(String) or KnownVariable::Local(String), so
+        // we need to check both variants, local first.
+        vars.get(&KnownVariable::Local(var_name.to_string()))
+            .or_else(|| vars.get(&KnownVariable::External(var_name.to_string())))
+    };
+    entry.map(|(data, path)| (*data, path))
+}
+
+impl Ranged for JSONSelection {
+    fn range(&self) -> OffsetRange {
+        match &self.inner {
+            TopLevelSelection::Named(selection) => selection.range(),
+            TopLevelSelection::Value(lit) => lit.range(),
+        }
+    }
+
+    fn shape_location(&self, source_id: &SourceId) -> Option<Location> {
+        self.range().map(|range| source_id.location(range))
+    }
+}
+
+pub(super) trait ApplyToInternal {
+    // This is the trait method that should be implemented and called
+    // recursively by the various JSONSelection types.
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>);
+
+    // When array is encountered, the Self selection will be applied to each
+    // element of the array, producing a new array.
+    fn apply_to_array(
+        &self,
+        data_array: &[JSON],
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        let mut output = Vec::with_capacity(data_array.len());
+        let mut errors = Vec::new();
+
+        for (i, element) in data_array.iter().enumerate() {
+            let input_path_with_index = input_path.append(json!(i));
+            let (applied, mut apply_errors) =
+                self.apply_to_path(element, vars, &input_path_with_index, spec);
+            // Auto-mapping over an array is index-preserving (a missing element
+            // becomes null below rather than being dropped), so the input index
+            // is also the output index.
+            for error in &mut apply_errors {
+                error.prepend_output_segment(json!(i));
+            }
+            errors.extend(apply_errors);
+            // When building an Object, we can simply omit missing properties
+            // and report an error, but when building an Array, we need to
+            // insert null values to preserve the original array indices/length.
+            output.push(applied.unwrap_or(JSON::Null));
+        }
+
+        (Some(JSON::Array(output)), errors)
+    }
+
+    /// Computes the static output shape produced by a JSONSelection, by
+    /// traversing the selection AST, recursively calling `compute_output_shape`
+    /// on the current data/variable shapes at each level.
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        // Shape of the `@` variable, which typically changes with each
+        // recursive call to compute_output_shape.
+        input_shape: Shape,
+        // Shape of the `$` variable, which is bound to the closest enclosing
+        // subselection object, or the root data object if there is no enclosing
+        // subselection.
+        dollar_shape: Shape,
+    ) -> Shape;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShapeContext {
+    /// [`ConnectSpec`] version derived from the [`JSONSelection`] that created
+    /// this [`ShapeContext`].
+    #[allow(dead_code)]
+    spec: ConnectSpec,
+
+    /// Shapes of other named variables, with the variable name `String`
+    /// including the initial `$` character. This map typically does not change
+    /// during the compute_output_shape recursion, and so can be passed down by
+    /// immutable reference.
+    named_shapes: IndexMap<String, Shape>,
+
+    /// A shared source name to use for all locations originating from this
+    /// `JSONSelection`.
+    source_id: SourceId,
+
+    /// Consumption trie accumulated as a byproduct of `compute_output_shape`.
+    /// Wrapped in `Ref<RefCell<…>>` so all clones produced by
+    /// [`ShapeContext::with_named_shapes`] (or any other builder cloning) share
+    /// the *same* trie — each step of the recursion appends into one place.
+    /// Inspectable with [`ShapeContext::consumption`] after recursion ends.
+    consumption: Ref<RefCell<SelectionTrie>>,
+
+    /// The `->` method call whose shape is being computed with this context,
+    /// if any, which records the shapes its arguments produce. Each call gets
+    /// a child context of its own. See [`ShapeContext::compute_method_shape`].
+    method_call: Option<Ref<MethodCall>>,
+}
+
+/// The arguments of one `->` method call, identified by their source ranges,
+/// and the shapes they produced while the method's shape was computed.
+#[derive(Debug)]
+struct MethodCall {
+    arg_ranges: Vec<std::ops::Range<usize>>,
+    arg_shapes: RefCell<Vec<Shape>>,
+}
+
+impl ShapeContext {
+    pub(crate) fn new(source_id: SourceId) -> Self {
+        // RefCell is not Sync, so Clippy flags this Arc as `arc_with_non_send_sync`.
+        // The context is constructed and consumed within a single static-analysis
+        // traversal (no thread crossings), so Arc is the wrong tool but Rc would
+        // diverge from the module-wide `Ref<T> = Arc<T>` shape-rs convention.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let consumption = Ref::new(RefCell::new(SelectionTrie::new()));
+        Self {
+            spec: ConnectSpec::latest(),
+            named_shapes: IndexMap::default(),
+            source_id,
+            consumption,
+            method_call: None,
+        }
+    }
+
+    /// Computes the result shape of a `->` method call with `compute`, then
+    /// carries over any errors in the shapes its arguments produced.
+    ///
+    /// At runtime, an error in an argument is reported whether or not the
+    /// method's result includes the argument's value, like the condition of
+    /// `->filter` or the separator of `->joinNotNull`. Shape errors are
+    /// metadata on the shape instead, so an error in an argument shape would
+    /// be lost whenever a method builds its result without it.
+    ///
+    /// `compute` gets a child context for this call, which records the shape
+    /// of each argument the method computes with it (see
+    /// [`Self::record_method_arg_shape`]). That keeps argument errors without
+    /// every method having to, and follows the method's own choice of which
+    /// arguments to evaluate and what `@` is bound to while it does. A nested
+    /// call gets its own child context, so each call only records its own
+    /// arguments.
+    ///
+    /// An error inside a union member, like one `->match` branch, may not
+    /// happen at runtime, but validation already rejects a union with an
+    /// error member, so it is carried over too.
+    ///
+    /// Anything this misses keeps the behavior from before it existed, with
+    /// the error dropped: an argument with no source range, parts of an
+    /// argument a method computes separately (see `ArrowMethodImpl::shape`),
+    /// and `->as`, whose variables carry their own errors to where they are
+    /// used.
+    pub(crate) fn compute_method_shape(
+        &self,
+        method_args: Option<&MethodArgs>,
+        compute: impl FnOnce(&ShapeContext) -> Shape,
+    ) -> Shape {
+        let arg_ranges: Vec<_> = method_args
+            .map(|args| args.args.iter().filter_map(|arg| arg.range()).collect())
+            .unwrap_or_default();
+        if arg_ranges.is_empty() {
+            // Nothing to record, so no child context is needed.
+            return compute(self);
+        }
+
+        // RefCell is not Sync, so Clippy flags this Arc, as in `Self::new`.
+        // The context never crosses threads, and `Ref` follows the shape-rs
+        // convention of `Ref<T> = Arc<T>`.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let method_call = Ref::new(MethodCall {
+            arg_ranges,
+            arg_shapes: RefCell::new(Vec::new()),
+        });
+        let call_context = Self {
+            method_call: Some(method_call.clone()),
+            ..self.clone()
+        };
+        let result = compute(&call_context);
+        with_arg_errors(method_call.arg_shapes.borrow().iter(), result)
+    }
+
+    /// Records the shape `arg` produced, if `arg` is an argument of the method
+    /// call this context was created for by [`Self::compute_method_shape`].
+    fn record_method_arg_shape(&self, arg: &WithRange<LitExpr>, shape: &Shape) {
+        if let Some(method_call) = &self.method_call
+            && let Some(range) = arg.range()
+            && method_call.arg_ranges.contains(&range)
+        {
+            method_call.arg_shapes.borrow_mut().push(shape.clone());
+        }
+    }
+
+    /// Returns a clone of this context that shares the consumption trie but
+    /// is not the child of any method call, so shapes computed with it are
+    /// not recorded as method argument shapes. For computing an argument's
+    /// shape only for its consumption side effects, when the argument is
+    /// never evaluated at runtime (a short-circuited `->and`/`->or`), so its
+    /// errors must not be carried into the method's result shape.
+    pub(crate) fn without_method_call(&self) -> Self {
+        Self {
+            method_call: None,
+            ..self.clone()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn spec(&self) -> ConnectSpec {
+        self.spec
+    }
+
+    pub(crate) fn with_spec(mut self, spec: ConnectSpec) -> Self {
+        self.spec = spec;
+        self
+    }
+
+    pub(crate) fn named_shapes(&self) -> &IndexMap<String, Shape> {
+        &self.named_shapes
+    }
+
+    pub(crate) fn with_named_shapes(
+        mut self,
+        named_shapes: impl IntoIterator<Item = (String, Shape)>,
+    ) -> Self {
+        for (name, shape) in named_shapes {
+            self.named_shapes.insert(name.clone(), shape.clone());
+        }
+        self
+    }
+
+    pub(crate) fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    /// Shared handle to the consumption trie that this context's
+    /// `compute_output_shape` invocations contribute to. Cloning this handle
+    /// is cheap; mutations via `borrow_mut()` are visible to every other
+    /// holder, including child contexts produced via `with_named_shapes`.
+    #[allow(dead_code)]
+    pub(crate) fn consumption(&self) -> &Ref<RefCell<SelectionTrie>> {
+        &self.consumption
+    }
+
+    /// Record the names attached to a shape produced during
+    /// `compute_output_shape` recursion. Each name describes the input path
+    /// that the shape was derived from; walking the name chain into the
+    /// consumption trie accumulates the union of all consumed paths.
+    ///
+    /// A shape's identity-bearing names live in two places:
+    ///
+    ///  1. `shape.case() == ShapeCase::Name(name, _)` — the case itself is a
+    ///     symbolic reference, with the `Name` chain as its only payload.
+    ///  2. `shape.names()` — name-metadata accumulated via shape-rs's
+    ///     `with_base_name` / `with_name` / per-step name propagation.
+    ///
+    /// Both sources are recorded.
+    ///
+    /// The `terminal` flag controls whether the deepest node of each
+    /// recorded name chain is marked as a [`SelectionTrie::is_leaf`].
+    /// Pass `true` from terminal recording sites (`PathList::Empty`,
+    /// `PathList::Method` call boundary) where the input value is
+    /// "explicitly consumed"; pass `false` for navigation-only sites
+    /// (`PathList::Key`) where we only want the trie to *contain* the
+    /// path without claiming it terminates a selection.
+    ///
+    /// Only the [`ShapeCase::Name`] case-name (the shape's "primary"
+    /// identity) is eligible to be marked as a leaf. Metadata names
+    /// from `shape.names()` accumulate the path structure as Names
+    /// propagate through field/item operations; marking those as
+    /// leaves too would cause the terminal `$root.a.b.c` recording to
+    /// incorrectly mark its ancestors `$root`, `$root.a`, and
+    /// `$root.a.b` as leaves as well.
+    #[allow(dead_code)]
+    pub(crate) fn record_consumption(&self, shape: &Shape, terminal: bool) {
+        let mut trie = self.consumption.borrow_mut();
+        if let ShapeCase::Name(name, _weak) = shape.case() {
+            let leaf = trie.add_name(name);
+            if terminal {
+                leaf.set_leaf();
+            }
+        }
+        for name in shape.names() {
+            // Metadata names contribute path structure, not leaf identity.
+            trie.add_name(name);
+        }
+    }
+}
+
+/// Who asked for an [`ApplyToError`], which decides how far it travels.
+///
+/// The two kinds share one channel — every method returns a single
+/// `Vec<ApplyToError>` — but they are not interchangeable at the far end of
+/// it. A [`Self::Diagnostic`] is the language telling on itself ("Property
+/// .nope not found in object"): useful to the mapping author in the debugger
+/// and in telemetry, and never something to hand a client, because it
+/// describes the mapping's internals rather than the request's outcome. A
+/// [`Self::Declared`] is a sentence the schema author wrote on purpose with
+/// `->withError`, addressed to the client, and it is the only kind eligible
+/// to be reported in the client's response, under its `extensions`.
+///
+/// The distinction has to live on the error itself rather than being inferred
+/// at the point of collection: by the time a `Vec<ApplyToError>` reaches the
+/// response mapper, the two kinds are thoroughly interleaved (a single
+/// `->withError` call can emit both, when an argument fails), and nothing
+/// about a message's text or path distinguishes them.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Hash, Default)]
+pub enum ApplyToErrorKind {
+    /// Reported by the mapping language about the mapping. Debugger and
+    /// telemetry only.
+    #[default]
+    Diagnostic,
+    /// Declared by the schema author via `->withError`, addressed to the
+    /// client.
+    Declared,
+}
+
+/// Drop the diagnostics from a set of accumulated errors, keeping only what the
+/// schema author declared.
+///
+/// Used where the coalescing operators discard the errors of operands they
+/// stepped over. Discarding a diagnostic there is the point — "this path
+/// produced nothing" is precisely the condition the fallback exists to handle,
+/// so reporting it would make every defaulted field noisy. A declared error is
+/// the opposite: the author wrote `->withError` to say something to the client,
+/// and it must survive being on the losing side of a `??`.
+fn retain_declared(errors: &mut Vec<ApplyToError>) {
+    errors.retain(|error| error.kind() == ApplyToErrorKind::Declared);
+}
+
+/// The parts of an error that only an author-declared one carries.
+///
+/// Boxed behind [`ApplyToError::declared`] rather than inlined, for two
+/// reasons. `ApplyToError` is returned by every method in the language, often
+/// in a `Result<_, ApplyToError>`, so its size is on a hot path that
+/// diagnostics dominate; inlining these fields grew it from ~80 to 192 bytes
+/// and tripped `clippy::result_large_err`. And keeping them here makes the
+/// invariant structural: a diagnostic *cannot* carry extensions or an output
+/// path, because it has no place to put them.
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+struct DeclaredParts {
+    /// Structured fields for the GraphQL error's `extensions`, when the author
+    /// supplied them.
+    ///
+    /// Held as a [`JSON`] rather than a `Map` so this struct keeps the `Eq` and
+    /// `Hash` it derives, and because the value arrives as a `JSON` from
+    /// evaluating the author's expression either way. Constructors guarantee it
+    /// is `Some(JSON::Object(_))` or `None`.
+    extensions: Option<JSON>,
+    /// Where this error belongs in the mapping's *output*, as opposed to
+    /// [`ApplyToError::path`], which says where the mapping was reading in its
+    /// input.
+    ///
+    /// The two differ under any rename: `balance: amount->withError(...)`
+    /// reads `amount` and writes `balance`. Only this one can be handed to a
+    /// client, because only this one resolves against the data the client
+    /// received.
+    ///
+    /// Built by prepending on the way *out* rather than threading a parameter
+    /// on the way in: every construction site already reports `input_path`, and
+    /// the output name is known only by the enclosing [`NamedSelection`], which
+    /// sees the error on its way back up. See
+    /// [`ApplyToError::prepend_output_segment`].
+    output_path: Vec<JSON>,
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
+pub struct ApplyToError {
+    message: String,
+    path: Vec<JSON>,
+    range: OffsetRange,
+    spec: ConnectSpec,
+    /// `Some` exactly when the schema author declared this error with
+    /// `->withError`, which is also what [`Self::kind`] reports.
+    declared: Option<Box<DeclaredParts>>,
+}
+
+impl ApplyToError {
+    pub(crate) const fn new(
+        message: String,
+        path: Vec<JSON>,
+        range: OffsetRange,
+        spec: ConnectSpec,
+    ) -> Self {
+        Self {
+            message,
+            path,
+            range,
+            spec,
+            declared: None,
+        }
+    }
+
+    /// An error the schema author declared with `->withError`, eligible to
+    /// reach the client. `extensions` is ignored unless it is an object, so a
+    /// caller cannot smuggle a scalar into a position the GraphQL spec says is
+    /// a map.
+    pub(crate) fn declared(
+        message: String,
+        path: Vec<JSON>,
+        range: OffsetRange,
+        spec: ConnectSpec,
+        extensions: Option<JSON>,
+    ) -> Self {
+        Self {
+            message,
+            path,
+            range,
+            spec,
+            declared: Some(Box::new(DeclaredParts {
+                extensions: extensions.filter(|value| matches!(value, JSON::Object(_))),
+                output_path: Vec::new(),
+            })),
+        }
+    }
+
+    // This macro is useful for tests, but it absolutely should never be used with
+    // dynamic input at runtime, since it panics for any input that's not JSON.
+    #[cfg(test)]
+    pub(crate) fn from_json(json: &JSON) -> Self {
+        use crate::link::spec::Version;
+
+        let error = json.as_object().unwrap();
+        let message = error.get("message").unwrap().as_str().unwrap().to_string();
+        let path = error.get("path").unwrap().as_array().unwrap().clone();
+        let range = error.get("range").unwrap().as_array().unwrap();
+        let spec = error
+            .get("spec")
+            .and_then(|s| s.as_str())
+            .and_then(|s| match s.parse::<Version>() {
+                Ok(version) => ConnectSpec::try_from(&version).ok(),
+                Err(_) => None,
+            })
+            .unwrap_or_else(ConnectSpec::latest);
+
+        Self {
+            message,
+            path,
+            range: if range.len() == 2 {
+                let start = range[0].as_u64().unwrap() as usize;
+                let end = range[1].as_u64().unwrap() as usize;
+                Some(start..end)
+            } else {
+                None
+            },
+            spec,
+            // Absent keys mean "a plain diagnostic", so the many existing tests
+            // that spell out only message/path/range keep passing unchanged and
+            // only tests about declared errors have to say so.
+            declared: (error.get("declared").and_then(JSON::as_bool) == Some(true)).then(|| {
+                Box::new(DeclaredParts {
+                    extensions: error
+                        .get("extensions")
+                        .filter(|value| matches!(value, JSON::Object(_)))
+                        .cloned(),
+                    output_path: error
+                        .get("output_path")
+                        .and_then(JSON::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            }),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        self.message.as_str()
+    }
+
+    pub fn kind(&self) -> ApplyToErrorKind {
+        match self.declared {
+            Some(_) => ApplyToErrorKind::Declared,
+            None => ApplyToErrorKind::Diagnostic,
+        }
+    }
+
+    /// Where this error belongs in the mapping's *output*, as opposed to
+    /// [`Self::path`], which says where the mapping was reading in its input.
+    ///
+    /// The two differ under any rename: `balance: amount->withError(...)` reads
+    /// `amount` and writes `balance`. Only this one resolves against the data a
+    /// client received, so only this one belongs in a GraphQL error's `path`.
+    ///
+    /// Always empty for a diagnostic, which carries no output path because it
+    /// is addressed to the mapping author rather than to a client.
+    pub fn output_path(&self) -> &[JSON] {
+        self.declared
+            .as_ref()
+            .map_or(&[], |declared| declared.output_path.as_slice())
+    }
+
+    /// Record that this error came from inside `segment` of the enclosing
+    /// output structure — an object key, or an array index.
+    ///
+    /// Called while unwinding, so the innermost enclosing name is prepended
+    /// first and the outermost last, leaving the segments in reading order.
+    ///
+    /// Only [`ApplyToErrorKind::Declared`] errors accumulate an output path,
+    /// because only they are reported to the client, which is the one thing an
+    /// output path is for. A diagnostic is addressed to the mapping
+    /// author, who wants [`Self::path`] — where the mapping was reading when it
+    /// went wrong — and would be misled by a path naming the field it was
+    /// writing. Restricting it this way also keeps every existing diagnostic
+    /// byte-identical, so the many tests that assert on whole `ApplyToError`
+    /// values keep testing what they were written to test. Here that
+    /// restriction is not a check but the shape of the data: a diagnostic has
+    /// no `DeclaredParts` to record into.
+    pub(crate) fn prepend_output_segment(&mut self, segment: JSON) {
+        if let Some(declared) = self.declared.as_mut() {
+            declared.output_path.insert(0, segment);
+        }
+    }
+
+    /// The author-supplied `extensions` object, present only on a
+    /// [`ApplyToErrorKind::Declared`] error whose author supplied one.
+    pub fn extensions(&self) -> Option<&JSON> {
+        self.declared
+            .as_ref()
+            .and_then(|declared| declared.extensions.as_ref())
+    }
+
+    pub fn path(&self) -> &[JSON] {
+        self.path.as_slice()
+    }
+
+    pub fn range(&self) -> OffsetRange {
+        self.range.clone()
+    }
+
+    pub fn spec(&self) -> ConnectSpec {
+        self.spec
+    }
+}
+
+// Rust doesn't allow implementing methods directly on tuples like
+// (Option<JSON>, Vec<ApplyToError>), so we define a trait to provide the
+// methods we need, and implement the trait for the tuple in question.
+pub(super) trait ApplyToResultMethods {
+    fn prepend_errors(self, errors: Vec<ApplyToError>) -> Self;
+
+    fn and_then_collecting_errors(
+        self,
+        f: impl FnOnce(&JSON) -> (Option<JSON>, Vec<ApplyToError>),
+    ) -> (Option<JSON>, Vec<ApplyToError>);
+}
+
+impl ApplyToResultMethods for (Option<JSON>, Vec<ApplyToError>) {
+    // Intentionally taking ownership of self to avoid cloning, since we pretty
+    // much always use this method to replace the previous (value, errors) tuple
+    // before returning.
+    fn prepend_errors(self, mut errors: Vec<ApplyToError>) -> Self {
+        if errors.is_empty() {
+            self
+        } else {
+            let (value_opt, apply_errors) = self;
+            errors.extend(apply_errors);
+            (value_opt, errors)
+        }
+    }
+
+    // A substitute for Option<_>::and_then that accumulates errors behind the
+    // scenes. I'm no Haskell programmer, but this feels monadic? ¯\_(ツ)_/¯
+    fn and_then_collecting_errors(
+        self,
+        f: impl FnOnce(&JSON) -> (Option<JSON>, Vec<ApplyToError>),
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        match self {
+            (Some(data), errors) => f(&data).prepend_errors(errors),
+            (None, errors) => (None, errors),
+        }
+    }
+}
+
+impl ApplyToInternal for JSONSelection {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        _spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        match &self.inner {
+            // Because we represent a JSONSelection::Named as a SubSelection, we
+            // can fully delegate apply_to_path to SubSelection::apply_to_path.
+            // Even if we represented Self::Named as a Vec<NamedSelection>, we
+            // could still delegate to SubSelection::apply_to_path, but we would
+            // need to create a temporary SubSelection to wrap the selections
+            // Vec.
+            TopLevelSelection::Named(named_selections) => {
+                named_selections.apply_to_path(data, vars, input_path, self.spec)
+            }
+            TopLevelSelection::Value(lit) => lit.apply_to_path(data, vars, input_path, self.spec),
+        }
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        debug_assert_eq!(context.spec(), self.spec());
+
+        match &self.inner {
+            TopLevelSelection::Named(selection) => {
+                selection.compute_output_shape(context, input_shape, dollar_shape)
+            }
+            TopLevelSelection::Value(lit) => {
+                lit.compute_output_shape(context, input_shape, dollar_shape)
+            }
+        }
+    }
+}
+
+impl ApplyToInternal for NamedSelection {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        let mut output: Option<JSON> = None;
+        let mut errors = Vec::new();
+
+        let (value_opt, apply_errors) = self.path.apply_to_path(data, vars, input_path, spec);
+        errors.extend(apply_errors);
+
+        match &self.prefix {
+            NamingPrefix::Alias(alias) => {
+                if let Some(value) = value_opt {
+                    output = Some(json!({ alias.name.as_str(): value }));
+                }
+            }
+
+            NamingPrefix::Spread(_spread_range) => {
+                match value_opt {
+                    Some(JSON::Object(_) | JSON::Null) => {
+                        // Objects and null are valid outputs for an
+                        // inline/spread NamedSelection.
+                        output = value_opt;
+                    }
+                    Some(value) => {
+                        errors.push(ApplyToError::new(
+                            format!("Expected object or null, not {}", json_type_name(&value)),
+                            input_path.to_vec(),
+                            self.path.range(),
+                            spec,
+                        ));
+                    }
+                    None => {
+                        errors.push(ApplyToError::new(
+                            "Inlined path produced no value".to_string(),
+                            input_path.to_vec(),
+                            self.path.range(),
+                            spec,
+                        ));
+                    }
+                };
+            }
+
+            NamingPrefix::None => {
+                // Since there is no prefix (NamingPrefix::None), value_opt is
+                // usable as the output of NamedSelection::apply_to_path only if
+                // the NamedSelection has an implied single key, or by having a
+                // trailing SubSelection that guarantees object/null output.
+                let single_key = if let LitExpr::Path(path) = self.path.as_ref() {
+                    path.get_single_key()
+                } else {
+                    None
+                };
+                if let Some(single_key) = single_key {
+                    if let Some(value) = value_opt {
+                        output = Some(json!({ single_key.as_str(): value }));
+                    }
+                } else {
+                    output = value_opt;
+                }
+            }
+        }
+
+        // Everything reported from beneath this selection belongs under the key
+        // this selection writes, so record that on the way out. A spread
+        // (`NamingPrefix::Spread`) contributes no key: its fields are inlined
+        // into the enclosing object, so its errors already sit at the right
+        // depth.
+        if let Some(output_key) = self.get_single_key() {
+            for error in &mut errors {
+                error.prepend_output_segment(JSON::String(output_key.as_string().into()));
+            }
+        }
+
+        (output, errors)
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        let path_shape = self
+            .path
+            .compute_output_shape(context, input_shape, dollar_shape);
+
+        if let Some(single_output_key) = self.get_single_key() {
+            let mut map = Shape::empty_map();
+            map.insert(single_output_key.as_string(), path_shape);
+            Shape::closed_record(map, self.shape_location(context.source_id()))
+        } else {
+            path_shape
+        }
+    }
+}
+
+impl ApplyToInternal for PathSelection {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        match (self.path.as_ref(), vars.get(&KnownVariable::Dollar)) {
+            // If this is a KeyPath, instead of using data as given, we need to
+            // evaluate the path starting from the current value of $. To evaluate
+            // the KeyPath against data, prefix it with @. This logic supports
+            // method chaining like obj->has('a')->and(obj->has('b')), where both
+            // obj references are interpreted as $.obj.
+            (PathList::Key(_, _), Some((dollar_data, dollar_path))) => {
+                self.path
+                    .apply_to_path(dollar_data, vars, dollar_path, spec)
+            }
+
+            // If $ is undefined for some reason, fall back to using data...
+            // TODO: Since $ should never be undefined, we might want to
+            // guarantee its existence at compile time, somehow.
+            // (PathList::Key(_, _), None) => todo!(),
+            _ => self.path.apply_to_path(data, vars, input_path, spec),
+        }
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        match self.path.as_ref() {
+            PathList::Key(_, _) => {
+                // If this is a KeyPath, we need to evaluate the path starting
+                // from the current $ shape, so we pass dollar_shape as the data
+                // *and* dollar_shape to self.path.compute_output_shape.
+                self.path
+                    .compute_output_shape(context, dollar_shape.clone(), dollar_shape)
+            }
+            // If this is not a KeyPath, keep evaluating against input_shape.
+            // This logic parallels PathSelection::apply_to_path (above).
+            _ => self
+                .path
+                .compute_output_shape(context, input_shape, dollar_shape),
+        }
+    }
+}
+
+impl ApplyToInternal for WithRange<PathList> {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        match self.as_ref() {
+            PathList::Var(ranged_var_name, tail) => {
+                let var_name = ranged_var_name.as_ref();
+                if var_name == &KnownVariable::AtSign {
+                    // We represent @ as a variable name in PathList::Var, but
+                    // it is never stored in the vars map, because it is always
+                    // shorthand for the current data value.
+                    tail.apply_to_path(data, vars, input_path, spec)
+                } else if let Some((var_data, var_path)) = lookup_variable(vars, var_name.as_str())
+                {
+                    // Variables are associated with a path, which is always
+                    // just the variable name for named $variables other than $.
+                    // For the special variable $, the path represents the
+                    // sequence of keys from the root input data to the $ data.
+                    tail.apply_to_path(var_data, vars, var_path, spec)
+                } else {
+                    (
+                        None,
+                        vec![ApplyToError::new(
+                            format!("Variable {} not found", var_name.as_str()),
+                            input_path.to_vec(),
+                            ranged_var_name.range(),
+                            spec,
+                        )],
+                    )
+                }
+            }
+            PathList::Key(key, tail) => {
+                let input_path_with_key = input_path.append(key.to_json());
+
+                if let JSON::Array(array) = data {
+                    // If we recursively call self.apply_to_array, it will end
+                    // up invoking the tail of the key recursively, whereas we
+                    // want to apply the tail once to the entire output array of
+                    // shallow key lookups. To keep the recursion shallow, we
+                    // need a version of self that has the same key but no tail.
+                    let empty_tail = WithRange::new(PathList::Empty, tail.range());
+                    let self_with_empty_tail =
+                        WithRange::new(PathList::Key(key.clone(), empty_tail), key.range());
+
+                    self_with_empty_tail
+                        .apply_to_array(array, vars, input_path, spec)
+                        .and_then_collecting_errors(|shallow_mapped_array| {
+                            // This tail.apply_to_path call happens only once,
+                            // passing to the original/top-level tail the entire
+                            // array produced by key-related recursion/mapping.
+                            tail.apply_to_path(
+                                shallow_mapped_array,
+                                vars,
+                                &input_path_with_key,
+                                spec,
+                            )
+                        })
+                } else {
+                    let not_found = || {
+                        (
+                            None,
+                            vec![ApplyToError::new(
+                                format!(
+                                    "Property {} not found in {}",
+                                    key.dotted(),
+                                    json_type_name(data),
+                                ),
+                                input_path_with_key.to_vec(),
+                                key.range(),
+                                spec,
+                            )],
+                        )
+                    };
+
+                    if !matches!(data, JSON::Object(_)) {
+                        return not_found();
+                    }
+
+                    if let Some(child) = data.get(key.as_str()) {
+                        tail.apply_to_path(child, vars, &input_path_with_key, spec)
+                    } else if tail.is_question() {
+                        (None, vec![])
+                    } else {
+                        not_found()
+                    }
+                }
+            }
+            PathList::Expr(expr, tail) => expr
+                .apply_to_path(data, vars, input_path, spec)
+                .and_then_collecting_errors(|value| {
+                    tail.apply_to_path(value, vars, input_path, spec)
+                }),
+            PathList::Method(method_name, method_args, tail) => {
+                let method_path =
+                    input_path.append(JSON::String(format!("->{}", method_name.as_ref()).into()));
+
+                ArrowMethod::lookup(method_name).map_or_else(
+                    || {
+                        (
+                            None,
+                            vec![ApplyToError::new(
+                                format!("Method ->{} not found", method_name.as_ref()),
+                                method_path.to_vec(),
+                                method_name.range(),
+                                spec,
+                            )],
+                        )
+                    },
+                    |method| {
+                        let (result_opt, errors) = method.apply(
+                            method_name,
+                            method_args.as_ref(),
+                            data,
+                            vars,
+                            &method_path,
+                            spec,
+                        );
+
+                        // We special-case the ->as method here to avoid having
+                        // to give every -> method the ability to update
+                        // variables. The method.apply implementation for
+                        // ArrowMethod::As returns Some(json_object) where the
+                        // keys of json_object are variable names to update, and
+                        // the values are the values of those named variables.
+                        if let (ArrowMethod::As, Some(JSON::Object(bindings))) =
+                            (method, result_opt.as_ref())
+                        {
+                            let mut updated_vars = vars.clone();
+
+                            for (var_name, var_value) in bindings {
+                                updated_vars.insert(
+                                    KnownVariable::Local(var_name.as_str().to_string()),
+                                    // Should this InputPath include prior path information?
+                                    (var_value, InputPath::empty().append(json!(var_name))),
+                                );
+                            }
+
+                            return tail
+                                // We always pass the original input data to the
+                                // tail, no matter what ->as returned.
+                                .apply_to_path(data, &updated_vars, &method_path, spec)
+                                .prepend_errors(errors);
+                        }
+
+                        if let Some(result) = result_opt {
+                            tail.apply_to_path(&result, vars, &method_path, spec)
+                                .prepend_errors(errors)
+                        } else {
+                            // If the method produced no output, assume the errors
+                            // explain the None. Methods can legitimately produce
+                            // None without errors (like ->first or ->last on an
+                            // empty array), so we do not report any blanket error
+                            // here when errors.is_empty().
+                            (None, errors)
+                        }
+                    },
+                )
+            }
+            PathList::Selection(selection) => selection.apply_to_path(data, vars, input_path, spec),
+            PathList::Question(tail) => {
+                // Universal null check for any operation after ?
+                if data.is_null() {
+                    (None, vec![])
+                } else {
+                    tail.apply_to_path(data, vars, input_path, spec)
+                }
+            }
+            PathList::Empty => {
+                // If data is not an object here, we want to preserve its value
+                // without an error.
+                (Some(data.clone()), vec![])
+            }
+        }
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        // Errors are now stored as metadata on `input_shape` rather than as a
+        // `ShapeCase::Error` variant wrapping a partial. Capture them up-front
+        // so they can be reapplied to whatever the structural recursion below
+        // produces. A pure error (case == Unknown carrying error metadata) has
+        // no partial structure to drive shape computation, so we short-circuit
+        // and return it as-is. Note: this collapses the distinction between
+        // error_with_partial(msg, Unknown) and error(msg) — both early-return
+        // here — so if a future call site constructs the former and expects
+        // tail computation through the Unknown partial, this path will need
+        // refinement.
+        let pending_errors: Vec<(String, Vec<Location>)> = if input_shape.has_own_errors() {
+            if matches!(input_shape.case(), ShapeCase::Unknown) {
+                return input_shape;
+            }
+            let locations: Vec<Location> = input_shape.locations().cloned().collect();
+            input_shape
+                .own_errors()
+                .map(|e| (e.message.clone(), locations.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        match input_shape.case() {
+            ShapeCase::One(shapes) => {
+                let distributed = Shape::one(
+                    shapes.iter().map(|shape| {
+                        self.compute_output_shape(context, shape.clone(), dollar_shape.clone())
+                    }),
+                    input_shape.locations().cloned(),
+                );
+                return pending_errors
+                    .into_iter()
+                    .fold(distributed, |acc, (msg, locs)| {
+                        Shape::error_with_partial(msg, acc, locs)
+                    });
+            }
+            ShapeCase::All(shapes) => {
+                let distributed = Shape::all(
+                    shapes.iter().map(|shape| {
+                        self.compute_output_shape(context, shape.clone(), dollar_shape.clone())
+                    }),
+                    input_shape.locations().cloned(),
+                );
+                return pending_errors
+                    .into_iter()
+                    .fold(distributed, |acc, (msg, locs)| {
+                        Shape::error_with_partial(msg, acc, locs)
+                    });
+            }
+            _ => {}
+        };
+
+        // Below, input_shape is neither ::One nor ::All; any pending_errors
+        // captured above will be reapplied at the bottom of this function.
+
+        let mut extra_vars_opt: Option<Shape> = None;
+        let (current_shape, tail_opt) = match self.as_ref() {
+            PathList::Var(ranged_var_name, tail) => {
+                let var_name = ranged_var_name.as_ref();
+                let var_shape = if var_name == &KnownVariable::AtSign {
+                    input_shape
+                } else if var_name == &KnownVariable::Dollar {
+                    dollar_shape.clone()
+                } else if let Some(shape) = context.named_shapes().get(var_name.as_str()) {
+                    shape.clone()
+                } else {
+                    Shape::name(
+                        var_name.as_str(),
+                        ranged_var_name.shape_location(context.source_id()),
+                    )
+                };
+                (var_shape, Some(tail))
+            }
+
+            // For the first key in a path, PathSelection::compute_output_shape
+            // will have set our input_shape equal to its dollar_shape, thereby
+            // ensuring that some.nested.path is equivalent to
+            // $.some.nested.path.
+            PathList::Key(key, tail) => {
+                if input_shape.is_none() {
+                    // If the previous path prefix evaluated to None, path
+                    // evaluation must terminate because we cannot select a key
+                    // from a missing input value.
+                    //
+                    // Any errors that might explain an unexpected None value
+                    // should have been reported as Shape::error_with_partial
+                    // errors at a higher level.
+                    //
+                    // Although PathList::Key selections always refer to $.key,
+                    // the input_shape here has already been set to $ in
+                    // PathSelection::compute_output_shape.
+                    return input_shape;
+                }
+
+                let child_shape = field(&input_shape, key, context.source_id());
+
+                // Here input_shape was not None, but input_shape.field(key) was
+                // None, so it's the responsibility of this PathList::Key node
+                // to report the missing property error. Elsewhere None may
+                // terminate path evaluation, but it does not necessarily
+                // trigger a Shape::error. Here, the shape system is telling us
+                // the key will never be found, so an error is warranted.
+                //
+                // In the future, we might allow tail to be a PathList::Question
+                // supporting optional ? chaining syntax, which would be a way
+                // of silencing this error when the key's absence is acceptable.
+                if child_shape.is_none() {
+                    return Shape::error(
+                        format!(
+                            "Property {} not found in {}",
+                            key.dotted(),
+                            input_shape.pretty_print_bounded(PrintLimits::default())
+                        ),
+                        key.shape_location(context.source_id()),
+                    );
+                }
+
+                // Record the navigation path through this key step with
+                // `terminal = false`, so the structurally-traversed key
+                // appears in the consumption trie *as a non-leaf* — the
+                // path's actual leaf is recorded separately at the next
+                // `Empty` / `Method` boundary. This lets aliased
+                // selections like `users { name: $args.name }` capture
+                // `$root.users` as an internal node (necessary for
+                // upstream-existence guarantees) without marking it as a
+                // terminal selection.
+                context.record_consumption(&child_shape, false);
+
+                (child_shape, Some(tail))
+            }
+
+            PathList::Expr(expr, tail) => (
+                expr.compute_output_shape(context, input_shape, dollar_shape.clone()),
+                Some(tail),
+            ),
+
+            PathList::Method(method_name, method_args, tail) => {
+                if input_shape.is_none() {
+                    // If the previous path prefix evaluated to None, path
+                    // evaluation must terminate because -> methods never
+                    // execute against a missing/None input value.
+                    //
+                    // Any errors that might explain an unexpected None value
+                    // should have been reported as Shape::error_with_partial
+                    // errors at a higher level.
+                    return input_shape;
+                }
+
+                // The method consumes whatever the input path resolved to;
+                // record the input's accumulated name(s) into the trie before
+                // invoking the method, since `method.shape(...)` typically
+                // does not propagate the original name through to its result.
+                context.record_consumption(&input_shape, true);
+
+                if let Some(method) = ArrowMethod::lookup(method_name) {
+                    // Before connect/v0.3, we did not consult method.shape at
+                    // all, and instead returned Unknown. Since this behavior
+                    // has consequences for URI validation, the older behavior
+                    // is preserved/retrievable given ConnectSpec::V0_2/earlier.
+                    if context.spec() < ConnectSpec::V0_3 {
+                        (
+                            Shape::unknown(method_name.shape_location(context.source_id())),
+                            None,
+                        )
+                    } else {
+                        let compute = |context: &ShapeContext| {
+                            method.shape(
+                                context,
+                                method_name,
+                                method_args.as_ref(),
+                                input_shape.clone(),
+                                dollar_shape.clone(),
+                            )
+                        };
+                        let result_shape = if method == ArrowMethod::As {
+                            // The result of `->as` is the shape of the bound
+                            // variables, which carry any errors in their own
+                            // shapes to where they are used.
+                            compute(context)
+                        } else {
+                            context.compute_method_shape(method_args.as_ref(), compute)
+                        };
+
+                        // We special-case ArrowMethod::As in apply_to_path, so
+                        // it makes sense to do so here as well.
+                        if method == ArrowMethod::As {
+                            // This is the only place we set extra_vars_opt to a
+                            // non-None value, which allows compute_tail_shape
+                            // to call context.with_named_shapes to make sure
+                            // $var gets defined in input->as($var)->echo($var).
+                            extra_vars_opt = Some(result_shape);
+                            (
+                                // We always apply the tail of an input->as(...)
+                                // method to the input shape, regardless of what
+                                // method.shape returned.
+                                input_shape,
+                                Some(tail),
+                            )
+                        } else {
+                            (result_shape, Some(tail))
+                        }
+                    }
+                } else {
+                    (
+                        Shape::error(
+                            format!("Method ->{} not found", method_name.as_str()),
+                            method_name.shape_location(context.source_id()),
+                        ),
+                        None,
+                    )
+                }
+            }
+
+            PathList::Question(tail) => {
+                let q_shape = input_shape.question(self.shape_location(context.source_id()));
+                (
+                    if tail.is_empty() {
+                        // If there is no tail, we do not need to account for
+                        // the possibility that the whole path might evaluate to
+                        // None, as that possibility will be encoded in the
+                        // computed shape for this terminal/leaf ::Question.
+                        q_shape
+                    } else {
+                        // Using the ? operator with a non-empty tail suggests
+                        // the input shape could evaluate to None, so we always
+                        // include None as a possible shape here. If we don't
+                        // entertain this possibility, we might compute a
+                        // non-optional object shape with missing fields instead
+                        // of correctly computing One<{...}, None>.
+                        Shape::one([q_shape, Shape::none()], [])
+                    },
+                    Some(tail),
+                )
+            }
+
+            PathList::Selection(selection) => {
+                if input_shape.is_none() {
+                    // We do not require that the input shape for a SubSelection
+                    // must be an object (as it will be bound to $ and @
+                    // regardless), but we skip executing the SubSelection
+                    // if/when the input shape is None, since we can't bind None
+                    // to $ or @.
+                    return input_shape;
+                }
+
+                // The path terminates here — `Selection` is a leaf-position
+                // for the outer path (no `tail` after it). Record the input
+                // path as terminal so the trie has a leaf at the
+                // navigation's endpoint, matching the walker's behavior of
+                // marking a key followed by a subselection as leaf-with-
+                // children. Subsequent recursion into `selection` records
+                // additional consumption (e.g. the subselection's own
+                // fields) on top.
+                //
+                // The one exception is a subselection applied directly to a
+                // bare variable, with no key navigation in between, as in
+                // `price: { amount: $args.amount }`, whose input is the
+                // enclosing `@` (`$root`, or `$root.*`). Marking that input
+                // as a leaf would claim the whole variable was consumed, so
+                // it is marked only if the subselection read something under
+                // it. To tell, the subselection records into a fresh trie,
+                // which is then merged back into the shared one.
+                let bare_variable = match input_shape.case() {
+                    ShapeCase::Name(name, _) if !name_navigates(name) => Some(name.clone()),
+                    _ => None,
+                };
+
+                if let Some(name) = bare_variable {
+                    let outer = context.consumption().replace(SelectionTrie::new());
+                    let output_shape = selection.compute_output_shape(
+                        context,
+                        input_shape.clone(),
+                        dollar_shape.clone(),
+                    );
+                    let inner = context.consumption().replace(outer);
+                    let read_under_input = inner.contains_name(&name);
+                    context.consumption().borrow_mut().extend(&inner);
+                    // Release `inner` before recording more, so the subtrees
+                    // it shares with the merged trie are uniquely owned again
+                    // and `Ref::make_mut` can update them in place.
+                    drop(inner);
+                    if read_under_input {
+                        context.record_consumption(&input_shape, true);
+                    }
+                    (output_shape, None)
+                } else {
+                    context.record_consumption(&input_shape, true);
+                    (
+                        selection.compute_output_shape(context, input_shape, dollar_shape.clone()),
+                        None,
+                    )
+                }
+            }
+
+            PathList::Empty => {
+                // Terminal step — the accumulated name(s) on `input_shape`
+                // describe the deepest input path the surrounding path
+                // expression consumed. Record them into the trie.
+                context.record_consumption(&input_shape, true);
+                (input_shape, None)
+            }
+        };
+
+        let tail_result = if let Some(tail) = tail_opt {
+            // Recurses over extra_vars_opt, which is usually None, but could be
+            // Some(object_shape) (when handling ArrowMethod::As), and might
+            // sometimes be Some(error_shape) with an object partial shape.
+            fn compute_tail_shape(
+                tail: &WithRange<PathList>,
+                extra_vars_opt: &Option<Shape>,
+                context: &ShapeContext,
+                input_shape: Shape,
+                dollar_shape: Shape,
+            ) -> Shape {
+                let pending_messages: Vec<String> = extra_vars_opt
+                    .as_ref()
+                    .map(|s| s.own_errors().map(|e| e.message.clone()).collect())
+                    .unwrap_or_default();
+                let tail_location = tail.shape_location(context.source_id());
+
+                let inner_shape = match extra_vars_opt.as_ref().map(|s| s.case()) {
+                    Some(ShapeCase::Object { fields, .. }) => {
+                        // TODO Refactor the internal ShapeContext
+                        // representation to make this cloning
+                        // unnecessary/cheaper.
+                        let new_context = context.clone().with_named_shapes(
+                            fields
+                                .iter()
+                                .map(|(name, shape)| (name.clone(), shape.clone())),
+                        );
+                        tail.compute_output_shape(&new_context, input_shape, dollar_shape)
+                    }
+
+                    // A pure error (case == Unknown carrying error metadata) has
+                    // no partial structure to drive name installation; emit a
+                    // fresh error shape carrying the same messages.
+                    Some(ShapeCase::Unknown) if !pending_messages.is_empty() => {
+                        let mut iter = pending_messages.into_iter();
+                        let first = iter.next().unwrap_or_default();
+                        return iter.fold(Shape::error(first, tail_location), |acc, msg| {
+                            acc.with_error(shape::Error { message: msg })
+                        });
+                    }
+
+                    _ => tail.compute_output_shape(context, input_shape, dollar_shape),
+                };
+
+                // Reattach any error metadata that was sitting on
+                // extra_vars_opt, so the structural recursion's output still
+                // surfaces the original error messages.
+                pending_messages.into_iter().fold(inner_shape, |acc, msg| {
+                    Shape::error_with_partial(msg, acc, tail_location.clone())
+                })
+            }
+
+            compute_tail_shape(
+                tail,
+                &extra_vars_opt,
+                context,
+                // Note: current_shape gets renamed to input_shape within the
+                // compute_tail_shape function defined above.
+                current_shape,
+                dollar_shape,
+            )
+        } else {
+            current_shape
+        };
+
+        // Reapply any pending errors that were attached to the original
+        // input_shape, so callers see the same error metadata they would have
+        // seen when errors were a dedicated `ShapeCase::Error` variant.
+        pending_errors
+            .into_iter()
+            .fold(tail_result, |acc, (msg, locs)| {
+                Shape::error_with_partial(msg, acc, locs)
+            })
+    }
+}
+
+impl ApplyToInternal for WithRange<LitExpr> {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        match self.as_ref() {
+            LitExpr::String(s) => (Some(JSON::String(s.clone().into())), vec![]),
+            LitExpr::Number(n) => (Some(JSON::Number(n.clone())), vec![]),
+            LitExpr::Bool(b) => (Some(JSON::Bool(*b)), vec![]),
+            LitExpr::Null => (Some(JSON::Null), vec![]),
+            LitExpr::LegacyObject(map) => {
+                let mut output = JSONMap::with_capacity(map.len());
+                let mut errors = Vec::new();
+                for (key, value) in map {
+                    let (value_opt, apply_errors) =
+                        value.apply_to_path(data, vars, input_path, spec);
+                    errors.extend(apply_errors);
+                    if let Some(value_json) = value_opt {
+                        output.insert(key.as_str(), value_json);
+                    }
+                }
+                (Some(JSON::Object(output)), errors)
+            }
+            LitExpr::Object(sub) => {
+                // LitExpr::Object shares grammar with SubSelection but NOT its
+                // `$` rebinding: `$` inside a literal object stays bound to
+                // the surrounding data. Nested `Key SubSelection` syntax
+                // (e.g. `{ foo { bar } }`) still rebinds `$` via the inner
+                // SubSelection, which is handled by NamedSelection itself.
+                let (output, errors) = sub.apply_selections_no_rebind(data, vars, input_path, spec);
+                (Some(output), errors)
+            }
+            LitExpr::Array(vec) => {
+                let mut output = Vec::with_capacity(vec.len());
+                let mut errors = Vec::new();
+                for value in vec {
+                    let (value_opt, apply_errors) =
+                        value.apply_to_path(data, vars, input_path, spec);
+                    errors.extend(apply_errors);
+                    output.push(value_opt.unwrap_or(JSON::Null));
+                }
+                (Some(JSON::Array(output)), errors)
+            }
+            LitExpr::Path(path) => path.apply_to_path(data, vars, input_path, spec),
+            LitExpr::LitPath(literal, subpath) => literal
+                .apply_to_path(data, vars, input_path, spec)
+                .and_then_collecting_errors(|value| {
+                    subpath.apply_to_path(value, vars, input_path, spec)
+                }),
+            LitExpr::OpChain(op, operands) => {
+                match op.as_ref() {
+                    LitOp::NullishCoalescing => {
+                        // Null coalescing: A ?? B ?? C
+                        // Returns B if A is null OR None, otherwise A. If B is also null/None, returns C, etc.
+                        let mut accumulated_errors = Vec::new();
+                        let mut last_value: Option<JSON> = None;
+
+                        for operand in operands {
+                            let (value, errors) =
+                                operand.apply_to_path(data, vars, input_path, spec);
+
+                            match value {
+                                // If we get a non-null, non-None value, return it
+                                Some(JSON::Null) | None => {
+                                    // Accumulate errors but continue to next operand
+                                    accumulated_errors.extend(errors);
+                                    last_value = value;
+                                    continue;
+                                }
+                                Some(value) => {
+                                    // Found a non-null/non-None value. Earlier
+                                    // operands' diagnostics are dropped: a path
+                                    // that produced nothing is exactly what the
+                                    // fallback is for, so reporting it would be
+                                    // noise. Declared errors are kept, because
+                                    // the author asked for those explicitly and
+                                    // dropping them would silently discard a
+                                    // message meant for the client.
+                                    retain_declared(&mut accumulated_errors);
+                                    accumulated_errors.extend(errors);
+                                    return (Some(value), accumulated_errors);
+                                }
+                            }
+                        }
+
+                        // If the last value was Some(JSON::Null), we return
+                        // that null, since there is no ?? after it. Otherwise,
+                        // last_value will be None at this point, because we
+                        // return Some(value) above as soon as we find a
+                        // non-null/non-None value.
+                        if last_value.is_none() {
+                            // If we never found a non-null value, return None
+                            // with all accumulated errors.
+                            (None, accumulated_errors)
+                        } else {
+                            // The last operand evaluated to null, which counts
+                            // as a successful evaluation, so earlier operands'
+                            // diagnostics are not reported. Declared errors
+                            // still are: `x ?? $(null)->withError("...")` is a
+                            // deliberate "default to null and say why", and
+                            // dropping the message would make that spelling
+                            // silently do nothing.
+                            retain_declared(&mut accumulated_errors);
+                            (last_value, accumulated_errors)
+                        }
+                    }
+
+                    LitOp::NoneCoalescing => {
+                        // None coalescing: A ?! B ?! C
+                        // Returns B if A is None (preserves null), otherwise A. If B is also None, returns C, etc.
+                        let mut accumulated_errors = Vec::new();
+
+                        for operand in operands {
+                            let (value, errors) =
+                                operand.apply_to_path(data, vars, input_path, spec);
+
+                            match value {
+                                // If we get None, continue to next operand
+                                None => {
+                                    accumulated_errors.extend(errors);
+                                    continue;
+                                }
+                                // If we get any value (including null), return
+                                // it. As with `??`, earlier operands'
+                                // diagnostics are dropped as expected noise
+                                // while declared errors are kept.
+                                Some(value) => {
+                                    retain_declared(&mut accumulated_errors);
+                                    accumulated_errors.extend(errors);
+                                    return (Some(value), accumulated_errors);
+                                }
+                            }
+                        }
+
+                        // All operands were None, return None with all accumulated errors
+                        (None, accumulated_errors)
+                    }
+                }
+            }
+        }
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        let locations = self.shape_location(context.source_id());
+
+        let shape = match self.as_ref() {
+            LitExpr::Null => Shape::null(locations),
+            LitExpr::Bool(value) => Shape::bool_value(*value, locations),
+            LitExpr::String(value) => Shape::string_value(value.as_str(), locations),
+
+            LitExpr::Number(value) => {
+                if let Some(n) = value.as_i64() {
+                    Shape::int_value(n, locations)
+                } else if value.is_f64() {
+                    Shape::float(locations)
+                } else {
+                    Shape::error("Number neither Int nor Float", locations)
+                }
+            }
+
+            LitExpr::LegacyObject(map) => {
+                let mut fields = Shape::empty_map();
+                for (key, value) in map {
+                    fields.insert(
+                        key.as_string(),
+                        value.compute_output_shape(
+                            context,
+                            input_shape.clone(),
+                            dollar_shape.clone(),
+                        ),
+                    );
+                }
+                Shape::object(fields, Shape::none(), locations)
+            }
+
+            LitExpr::Object(sub) => {
+                // Mirror the LitExpr::Object apply_to_path semantics: iterate
+                // NamedSelection shapes against the outer input/dollar shapes
+                // rather than rebinding $ (which SubSelection would do).
+                sub.compute_selections_shape_no_rebind(context, input_shape, dollar_shape)
+            }
+
+            LitExpr::Array(vec) => {
+                let mut shapes = Vec::with_capacity(vec.len());
+                for value in vec {
+                    // Elements with no value become null at runtime.
+                    shapes.push(missing_as_null(
+                        context,
+                        value.compute_output_shape(
+                            context,
+                            input_shape.clone(),
+                            dollar_shape.clone(),
+                        ),
+                    ));
+                }
+                Shape::array(shapes, Shape::none(), locations)
+            }
+
+            LitExpr::Path(path) => path.compute_output_shape(context, input_shape, dollar_shape),
+
+            LitExpr::LitPath(literal, subpath) => {
+                let literal_shape =
+                    literal.compute_output_shape(context, input_shape, dollar_shape.clone());
+                subpath.compute_output_shape(context, literal_shape, dollar_shape)
+            }
+
+            LitExpr::OpChain(op, operands) => {
+                let mut shapes: Vec<Shape> = operands
+                    .iter()
+                    .map(|operand| {
+                        operand.compute_output_shape(
+                            context,
+                            input_shape.clone(),
+                            dollar_shape.clone(),
+                        )
+                    })
+                    .collect();
+
+                match op.as_ref() {
+                    LitOp::NullishCoalescing => {
+                        if let Some(last_shape) = shapes.pop() {
+                            let mut new_shapes = shapes
+                                .iter()
+                                .map(|shape| {
+                                    shape
+                                        .question(locations.clone())
+                                        .not_none(locations.clone())
+                                })
+                                .collect::<Vec<_>>();
+                            new_shapes.push(last_shape);
+                            Shape::one(new_shapes, locations)
+                        } else {
+                            Shape::one(shapes, locations)
+                        }
+                    }
+
+                    // Just like NullishCoalescing except null is not excluded.
+                    LitOp::NoneCoalescing => {
+                        if let Some(last_shape) = shapes.pop() {
+                            let mut new_shapes = shapes
+                                .iter()
+                                .map(|shape| shape.not_none(locations.clone()))
+                                .collect::<Vec<_>>();
+                            new_shapes.push(last_shape);
+                            Shape::one(new_shapes, locations)
+                        } else {
+                            Shape::one(shapes, locations)
+                        }
+                    }
+                }
+            }
+        };
+
+        // How `->` method calls keep the errors of their arguments. See
+        // `ShapeContext::compute_method_shape`.
+        context.record_method_arg_shape(self, &shape);
+        shape
+    }
+}
+
+impl SubSelection {
+    /// Apply each [`NamedSelection`] in `self.selections` to `data`, merging
+    /// outputs into an accumulating object. Unlike
+    /// [`ApplyToInternal::apply_to_path`] on `SubSelection`, this does **not**
+    /// rebind `$` — `vars` is threaded to each inner selection as-is. Callers
+    /// that want `SubSelection`'s `$`-to-`data` binding must prepare `vars`
+    /// before calling.
+    fn apply_selections_no_rebind(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (JSON, Vec<ApplyToError>) {
+        let mut output = JSON::Object(JSONMap::new());
+        let mut errors = Vec::new();
+
+        for named_selection in self.selections.iter() {
+            let (named_output_opt, apply_errors) =
+                named_selection.apply_to_path(data, vars, input_path, spec);
+            errors.extend(apply_errors);
+
+            let (merged, merge_errors) = json_merge(Some(&output), named_output_opt.as_ref());
+
+            errors.extend(merge_errors.into_iter().map(|message| {
+                ApplyToError::new(message, input_path.to_vec(), self.range(), spec)
+            }));
+
+            if let Some(merged) = merged {
+                output = merged;
+            }
+        }
+
+        (output, errors)
+    }
+
+    /// Shape counterpart of [`Self::apply_selections_no_rebind`]: merge the
+    /// output shapes of each [`NamedSelection`] with [`Shape::merge`] without
+    /// rebinding `$`. Callers pass the `dollar_shape` they want threaded.
+    fn compute_selections_shape_no_rebind(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        dollar_shape: Shape,
+    ) -> Shape {
+        let locations = self.shape_location(context.source_id());
+        let mut selections = self.selections.iter();
+
+        // Object shapes with no field in common can be merged in one call, so
+        // they are combined once instead of rebuilt for every named selection.
+        let mut object_shapes = Vec::with_capacity(self.selections.len());
+        let mut field_names = IndexSet::default();
+        let mut merged_shape = None;
+        for named_selection in selections.by_ref() {
+            let shape = named_selection.compute_output_shape(
+                context,
+                input_shape.clone(),
+                dollar_shape.clone(),
+            );
+            if Self::adds_only_new_fields(&shape, &mut field_names) {
+                object_shapes.push(shape);
+            } else {
+                let objects = Shape::merge(object_shapes.drain(..), locations.clone());
+                merged_shape = Some(Shape::merge([objects, shape], locations.clone()));
+                break;
+            }
+        }
+        let Some(mut merged_shape) = merged_shape else {
+            let merged_shape = Shape::merge(object_shapes, locations.clone());
+            return if merged_shape.is_unknown() {
+                Shape::empty_object(locations)
+            } else {
+                merged_shape
+            };
+        };
+
+        // From the first shape that isn't such an object, merge one at a time:
+        // Shape::merge only drops impossible combinations of union members when
+        // it expands them, so merging the rest in one call could produce a
+        // different shape.
+        for named_selection in selections {
+            // If merging produces null instead of an object, that nullifies the
+            // whole object and allows shape computation to bail out early.
+            if merged_shape.is_null() {
+                break;
+            }
+            merged_shape = Shape::merge(
+                [
+                    merged_shape,
+                    named_selection.compute_output_shape(
+                        context,
+                        input_shape.clone(),
+                        dollar_shape.clone(),
+                    ),
+                ],
+                locations.clone(),
+            );
+        }
+
+        if merged_shape.is_unknown() {
+            Shape::empty_object(locations)
+        } else {
+            merged_shape
+        }
+    }
+
+    /// Whether `shape` is an object whose fields are all missing from
+    /// `field_names`, in which case they are added to `field_names`.
+    fn adds_only_new_fields(shape: &Shape, field_names: &mut IndexSet<String>) -> bool {
+        match shape.case() {
+            ShapeCase::Object { fields, .. } => {
+                if fields.keys().any(|name| field_names.contains(name)) {
+                    return false;
+                }
+                field_names.extend(fields.keys().cloned());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ApplyToInternal for SubSelection {
+    fn apply_to_path(
+        &self,
+        data: &JSON,
+        vars: &VarsWithPathsMap,
+        input_path: &InputPath<JSON>,
+        spec: ConnectSpec,
+    ) -> (Option<JSON>, Vec<ApplyToError>) {
+        if let JSON::Array(array) = data {
+            return self.apply_to_array(array, vars, input_path, spec);
+        }
+
+        let vars: VarsWithPathsMap = {
+            let mut vars = vars.clone();
+            vars.insert(KnownVariable::Dollar, (data, input_path.clone()));
+            vars
+        };
+
+        let (output, errors) = self.apply_selections_no_rebind(data, &vars, input_path, spec);
+
+        if !matches!(data, JSON::Object(_)) {
+            let output_is_empty = match &output {
+                JSON::Object(map) => map.is_empty(),
+                _ => false,
+            };
+            if output_is_empty {
+                // If data was a primitive value (neither array nor object), and
+                // no output properties were generated, return data as is, along
+                // with any errors that occurred.
+                return (Some(data.clone()), errors);
+            }
+        }
+
+        (Some(output), errors)
+    }
+
+    fn compute_output_shape(
+        &self,
+        context: &ShapeContext,
+        input_shape: Shape,
+        _previous_dollar_shape: Shape,
+    ) -> Shape {
+        // Just as SubSelection::apply_to_path calls apply_to_array when data is
+        // an array, so compute_output_shape recursively computes the output
+        // shapes of each array element shape.
+        if let ShapeCase::Array { prefix, tail } = input_shape.case() {
+            let new_prefix = prefix
+                .iter()
+                .map(|shape| self.compute_output_shape(context, shape.clone(), shape.clone()))
+                .collect::<Vec<_>>();
+
+            let new_tail = if tail.is_none() {
+                tail.clone()
+            } else {
+                self.compute_output_shape(context, tail.clone(), tail.clone())
+            };
+
+            return Shape::array(
+                new_prefix,
+                new_tail,
+                self.shape_location(context.source_id()),
+            );
+        }
+
+        // If the input shape is a named shape, it might end up being an array,
+        // so we need to hedge the output shape using a wildcard that maps over
+        // array elements.
+        let input_shape = input_shape.any_item(Vec::new());
+
+        // The SubSelection rebinds the $ variable to the selected input object,
+        // so we can ignore _previous_dollar_shape.
+        let dollar_shape = input_shape.clone();
+
+        self.compute_selections_shape_no_rebind(context, input_shape, dollar_shape)
+    }
+}
+
+impl WithRange<PathList> {
+    /// Build a [`SelectionTrie`] describing every input path under
+    /// `namespace` (the variable name including the `$` prefix, e.g.
+    /// `"$this"`) that this tail consumes. Uses the fused-trie machinery in
+    /// [`Self::compute_output_shape`], so it correctly traverses through
+    /// arrow methods, conditional operators (`?`), nested subselections
+    /// (`$this.items->filter(...) { id name }`), and any predicate
+    /// sub-expressions inside method arguments — all of which the legacy
+    /// trie walker treats as opaque leaves.
+    pub(crate) fn compute_consumption_trie(&self, namespace: &str) -> SelectionTrie {
+        let context = ShapeContext::new(SourceId::Other("VariableReference".into()));
+        let var_shape = Shape::name(namespace, Vec::new());
+
+        // The recursion records into `context.consumption()` as a byproduct
+        // of computing the output shape; we discard the output shape here.
+        let _ = self.compute_output_shape(&context, var_shape.clone(), var_shape);
+
+        context
+            .consumption()
+            .borrow()
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(SelectionTrie::new)
+    }
+}
+
+/// Whether a shape name navigates into its base variable through a field or
+/// item step, as opposed to naming the variable itself (`$root`, or
+/// `$root.*` when only array iteration markers follow the base).
+fn name_navigates(name: &Name) -> bool {
+    name.iter().any(|part| {
+        matches!(
+            part.case(),
+            NameCase::Field(..) | NameCase::Item(..) | NameCase::AnyField(_)
+        )
+    })
+}
+
+/// Helper to get the field from a shape or error if the object doesn't have that field.
+fn field(shape: &Shape, key: &WithRange<Key>, source_id: &SourceId) -> Shape {
+    if let ShapeCase::One(inner) = shape.case() {
+        let mut new_fields = Vec::new();
+        for inner_field in inner.iter() {
+            new_fields.push(field(inner_field, key, source_id));
+        }
+        return Shape::one(new_fields, shape.locations().cloned());
+    }
+    if shape.is_none() || shape.is_null() {
+        return Shape::none();
+    }
+    let field_shape = shape.field(key.as_str(), key.shape_location(source_id));
+    if field_shape.is_none() {
+        return Shape::error(
+            format!("field `{field}` not found", field = key.as_str()),
+            key.shape_location(source_id),
+        );
+    }
+    field_shape
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::assert_debug_snapshot;
+    use crate::connectors::json_selection::PrettyPrintable;
+    use crate::selection;
+
+    #[rstest]
+    #[case::v0_2(ConnectSpec::V0_2)]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_apply_to_selection(#[case] spec: ConnectSpec) {
+        let data = json!({
+            "hello": "world",
+            "nested": {
+                "hello": "world",
+                "world": "hello",
+            },
+            "array": [
+                { "hello": "world 0" },
+                { "hello": "world 1" },
+                { "hello": "world 2" },
+            ],
+        });
+
+        #[track_caller]
+        fn check_ok(data: &JSON, selection: JSONSelection, expected_json: JSON) {
+            let (actual_json, errors) = selection.apply_to(data);
+            assert_eq!(actual_json, Some(expected_json));
+            assert_eq!(errors, vec![]);
+        }
+
+        check_ok(&data, selection!("hello", spec), json!({"hello": "world"}));
+
+        check_ok(
+            &data,
+            selection!("nested", spec),
+            json!({
+                "nested": {
+                    "hello": "world",
+                    "world": "hello",
+                },
+            }),
+        );
+
+        check_ok(&data, selection!("nested.hello", spec), json!("world"));
+        check_ok(&data, selection!("$.nested.hello", spec), json!("world"));
+
+        check_ok(&data, selection!("nested.world", spec), json!("hello"));
+        check_ok(&data, selection!("$.nested.world", spec), json!("hello"));
+
+        check_ok(
+            &data,
+            selection!("nested hello", spec),
+            json!({
+                "hello": "world",
+                "nested": {
+                    "hello": "world",
+                    "world": "hello",
+                },
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("array { hello }", spec),
+            json!({
+                "array": [
+                    { "hello": "world 0" },
+                    { "hello": "world 1" },
+                    { "hello": "world 2" },
+                ],
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("greetings: array { hello }", spec),
+            json!({
+                "greetings": [
+                    { "hello": "world 0" },
+                    { "hello": "world 1" },
+                    { "hello": "world 2" },
+                ],
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("$.array { hello }", spec),
+            json!([
+                { "hello": "world 0" },
+                { "hello": "world 1" },
+                { "hello": "world 2" },
+            ]),
+        );
+
+        check_ok(
+            &data,
+            selection!("worlds: array.hello", spec),
+            json!({
+                "worlds": [
+                    "world 0",
+                    "world 1",
+                    "world 2",
+                ],
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("worlds: $.array.hello", spec),
+            json!({
+                "worlds": [
+                    "world 0",
+                    "world 1",
+                    "world 2",
+                ],
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("array.hello", spec),
+            json!(["world 0", "world 1", "world 2",]),
+        );
+
+        check_ok(
+            &data,
+            selection!("$.array.hello", spec),
+            json!(["world 0", "world 1", "world 2",]),
+        );
+
+        check_ok(
+            &data,
+            selection!("nested grouped: { hello worlds: array.hello }", spec),
+            json!({
+                "nested": {
+                    "hello": "world",
+                    "world": "hello",
+                },
+                "grouped": {
+                    "hello": "world",
+                    "worlds": [
+                        "world 0",
+                        "world 1",
+                        "world 2",
+                    ],
+                },
+            }),
+        );
+
+        check_ok(
+            &data,
+            selection!("nested grouped: { hello worlds: $.array.hello }", spec),
+            json!({
+                "nested": {
+                    "hello": "world",
+                    "world": "hello",
+                },
+                "grouped": {
+                    "hello": "world",
+                    "worlds": [
+                        "world 0",
+                        "world 1",
+                        "world 2",
+                    ],
+                },
+            }),
+        );
+    }
+
+    #[rstest]
+    #[case::v0_2(ConnectSpec::V0_2)]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_apply_to_errors(#[case] spec: ConnectSpec) {
+        let data = json!({
+            "hello": "world",
+            "nested": {
+                "hello": 123,
+                "world": true,
+            },
+            "array": [
+                { "hello": 1, "goodbye": "farewell" },
+                { "hello": "two" },
+                { "hello": 3.0, "smello": "yellow" },
+            ],
+        });
+
+        assert_eq!(
+            selection!("hello", spec).apply_to(&data),
+            (Some(json!({"hello": "world"})), vec![],)
+        );
+
+        fn make_yellow_errors_expected(
+            yellow_range: std::ops::Range<usize>,
+            spec: ConnectSpec,
+        ) -> Vec<ApplyToError> {
+            vec![ApplyToError::new(
+                "Property .yellow not found in object".to_string(),
+                vec![json!("yellow")],
+                Some(yellow_range),
+                spec,
+            )]
+        }
+        assert_eq!(
+            selection!("yellow", spec).apply_to(&data),
+            (Some(json!({})), make_yellow_errors_expected(0..6, spec)),
+        );
+        assert_eq!(
+            selection!("$.yellow", spec).apply_to(&data),
+            (None, make_yellow_errors_expected(2..8, spec)),
+        );
+
+        assert_eq!(
+            selection!("nested.hello", spec).apply_to(&data),
+            (Some(json!(123)), vec![],)
+        );
+
+        fn make_quoted_yellow_expected(
+            yellow_range: std::ops::Range<usize>,
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                None,
+                vec![ApplyToError::new(
+                    "Property .\"yellow\" not found in object".to_string(),
+                    vec![json!("nested"), json!("yellow")],
+                    Some(yellow_range),
+                    spec,
+                )],
+            )
+        }
+        assert_eq!(
+            selection!("nested.'yellow'", spec).apply_to(&data),
+            make_quoted_yellow_expected(7..15, spec),
+        );
+        assert_eq!(
+            selection!("nested.\"yellow\"", spec).apply_to(&data),
+            make_quoted_yellow_expected(7..15, spec),
+        );
+        assert_eq!(
+            selection!("$.nested.'yellow'", spec).apply_to(&data),
+            make_quoted_yellow_expected(9..17, spec),
+        );
+
+        fn make_nested_path_expected(
+            hola_range: (usize, usize),
+            yellow_range: (usize, usize),
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                Some(json!({
+                    "world": true,
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .hola not found in object",
+                        "path": ["nested", "hola"],
+                        "range": hola_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .yellow not found in object",
+                        "path": ["nested", "yellow"],
+                        "range": yellow_range,
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        }
+        assert_eq!(
+            selection!("$.nested { hola yellow world }", spec).apply_to(&data),
+            make_nested_path_expected((11, 15), (16, 22), spec),
+        );
+        assert_eq!(
+            selection!(" $ . nested { hola yellow world } ", spec).apply_to(&data),
+            make_nested_path_expected((14, 18), (19, 25), spec),
+        );
+
+        fn make_partial_array_expected(
+            goodbye_range: (usize, usize),
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                Some(json!({
+                    "partial": [
+                        { "hello": 1, "goodbye": "farewell" },
+                        { "hello": "two" },
+                        { "hello": 3.0 },
+                    ],
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .goodbye not found in object",
+                        "path": ["array", 1, "goodbye"],
+                        "range": goodbye_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .goodbye not found in object",
+                        "path": ["array", 2, "goodbye"],
+                        "range": goodbye_range,
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        }
+        assert_eq!(
+            selection!("partial: $.array { hello goodbye }", spec).apply_to(&data),
+            make_partial_array_expected((25, 32), spec),
+        );
+        assert_eq!(
+            selection!(" partial : $ . array { hello goodbye } ", spec).apply_to(&data),
+            make_partial_array_expected((29, 36), spec),
+        );
+
+        assert_eq!(
+            selection!("good: array.hello bad: array.smello", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "good": [
+                        1,
+                        "two",
+                        3.0,
+                    ],
+                    "bad": [
+                        null,
+                        null,
+                        "yellow",
+                    ],
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .smello not found in object",
+                        "path": ["array", 0, "smello"],
+                        "range": [29, 35],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .smello not found in object",
+                        "path": ["array", 1, "smello"],
+                        "range": [29, 35],
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        );
+
+        assert_eq!(
+            selection!("array { hello smello }", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "array": [
+                        { "hello": 1 },
+                        { "hello": "two" },
+                        { "hello": 3.0, "smello": "yellow" },
+                    ],
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .smello not found in object",
+                        "path": ["array", 0, "smello"],
+                        "range": [14, 20],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .smello not found in object",
+                        "path": ["array", 1, "smello"],
+                        "range": [14, 20],
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        );
+
+        assert_eq!(
+            selection!("$.nested { grouped: { hello smelly world } }", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "grouped": {
+                        "hello": 123,
+                        "world": true,
+                    },
+                })),
+                vec![ApplyToError::from_json(&json!({
+                    "message": "Property .smelly not found in object",
+                    "path": ["nested", "smelly"],
+                    "range": [28, 34],
+                    "spec": spec.to_string(),
+                }))],
+            )
+        );
+
+        assert_eq!(
+            selection!("alias: $.nested { grouped: { hello smelly world } }", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "alias": {
+                        "grouped": {
+                            "hello": 123,
+                            "world": true,
+                        },
+                    },
+                })),
+                vec![ApplyToError::from_json(&json!({
+                    "message": "Property .smelly not found in object",
+                    "path": ["nested", "smelly"],
+                    "range": [35, 41],
+                    "spec": spec.to_string(),
+                }))],
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::v0_2(ConnectSpec::V0_2)]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_apply_to_nested_arrays(#[case] spec: ConnectSpec) {
+        let data = json!({
+            "arrayOfArrays": [
+                [
+                    { "x": 0, "y": 0 },
+                ],
+                [
+                    { "x": 1, "y": 0 },
+                    { "x": 1, "y": 1 },
+                    { "x": 1, "y": 2 },
+                ],
+                [
+                    { "x": 2, "y": 0 },
+                    { "x": 2, "y": 1 },
+                ],
+                [],
+                [
+                    null,
+                    { "x": 4, "y": 1 },
+                    { "x": 4, "why": 2 },
+                    null,
+                    { "x": 4, "y": 4 },
+                ]
+            ],
+        });
+
+        fn make_array_of_arrays_x_expected(
+            x_range: (usize, usize),
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                Some(json!([[0], [1, 1, 1], [2, 2], [], [null, 4, 4, null, 4]])),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "x"],
+                        "range": x_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 3, "x"],
+                        "range": x_range,
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        }
+        assert_eq!(
+            selection!("arrayOfArrays.x", spec).apply_to(&data),
+            make_array_of_arrays_x_expected((14, 15), spec),
+        );
+        assert_eq!(
+            selection!("$.arrayOfArrays.x", spec).apply_to(&data),
+            make_array_of_arrays_x_expected((16, 17), spec),
+        );
+
+        fn make_array_of_arrays_y_expected(
+            y_range: (usize, usize),
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                Some(json!([
+                    [0],
+                    [0, 1, 2],
+                    [0, 1],
+                    [],
+                    [null, 1, null, null, 4],
+                ])),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "y"],
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in object",
+                        "path": ["arrayOfArrays", 4, 2, "y"],
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in null",
+                        "path": ["arrayOfArrays", 4, 3, "y"],
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        }
+        assert_eq!(
+            selection!("arrayOfArrays.y", spec).apply_to(&data),
+            make_array_of_arrays_y_expected((14, 15), spec),
+        );
+        assert_eq!(
+            selection!("$.arrayOfArrays.y", spec).apply_to(&data),
+            make_array_of_arrays_y_expected((16, 17), spec),
+        );
+
+        assert_eq!(
+            selection!("alias: arrayOfArrays { x y }", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "alias": [
+                        [
+                            { "x": 0, "y": 0 },
+                        ],
+                        [
+                            { "x": 1, "y": 0 },
+                            { "x": 1, "y": 1 },
+                            { "x": 1, "y": 2 },
+                        ],
+                        [
+                            { "x": 2, "y": 0 },
+                            { "x": 2, "y": 1 },
+                        ],
+                        [],
+                        [
+                            null,
+                            { "x": 4, "y": 1 },
+                            { "x": 4 },
+                            null,
+                            { "x": 4, "y": 4 },
+                        ]
+                    ],
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "x"],
+                        "range": [23, 24],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "y"],
+                        "range": [25, 26],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in object",
+                        "path": ["arrayOfArrays", 4, 2, "y"],
+                        "range": [25, 26],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 3, "x"],
+                        "range": [23, 24],
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in null",
+                        "path": ["arrayOfArrays", 4, 3, "y"],
+                        "range": [25, 26],
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            ),
+        );
+
+        fn make_array_of_arrays_x_y_expected(
+            x_range: (usize, usize),
+            y_range: (usize, usize),
+            spec: ConnectSpec,
+        ) -> (Option<JSON>, Vec<ApplyToError>) {
+            (
+                Some(json!({
+                    "ys": [
+                        [0],
+                        [0, 1, 2],
+                        [0, 1],
+                        [],
+                        [null, 1, null, null, 4],
+                    ],
+                    "xs": [
+                        [0],
+                        [1, 1, 1],
+                        [2, 2],
+                        [],
+                        [null, 4, 4, null, 4],
+                    ],
+                })),
+                vec![
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "y"],
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .y not found in object",
+                        "path": ["arrayOfArrays", 4, 2, "y"],
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        // Reversing the order of "path" and "message" here to make
+                        // sure that doesn't affect the deduplication logic.
+                        "path": ["arrayOfArrays", 4, 3, "y"],
+                        "message": "Property .y not found in null",
+                        "range": y_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 0, "x"],
+                        "range": x_range,
+                        "spec": spec.to_string(),
+                    })),
+                    ApplyToError::from_json(&json!({
+                        "message": "Property .x not found in null",
+                        "path": ["arrayOfArrays", 4, 3, "x"],
+                        "range": x_range,
+                        "spec": spec.to_string(),
+                    })),
+                ],
+            )
+        }
+        assert_eq!(
+            selection!("ys: arrayOfArrays.y xs: arrayOfArrays.x", spec).apply_to(&data),
+            make_array_of_arrays_x_y_expected((38, 39), (18, 19), spec),
+        );
+        assert_eq!(
+            selection!("ys: $.arrayOfArrays.y xs: $.arrayOfArrays.x", spec).apply_to(&data),
+            make_array_of_arrays_x_y_expected((42, 43), (20, 21), spec),
+        );
+    }
+
+    #[rstest]
+    #[case::v0_2(ConnectSpec::V0_2)]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_apply_to_variable_expressions(#[case] spec: ConnectSpec) {
+        let id_object = selection!("id: $", spec).apply_to(&json!(123));
+        assert_eq!(id_object, (Some(json!({"id": 123})), vec![]));
+
+        let data = json!({
+            "id": 123,
+            "name": "Ben",
+            "friend_ids": [234, 345, 456]
+        });
+
+        assert_eq!(
+            selection!("id name friends: friend_ids { id: $ }", spec).apply_to(&data),
+            (
+                Some(json!({
+                    "id": 123,
+                    "name": "Ben",
+                    "friends": [
+                        { "id": 234 },
+                        { "id": 345 },
+                        { "id": 456 },
+                    ],
+                })),
+                vec![],
+            ),
+        );
+
+        let mut vars = IndexMap::default();
+        vars.insert("$args".to_string(), json!({ "id": "id from args" }));
+        assert_eq!(
+            selection!("id: $args.id name", spec).apply_with_vars(&data, &vars),
+            (
+                Some(json!({
+                    "id": "id from args",
+                    "name": "Ben"
+                })),
+                vec![],
+            ),
+        );
+        assert_eq!(
+            selection!("nested.path { id: $args.id name }", spec).apply_to(&json!({
+                "nested": {
+                    "path": data,
+                },
+            })),
+            (
+                Some(json!({
+                    "name": "Ben"
+                })),
+                vec![ApplyToError::from_json(&json!({
+                    "message": "Variable $args not found",
+                    "path": ["nested", "path"],
+                    "range": [18, 23],
+                    "spec": spec.to_string(),
+                }))],
+            ),
+        );
+        let mut vars_without_args_id = IndexMap::default();
+        vars_without_args_id.insert("$args".to_string(), json!({ "unused": "ignored" }));
+        assert_eq!(
+            selection!("id: $args.id name", spec).apply_with_vars(&data, &vars_without_args_id),
+            (
+                Some(json!({
+                    "name": "Ben"
+                })),
+                vec![ApplyToError::from_json(&json!({
+                    "message": "Property .id not found in object",
+                    "path": ["$args", "id"],
+                    "range": [10, 12],
+                    "spec": spec.to_string(),
+                }))],
+            ),
+        );
+
+        // A single variable path should not be mapped over an input array.
+        assert_eq!(
+            selection!("$args.id", spec).apply_with_vars(&json!([1, 2, 3]), &vars),
+            (Some(json!("id from args")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_apply_to_variable_expressions_typename() {
+        let typename_object =
+            selection!("__typename: $->echo('Product') reviews { __typename: $->echo('Review') }")
+                .apply_to(&json!({"reviews": [{}]}));
+        assert_eq!(
+            typename_object,
+            (
+                Some(json!({"__typename": "Product", "reviews": [{ "__typename": "Review" }] })),
+                vec![]
+            )
+        );
+    }
+
+    #[test]
+    fn test_literal_expressions_in_parentheses() {
+        assert_eq!(
+            selection!("__typename: $('Product')").apply_to(&json!({})),
+            (Some(json!({"__typename": "Product"})), vec![]),
+        );
+
+        // As of connect/v0.4, a bare quoted string after an alias is a
+        // string literal, not a key-path lookup, so this no longer errors.
+        assert_eq!(
+            selection!(" __typename : 'Product' ").apply_to(&json!({})),
+            (Some(json!({"__typename": "Product"})), vec![]),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                one: $(1)
+                two: $(2)
+                negativeThree: $(-  3)
+                true: $(true  )
+                false: $(  false)
+                null: $(null)
+                string: $("string")
+                array: $( [ 1 , 2 , 3 ] )
+                object: $( { "key" : "value" } )
+                path: $(nested.path)
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": "nested path value"
+                }
+            })),
+            (
+                Some(json!({
+                    "one": 1,
+                    "two": 2,
+                    "negativeThree": -3,
+                    "true": true,
+                    "false": false,
+                    "null": null,
+                    "string": "string",
+                    "array": [1, 2, 3],
+                    "object": { "key": "value" },
+                    "path": "nested path value",
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                one: $(1)->typeof
+                two: $(2)->typeof
+                negativeThree: $(-3)->typeof
+                true: $(true)->typeof
+                false: $(false)->typeof
+                null: $(null)->typeof
+                string: $("string")->typeof
+                array: $([1, 2, 3])->typeof
+                object: $({ "key": "value" })->typeof
+                path: $(nested.path)->typeof
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": 12345
+                }
+            })),
+            (
+                Some(json!({
+                    "one": "number",
+                    "two": "number",
+                    "negativeThree": "number",
+                    "true": "boolean",
+                    "false": "boolean",
+                    "null": "null",
+                    "string": "string",
+                    "array": "array",
+                    "object": "object",
+                    "path": "number",
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                items: $([
+                    1,
+                    -2.0,
+                    true,
+                    false,
+                    null,
+                    "string",
+                    [1, 2, 3],
+                    { "key": "value" },
+                    nested.path,
+                ])->map(@->typeof)
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": { "deeply": "nested" }
+                }
+            })),
+            (
+                Some(json!({
+                    "items": [
+                        "number",
+                        "number",
+                        "boolean",
+                        "boolean",
+                        "null",
+                        "string",
+                        "array",
+                        "object",
+                        "object",
+                    ],
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                $({
+                    one: 1,
+                    two: 2,
+                    negativeThree: -3,
+                    true: true,
+                    false: false,
+                    null: null,
+                    string: "string",
+                    array: [1, 2, 3],
+                    object: { "key": "value" },
+                    path: $ . nested . path ,
+                })->entries
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": "nested path value"
+                }
+            })),
+            (
+                Some(json!([
+                    { "key": "one", "value": 1 },
+                    { "key": "two", "value": 2 },
+                    { "key": "negativeThree", "value": -3 },
+                    { "key": "true", "value": true },
+                    { "key": "false", "value": false },
+                    { "key": "null", "value": null },
+                    { "key": "string", "value": "string" },
+                    { "key": "array", "value": [1, 2, 3] },
+                    { "key": "object", "value": { "key": "value" } },
+                    { "key": "path", "value": "nested path value" },
+                ])),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                $({
+                    string: $("string")->slice(1, 4),
+                    array: $([1, 2, 3])->map(@->add(10)),
+                    object: $({ "key": "value" })->get("key"),
+                    path: nested.path->slice($("nested ")->size),
+                    needlessParens: $("oyez"),
+                    withoutParens: "oyez",
+                })
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": "nested path value"
+                }
+            })),
+            (
+                Some(json!({
+                    "string": "tri",
+                    "array": [11, 12, 13],
+                    "object": "value",
+                    "path": "path value",
+                    "needlessParens": "oyez",
+                    "withoutParens": "oyez",
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                string: $("string")->slice(1, 4)
+                array: $([1, 2, 3])->map(@->add(10))
+                object: $({ "key": "value" })->get("key")
+                path: nested.path->slice($("nested ")->size)
+            "#
+            )
+            .apply_to(&json!({
+                "nested": {
+                    "path": "nested path value"
+                }
+            })),
+            (
+                Some(json!({
+                    "string": "tri",
+                    "array": [11, 12, 13],
+                    "object": "value",
+                    "path": "path value",
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[rstest]
+    #[case::v0_2(ConnectSpec::V0_2)]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_inline_paths_with_subselections(#[case] spec: ConnectSpec) {
+        let data = json!({
+            "id": 123,
+            "created": "2021-01-01T00:00:00Z",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The capital of Australia is Canberra.",
+                },
+            }, {
+                "index": 1,
+                "message": {
+                    "role": "assistant",
+                    "content": "The capital of Australia is Sydney.",
+                },
+            }],
+        });
+
+        {
+            let expected = (
+                Some(json!({
+                    "id": 123,
+                    "created": "2021-01-01T00:00:00Z",
+                    "model": "gpt-4o",
+                    "role": "assistant",
+                    "content": "The capital of Australia is Canberra.",
+                })),
+                vec![],
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    role: choices->first.message.role
+                    content: choices->first.message.content
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->first.message {
+                        role
+                        content
+                    }
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    choices->first.message {
+                        role
+                        content
+                    }
+                    created
+                    model
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+        }
+
+        {
+            let expected = (
+                Some(json!({
+                    "id": 123,
+                    "created": "2021-01-01T00:00:00Z",
+                    "model": "gpt-4o",
+                    "role": "assistant",
+                    "message": "The capital of Australia is Sydney.",
+                })),
+                vec![],
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    role: choices->last.message.role
+                    message: choices->last.message.content
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->last.message {
+                        role
+                        message: content
+                    }
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    created
+                    choices->last.message {
+                        message: content
+                        role
+                    }
+                    model
+                    id
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+        }
+
+        {
+            let expected = (
+                Some(json!({
+                    "id": 123,
+                    "created": "2021-01-01T00:00:00Z",
+                    "model": "gpt-4o",
+                    "role": "assistant",
+                    "correct": "The capital of Australia is Canberra.",
+                    "incorrect": "The capital of Australia is Sydney.",
+                })),
+                vec![],
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    role: choices->first.message.role
+                    correct: choices->first.message.content
+                    incorrect: choices->last.message.content
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->first.message {
+                        role
+                        correct: content
+                    }
+                    choices->last.message {
+                        incorrect: content
+                    }
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->first.message {
+                        role
+                        correct: content
+                    }
+                    incorrect: choices->last.message.content
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->first.message {
+                        correct: content
+                    }
+                    choices->last.message {
+                        role
+                        incorrect: content
+                    }
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    correct: choices->first.message.content
+                    choices->last.message {
+                        role
+                        incorrect: content
+                    }
+                    model
+                "#,
+                    spec
+                )
+                .apply_to(&data),
+                expected,
+            );
+        }
+
+        {
+            let data = json!({
+                "from": "data",
+            });
+
+            let vars = {
+                let mut vars = IndexMap::default();
+                vars.insert(
+                    "$this".to_string(),
+                    json!({
+                        "id": 1234,
+                    }),
+                );
+                vars.insert(
+                    "$args".to_string(),
+                    json!({
+                        "input": {
+                            "title": "The capital of Australia",
+                            "body": "Canberra",
+                        },
+                        "extra": "extra",
+                    }),
+                );
+                vars
+            };
+
+            let expected = (
+                Some(json!({
+                    "id": 1234,
+                    "title": "The capital of Australia",
+                    "body": "Canberra",
+                    "from": "data",
+                })),
+                vec![],
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id: $this.id
+                    $args.input {
+                        title
+                        body
+                    }
+                    from
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    from
+                    $args.input { title body }
+                    id: $this.id
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    $args.input { body title }
+                    from
+                    id: $this.id
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id: $this.id
+                    $args { $.input { title body } }
+                    from
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                expected,
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id: $this.id
+                    $args { $.input { title body } extra }
+                    from: $.from
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                (
+                    Some(json!({
+                        "id": 1234,
+                        "title": "The capital of Australia",
+                        "body": "Canberra",
+                        "extra": "extra",
+                        "from": "data",
+                    })),
+                    vec![],
+                ),
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    # Equivalent to id: $this.id
+                    $this { id }
+
+                    $args {
+                        __typename: $("Args")
+
+                        # Requiring $. instead of just . prevents .input from
+                        # parsing as a key applied to the $("Args") string.
+                        $.input { title body }
+
+                        extra
+                    }
+
+                    from: $.from
+                "#,
+                    spec
+                )
+                .apply_with_vars(&data, &vars),
+                (
+                    Some(json!({
+                        "id": 1234,
+                        "title": "The capital of Australia",
+                        "body": "Canberra",
+                        "__typename": "Args",
+                        "extra": "extra",
+                        "from": "data",
+                    })),
+                    vec![],
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_path_errors() {
+        {
+            let data = json!({
+                "id": 123,
+                "created": "2021-01-01T00:00:00Z",
+                "model": "gpt-4o",
+                "choices": [{
+                    "message": "The capital of Australia is Canberra.",
+                }, {
+                    "message": "The capital of Australia is Sydney.",
+                }],
+            });
+
+            let expected = (
+                Some(json!({
+                    "id": 123,
+                    "created": "2021-01-01T00:00:00Z",
+                    "model": "gpt-4o",
+                })),
+                vec![
+                    ApplyToError::new(
+                        "Property .role not found in string".to_string(),
+                        vec![
+                            json!("choices"),
+                            json!("->first"),
+                            json!("message"),
+                            json!("role"),
+                        ],
+                        Some(123..127),
+                        ConnectSpec::latest(),
+                    ),
+                    ApplyToError::new(
+                        "Property .content not found in string".to_string(),
+                        vec![
+                            json!("choices"),
+                            json!("->first"),
+                            json!("message"),
+                            json!("content"),
+                        ],
+                        Some(128..135),
+                        ConnectSpec::latest(),
+                    ),
+                    ApplyToError::new(
+                        "Expected object or null, not string".to_string(),
+                        vec![],
+                        // This is the range of the whole
+                        // `choices->first.message { role content }`
+                        // subselection.
+                        Some(98..137),
+                        ConnectSpec::latest(),
+                    ),
+                ],
+            );
+
+            assert_eq!(
+                selection!(
+                    r#"
+                    id
+                    created
+                    model
+                    choices->first.message { role content }
+                "#
+                )
+                .apply_to(&data),
+                expected,
+            );
+        }
+
+        assert_eq!(
+            selection!("id nested.path.nonexistent { name }").apply_to(&json!({
+                "id": 2345,
+                "nested": {
+                    "path": "nested path value",
+                },
+            })),
+            (
+                Some(json!({
+                    "id": 2345,
+                })),
+                vec![
+                    ApplyToError::new(
+                        "Property .nonexistent not found in string".to_string(),
+                        vec![json!("nested"), json!("path"), json!("nonexistent")],
+                        Some(15..26),
+                        ConnectSpec::latest(),
+                    ),
+                    ApplyToError::new(
+                        "Inlined path produced no value".to_string(),
+                        vec![],
+                        // This is the range of the whole
+                        // `nested.path.nonexistent { name }` path selection.
+                        Some(3..35),
+                        ConnectSpec::latest(),
+                    ),
+                ],
+            ),
+        );
+
+        let valid_inline_path_selection = JSONSelection::named(SubSelection {
+            selections: vec![NamedSelection {
+                prefix: NamingPrefix::None,
+                path: WithRange::new(
+                    LitExpr::Path(PathSelection {
+                        path: PathList::Key(
+                            Key::field("some").into_with_range(),
+                            PathList::Key(
+                                Key::field("object").into_with_range(),
+                                PathList::Empty.into_with_range(),
+                            )
+                            .into_with_range(),
+                        )
+                        .into_with_range(),
+                    }),
+                    None,
+                ),
+            }],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            valid_inline_path_selection.apply_to(&json!({
+                "some": {
+                    "object": {
+                        "key": "value",
+                    },
+                },
+            })),
+            (
+                Some(json!({
+                    "key": "value",
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_apply_to_non_identifier_properties() {
+        let data = json!({
+            "not an identifier": [
+                { "also.not.an.identifier": 0 },
+                { "also.not.an.identifier": 1 },
+                { "also.not.an.identifier": 2 },
+            ],
+            "another": {
+                "pesky string literal!": {
+                    "identifier": 123,
+                    "{ evil braces }": true,
+                },
+            },
+        });
+
+        assert_eq!(
+            // Unlike `alias: 'key' { ... }` at the top level (a key-shaped
+            // literal followed by a subselection, still read as a path in
+            // connect/v0.4), a bare `safe: 'key'` with no trailing
+            // subselection is a string literal as of v0.4, not a key lookup.
+            selection!("alias: 'not an identifier' { safe: 'also.not.an.identifier' }")
+                .apply_to(&data),
+            (
+                Some(json!({
+                    "alias": [
+                        { "safe": "also.not.an.identifier" },
+                        { "safe": "also.not.an.identifier" },
+                        { "safe": "also.not.an.identifier" },
+                    ],
+                })),
+                vec![],
+            ),
+        );
+
+        // As of connect/v0.4, a leading bare quoted literal (with no `$.`
+        // prefix) is a string literal, not the start of a key path, so
+        // chaining `.key` off of it now applies a property lookup to the
+        // literal string itself rather than to the root value.
+        assert_eq!(
+            selection!("'not an identifier'.'also.not.an.identifier'").apply_to(&data),
+            (
+                None,
+                vec![ApplyToError::new(
+                    "Property .\"also.not.an.identifier\" not found in string".to_string(),
+                    vec![json!("also.not.an.identifier")],
+                    Some(20..44),
+                    ConnectSpec::latest(),
+                )],
+            ),
+        );
+
+        assert_eq!(
+            selection!("$.'not an identifier'.'also.not.an.identifier'").apply_to(&data),
+            (Some(json!([0, 1, 2])), vec![],),
+        );
+
+        assert_eq!(
+            selection!("$.\"not an identifier\" { safe: \"also.not.an.identifier\" }")
+                .apply_to(&data),
+            (
+                Some(json!([
+                    { "safe": "also.not.an.identifier" },
+                    { "safe": "also.not.an.identifier" },
+                    { "safe": "also.not.an.identifier" },
+                ])),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!(
+                "another {
+                pesky: 'pesky string literal!' {
+                    identifier
+                    evil: '{ evil braces }'
+                }
+            }"
+            )
+            .apply_to(&data),
+            (
+                Some(json!({
+                    "another": {
+                        "pesky": {
+                            "identifier": 123,
+                            "evil": "{ evil braces }",
+                        },
+                    },
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!("another.'pesky string literal!'.'{ evil braces }'").apply_to(&data),
+            (Some(json!(true)), vec![],),
+        );
+
+        assert_eq!(
+            selection!("another.'pesky string literal!'.\"identifier\"").apply_to(&data),
+            (Some(json!(123)), vec![],),
+        );
+
+        assert_eq!(
+            selection!("$.another.'pesky string literal!'.\"identifier\"").apply_to(&data),
+            (Some(json!(123)), vec![],),
+        );
+    }
+
+    #[rstest]
+    #[case::latest(ConnectSpec::V0_2)]
+    #[case::next(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_left_associative_path_evaluation(#[case] spec: ConnectSpec) {
+        assert_eq!(
+            selection!("batch.id->first", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!(1)), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->last", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!(3)), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->size", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!(3)), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->slice(1)->first", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!(2)), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->map({ batchId: @ })", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (
+                Some(json!([
+                    { "batchId": 1 },
+                    { "batchId": 2 },
+                    { "batchId": 3 },
+                ])),
+                vec![],
+            ),
+        );
+
+        let mut vars = IndexMap::default();
+        vars.insert(
+            "$batch".to_string(),
+            json!([
+                { "id": 4 },
+                { "id": 5 },
+                { "id": 6 },
+            ]),
+        );
+        assert_eq!(
+            selection!("$batch.id->map({ batchId: @ })", spec).apply_with_vars(
+                &json!({
+                    "batch": "ignored",
+                }),
+                &vars
+            ),
+            (
+                Some(json!([
+                    { "batchId": 4 },
+                    { "batchId": 5 },
+                    { "batchId": 6 },
+                ])),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!("batch.id->map({ batchId: @ })->first", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 7 },
+                    { "id": 8 },
+                    { "id": 9 },
+                ],
+            })),
+            (Some(json!({ "batchId": 7 })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->map({ batchId: @ })->last", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 7 },
+                    { "id": 8 },
+                    { "id": 9 },
+                ],
+            })),
+            (Some(json!({ "batchId": 9 })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map({ batchId: @ })->first", spec).apply_with_vars(
+                &json!({
+                    "batch": "ignored",
+                }),
+                &vars
+            ),
+            (Some(json!({ "batchId": 4 })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map({ batchId: @ })->last", spec).apply_with_vars(
+                &json!({
+                    "batch": "ignored",
+                }),
+                &vars
+            ),
+            (Some(json!({ "batchId": 6 })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("arrays.as.bs->echo({ echoed: @ })", spec).apply_to(&json!({
+                "arrays": [
+                    { "as": { "bs": [10, 20, 30] } },
+                    { "as": { "bs": [40, 50, 60] } },
+                    { "as": { "bs": [70, 80, 90] } },
+                ],
+            })),
+            (
+                Some(json!({
+                    "echoed": [
+                        [10, 20, 30],
+                        [40, 50, 60],
+                        [70, 80, 90],
+                    ],
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!("arrays.as.bs->echo({ echoed: @ })", spec).apply_to(&json!({
+                "arrays": [
+                    { "as": { "bs": [10, 20, 30] } },
+                    { "as": [
+                        { "bs": [40, 50, 60] },
+                        { "bs": [70, 80, 90] },
+                    ] },
+                    { "as": { "bs": [100, 110, 120] } },
+                ],
+            })),
+            (
+                Some(json!({
+                    "echoed": [
+                        [10, 20, 30],
+                        [
+                            [40, 50, 60],
+                            [70, 80, 90],
+                        ],
+                        [100, 110, 120],
+                    ],
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            selection!("batch.id->jsonStringify", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!("[1,2,3]")), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->map([@])->echo([@])->jsonStringify", spec).apply_to(&json!({
+                "batch": [
+                    { "id": 1 },
+                    { "id": 2 },
+                    { "id": 3 },
+                ],
+            })),
+            (Some(json!("[[[1],[2],[3]]]")), vec![]),
+        );
+
+        assert_eq!(
+            selection!("batch.id->map([@])->echo([@])->jsonStringify->typeof", spec).apply_to(
+                &json!({
+                    "batch": [
+                        { "id": 1 },
+                        { "id": 2 },
+                        { "id": 3 },
+                    ],
+                })
+            ),
+            (Some(json!("string")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_left_associative_output_shapes_v0_2() {
+        let spec = ConnectSpec::V0_2;
+
+        assert_eq!(
+            selection!("$batch.id", spec).shape().pretty_print(),
+            "$batch.id"
+        );
+
+        assert_eq!(
+            selection!("$batch.id->first", spec).shape().pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->last", spec).shape().pretty_print(),
+            "Unknown",
+        );
+
+        let mut named_shapes = IndexMap::default();
+        named_shapes.insert(
+            "$batch".to_string(),
+            Shape::list(
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert("id".to_string(), Shape::int([]));
+                        map
+                    },
+                    [],
+                ),
+                [],
+            ),
+        );
+
+        let root_shape = Shape::name("$root", []);
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes(named_shapes);
+
+        let computed_batch_id =
+            selection!("$batch.id", spec).compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_batch_id.pretty_print(), "[...Int]");
+
+        let computed_first = selection!("$batch.id->first", spec)
+            .compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_first.pretty_print(), "Unknown");
+
+        let computed_last = selection!("$batch.id->last", spec)
+            .compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_last.pretty_print(), "Unknown");
+
+        assert_eq!(
+            selection!("$batch.id->jsonStringify", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])->jsonStringify", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map(@)->echo(@)", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map(@)->echo([@])", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo(@)", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])", spec)
+                .shape()
+                .pretty_print(),
+            "Unknown",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])", spec)
+                .compute_output_shape(&shape_context, root_shape,)
+                .pretty_print(),
+            "Unknown",
+        );
+    }
+
+    #[test]
+    fn test_left_associative_output_shapes_v0_3() {
+        let spec = ConnectSpec::V0_3;
+
+        assert_eq!(
+            selection!("$batch.id", spec).shape().pretty_print(),
+            "$batch.id"
+        );
+
+        assert_eq!(
+            selection!("$batch.id->first", spec).shape().pretty_print(),
+            "$batch.id.0",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->last", spec).shape().pretty_print(),
+            "$batch.id.*",
+        );
+
+        let mut named_shapes = IndexMap::default();
+        named_shapes.insert(
+            "$batch".to_string(),
+            Shape::list(
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert("id".to_string(), Shape::int([]));
+                        map
+                    },
+                    [],
+                ),
+                [],
+            ),
+        );
+
+        let root_shape = Shape::name("$root", []);
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes(named_shapes.clone());
+
+        let computed_batch_id =
+            selection!("$batch.id", spec).compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_batch_id.pretty_print(), "[...Int]");
+
+        let computed_first = selection!("$batch.id->first", spec)
+            .compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_first.pretty_print(), "One<Int, None>");
+
+        let computed_last = selection!("$batch.id->last", spec)
+            .compute_output_shape(&shape_context, root_shape.clone());
+        assert_eq!(computed_last.pretty_print(), "One<Int, None>");
+
+        assert_eq!(
+            selection!("$batch.id->jsonStringify", spec)
+                .shape()
+                .pretty_print(),
+            "String",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])->jsonStringify", spec)
+                .shape()
+                .pretty_print(),
+            "String",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map(@)->echo(@)", spec)
+                .shape()
+                .pretty_print(),
+            "[...$batch.id.*]",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map(@)->echo([@])", spec)
+                .shape()
+                .pretty_print(),
+            "[[...$batch.id.*]]",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo(@)", spec)
+                .shape()
+                .pretty_print(),
+            "[...[$batch.id.*]]",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])", spec)
+                .shape()
+                .pretty_print(),
+            "[[...[$batch.id.*]]]",
+        );
+
+        assert_eq!(
+            selection!("$batch.id->map([@])->echo([@])", spec)
+                .compute_output_shape(&shape_context, root_shape,)
+                .pretty_print(),
+            "[[...[Int]]]",
+        );
+    }
+
+    // Shared fixture for the lit_paths_* family of tests, which each exercise
+    // exactly one literal-headed path shape in isolation so a regression
+    // in any one case cannot mask or be masked by another.
+    fn lit_paths_data() -> JSON {
+        json!({
+            "value": {
+                "key": 123,
+            },
+        })
+    }
+
+    #[test]
+    fn test_lit_paths_string_head_first() {
+        assert_eq!(
+            selection!("$(\"a\")->first").apply_to(&lit_paths_data()),
+            (Some(json!("a")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_string_head_last_inner() {
+        assert_eq!(
+            selection!("$('asdf'->last)").apply_to(&lit_paths_data()),
+            (Some(json!("f")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_number_head_add_outer() {
+        assert_eq!(
+            selection!("$(1234)->add(1111)").apply_to(&lit_paths_data()),
+            (Some(json!(2345)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_number_head_add_inner() {
+        assert_eq!(
+            selection!("$(1234->add(1111))").apply_to(&lit_paths_data()),
+            (Some(json!(2345)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_path_head_mul_inner() {
+        assert_eq!(
+            selection!("$(value.key->mul(10))").apply_to(&lit_paths_data()),
+            (Some(json!(1230)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_path_head_mul_outer() {
+        assert_eq!(
+            selection!("$(value.key)->mul(10)").apply_to(&lit_paths_data()),
+            (Some(json!(1230)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_path_head_typeof_inner() {
+        assert_eq!(
+            selection!("$(value.key->typeof)").apply_to(&lit_paths_data()),
+            (Some(json!("number")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_path_head_typeof_outer() {
+        assert_eq!(
+            selection!("$(value.key)->typeof").apply_to(&lit_paths_data()),
+            (Some(json!("number")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_array_head_last_outer() {
+        assert_eq!(
+            selection!("$([1, 2, 3])->last").apply_to(&lit_paths_data()),
+            (Some(json!(3)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_array_head_first_inner() {
+        assert_eq!(
+            selection!("$([1, 2, 3]->first)").apply_to(&lit_paths_data()),
+            (Some(json!(1)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_object_head_key_outer() {
+        assert_eq!(
+            selection!("$({ a: 'ay', b: 1 }).a").apply_to(&lit_paths_data()),
+            (Some(json!("ay")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_object_head_key_inner() {
+        assert_eq!(
+            selection!("$({ a: 'ay', b: 2 }.a)").apply_to(&lit_paths_data()),
+            (Some(json!("ay")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_negative_literal_precedence() {
+        // The `->` has lower precedence than the unary `-`, so `-1` is a
+        // completed expression before `->add(10)` is applied. Result is 9
+        // rather than -11.
+        assert_eq!(
+            selection!("$(-1->add(10))").apply_to(&lit_paths_data()),
+            (Some(json!(9)), vec![]),
+        );
+    }
+
+    // V0_4 cousins: the same shapes, but with the `$(...)` wrapper dropped
+    // where the unified grammar now accepts the bare literal head at the
+    // top level. These pin the round-trip story down per-shape.
+
+    #[test]
+    fn test_lit_paths_v0_4_string_head_first() {
+        assert_eq!(
+            selection!(r#""a"->first"#, ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!("a")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_string_head_last() {
+        assert_eq!(
+            selection!("'asdf'->last", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!("f")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_number_head_add() {
+        assert_eq!(
+            selection!("1234->add(1111)", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!(2345)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_array_head_last() {
+        assert_eq!(
+            selection!("[1, 2, 3]->last", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!(3)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_array_head_first() {
+        assert_eq!(
+            selection!("[1, 2, 3]->first", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!(1)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_object_head_key() {
+        assert_eq!(
+            selection!("{ a: 'ay', b: 1 }.a", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!("ay")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_negative_literal_precedence() {
+        assert_eq!(
+            selection!("-1->add(10)", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!(9)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_path_head_mul() {
+        assert_eq!(
+            selection!("value.key->mul(10)", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!(1230)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_lit_paths_v0_4_path_head_typeof() {
+        assert_eq!(
+            selection!("value.key->typeof", ConnectSpec::V0_4).apply_to(&lit_paths_data()),
+            (Some(json!("number")), vec![]),
+        );
+    }
+
+    // Tests for dotted access to keys whose names happen to match reserved
+    // LitExpr shapes (true, false, null) or contain characters that require
+    // quoting. Each is isolated so a regression in any one case is legible.
+    fn reserved_key_data() -> JSON {
+        json!({
+            "true": "yes",
+            "false": "no",
+            "null": "nope",
+            "some property": "with spaces",
+            "weird \"quoted\" key": "escapes work",
+        })
+    }
+
+    #[test]
+    fn test_reserved_key_true() {
+        assert_eq!(
+            selection!("$.true").apply_to(&reserved_key_data()),
+            (Some(json!("yes")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_false() {
+        assert_eq!(
+            selection!("$.false").apply_to(&reserved_key_data()),
+            (Some(json!("no")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_null() {
+        assert_eq!(
+            selection!("$.null").apply_to(&reserved_key_data()),
+            (Some(json!("nope")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_quoted_with_space() {
+        assert_eq!(
+            selection!(r#"$."some property""#).apply_to(&reserved_key_data()),
+            (Some(json!("with spaces")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_quoted_with_escapes() {
+        assert_eq!(
+            selection!(r#"$."weird \"quoted\" key""#).apply_to(&reserved_key_data()),
+            (Some(json!("escapes work")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_v0_4_true() {
+        assert_eq!(
+            selection!("$.true", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!("yes")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_v0_4_false() {
+        assert_eq!(
+            selection!("$.false", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!("no")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_v0_4_null() {
+        assert_eq!(
+            selection!("$.null", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!("nope")), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_reserved_key_v0_4_quoted_with_space() {
+        assert_eq!(
+            selection!(r#"$."some property""#, ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!("with spaces")), vec![]),
+        );
+    }
+
+    // In v0.3 and earlier, bare `true`/`false`/`null` parse as naked field
+    // names (`{ true: $.true }` etc.). In v0.4 they parse as JSON literals
+    // (LitExpr::Bool / LitExpr::Null). These tests pin that divergence.
+
+    #[test]
+    fn test_bare_keyword_true_v0_3_is_field_name() {
+        assert_eq!(
+            selection!("true", ConnectSpec::V0_3).apply_to(&reserved_key_data()),
+            (Some(json!({ "true": "yes" })), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_keyword_false_v0_3_is_field_name() {
+        assert_eq!(
+            selection!("false", ConnectSpec::V0_3).apply_to(&reserved_key_data()),
+            (Some(json!({ "false": "no" })), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_keyword_null_v0_3_is_field_name() {
+        assert_eq!(
+            selection!("null", ConnectSpec::V0_3).apply_to(&reserved_key_data()),
+            (Some(json!({ "null": "nope" })), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_keyword_true_v0_4_is_literal() {
+        assert_eq!(
+            selection!("true", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!(true)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_keyword_false_v0_4_is_literal() {
+        assert_eq!(
+            selection!("false", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!(false)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_keyword_null_v0_4_is_literal() {
+        assert_eq!(
+            selection!("null", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    // Same divergence for bare quoted strings: in v0.3 a quoted string at the
+    // top level is a naked single-Key field name; in v0.4 it's a String
+    // literal.
+
+    #[test]
+    fn test_bare_quoted_string_v0_3_is_field_name() {
+        assert_eq!(
+            selection!(r#""some property""#, ConnectSpec::V0_3).apply_to(&reserved_key_data()),
+            (Some(json!({ "some property": "with spaces" })), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_quoted_string_v0_4_is_literal() {
+        assert_eq!(
+            selection!(r#""some property""#, ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!("some property")), vec![]),
+        );
+    }
+
+    // The `?` PathList::Question operator propagates None when applied to a
+    // null value. Under v0.4 it composes with bare literal heads at the top
+    // level; `null?` short-circuits before any tail runs, `true?` / `false?`
+    // pass through.
+
+    #[test]
+    fn test_bare_null_question_v0_4_short_circuits() {
+        assert_eq!(
+            selection!("null?", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (None, vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_true_question_v0_4_passes_through() {
+        assert_eq!(
+            selection!("true?", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!(true)), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_bare_false_question_v0_4_passes_through() {
+        assert_eq!(
+            selection!("false?", ConnectSpec::V0_4).apply_to(&reserved_key_data()),
+            (Some(json!(false)), vec![]),
+        );
+    }
+
+    #[rstest]
+    #[case::number("1234", "1234")]
+    #[case::negative_number("-1", "-1")]
+    #[case::bool_true("true", "true")]
+    #[case::bool_false("false", "false")]
+    #[case::null("null", "null")]
+    #[case::string(r#""hello""#, r#""hello""#)]
+    #[case::array("[1, 2, 3]", "[1, 2, 3]")]
+    #[case::object("{ a: 1, b: 2 }", "{ a: 1, b: 2 }")]
+    #[case::object_key_access("{ a: 1, b: 2 }.a", "1")]
+    #[case::array_last("[1, 2, 3]->last", "3")]
+    #[case::array_first("[1, 2, 3]->first", "1")]
+    #[case::number_add("1234->add(1111)", "Int")]
+    #[case::null_question("null?", "None")]
+    #[case::true_question("true?", "true")]
+    #[case::nullish_coalescing(r#"$args.maybe ?? "fallback""#, r#"One<$args.maybe?!, "fallback">"#)]
+    #[case::multiline_nested_object(
+        r#"{
+            a: 1,
+            b: {
+                x: "hi",
+                y: [1, 2, 3],
+            },
+        }"#,
+        r#"{ a: 1, b: { x: "hi", y: [1, 2, 3] } }"#
+    )]
+    #[case::multiline_array_of_objects(
+        r#"[
+            { id: 1, label: "one" },
+            { id: 2, label: "two" },
+        ]"#,
+        r#"[{ id: 1, label: "one" }, { id: 2, label: "two" }]"#
+    )]
+    #[case::multiline_method_chain(
+        r#"[1, 2, 3]
+            ->map(@)
+            ->first"#,
+        "1"
+    )]
+    #[case::multiline_object_with_comment(
+        r#"{
+            # pick the user id
+            userid: $args.userid,
+            name: "fixed",
+        }"#,
+        r#"{ name: "fixed", userid: $args.userid }"#
+    )]
+    #[case::multiline_nullish_coalescing_chain(
+        r#"$args.a
+            ?? $args.b
+            ?? "fallback""#,
+        r#"One<$args.a?!, $args.b?!, "fallback">"#
+    )]
+    #[case::multiline_copy_paste_json(
+        r#"{
+            hello: "world",
+            count: 3,
+            items: ["a", "b", "c"],
+            when: $args.when,
+        }"#,
+        "{\n  count: 3,\n  hello: \"world\",\n  items: [\"a\", \"b\", \"c\"],\n  when: $args.when,\n}"
+    )]
+    fn test_v0_4_top_level_shape_literal(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(
+            selection!(input, ConnectSpec::V0_4).shape().pretty_print(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_compute_output_shape_of_wide_selection_matches_pairwise_merge() {
+        let spec = ConnectSpec::V0_3;
+        let names = (0..300).map(|i| format!("field{i}")).collect::<Vec<_>>();
+
+        // Merging the shapes of all named selections at once must produce the
+        // same shape as merging them one at a time.
+        let pairwise = names.iter().fold(Shape::unknown([]), |acc, name| {
+            Shape::merge([acc, selection!(name, spec).shape()], [])
+        });
+        let wide = selection!(&names.join(" "), spec).shape();
+
+        assert_eq!(wide.pretty_print(), pairwise.pretty_print());
+        assert!(wide.pretty_print().contains("field299: $root.*.field299"));
+    }
+
+    // Spreads whose shapes are unions, fields that more than one spread
+    // outputs, and shapes that merge to null must still be merged one at a
+    // time, recording the same consumption as merging them one at a time.
+    #[rstest]
+    #[case::union_spreads(
+        "... a->match([1, 1], [@, 'x']) ... b->match([1, true], [@, 2.5]) c",
+        "All<1, { c: $root.*.c }>"
+    )]
+    #[case::repeated_field(
+        "x: a->match([1, 1], [@, 'x']) ... b { x: c->match([1, true], [@, 2.5]) } ... d { x: $(true) }",
+        "{ x: All<1, true> }"
+    )]
+    #[case::never_then_null(
+        "id: $.id ... $.c->match([1, 1], [@, 'x']) ... $(null) name: $.name",
+        "Never (err \"no value is both a number and an object\", \"no value is both a string and an object\")"
+    )]
+    #[case::union_merging_to_null(
+        "id: $.id ... $.c->match([1, null], [@, 'x']) name: $.name other: $.other",
+        "null"
+    )]
+    #[case::null_spread("a b ... $(null) c d", "null")]
+    #[case::union_then_objects(
+        "a ... $.u->match([1, { p: 1 }], [@, { q: 2 }]) b c",
+        "One<\n  { a: $root.*.a, b: $root.*.b, c: $root.*.c, p: 1 },\n  { a: $root.*.a, b: $root.*.b, c: $root.*.c, q: 2 },\n>"
+    )]
+    fn test_compute_output_shape_matches_pairwise_merge(
+        #[case] selection: &str,
+        #[case] expected: &str,
+    ) {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(selection, spec);
+        let TopLevelSelection::Named(sub) = &selection.inner else {
+            panic!("expected named selections");
+        };
+        let compute = |merge: &dyn Fn(&ShapeContext, Shape) -> Shape| {
+            let root = Shape::name("$root", []);
+            let context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes([("$root".to_string(), root.clone())]);
+            let shape = merge(&context, root.any_item([]));
+            let consumption = context.consumption().borrow().clone();
+            (shape, consumption)
+        };
+
+        let (shape, consumption) = compute(&|context, input| {
+            sub.compute_selections_shape_no_rebind(context, input.clone(), input)
+        });
+        let (pairwise_shape, pairwise_consumption) = compute(&|context, input| {
+            let locations = sub.shape_location(context.source_id());
+            let mut merged_shape = Shape::unknown([]);
+            for named_selection in sub.selections.iter() {
+                merged_shape = Shape::merge(
+                    [
+                        merged_shape,
+                        named_selection.compute_output_shape(context, input.clone(), input.clone()),
+                    ],
+                    locations.clone(),
+                );
+                if merged_shape.is_null() {
+                    break;
+                }
+            }
+            merged_shape
+        });
+
+        assert_eq!(shape, pairwise_shape);
+        assert_eq!(consumption, pairwise_consumption);
+        assert_eq!(shape.pretty_print(), expected);
+    }
+
+    #[test]
+    fn test_compute_output_shape() {
+        let spec = ConnectSpec::V0_3;
+
+        assert_eq!(selection!("", spec).shape().pretty_print(), "{}");
+
+        assert_eq!(
+            selection!("id name", spec).shape().pretty_print(),
+            "{ id: $root.*.id, name: $root.*.name }",
+        );
+
+        assert_eq!(
+            selection!("$.data { thisOrThat: $(maybe.this ?? maybe.that) }", spec)
+                .shape()
+                .pretty_print(),
+            "{ thisOrThat: One<$root.data.*.maybe.this?!, $root.data.*.maybe.that> }",
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                id
+                name
+                friends: friend_ids { id: @ }
+                alias: arrayOfArrays { x y }
+                ys: arrayOfArrays.y xs: arrayOfArrays.x
+            "#,
+                spec
+            )
+            .shape()
+            .pretty_print(),
+            // This output shape is wrong if $root.friend_ids turns out to be an
+            // array, and it's tricky to see how to transform the shape to what
+            // it would have been if we knew that, where friends: [...{ id:
+            // $root.friend_ids.* }] (note the * meaning any array index),
+            // because who's to say it's not the id field that should become the
+            // array, rather than the friends field?
+            r#"{
+  alias: {
+    x: $root.*.arrayOfArrays.*.x,
+    y: $root.*.arrayOfArrays.*.y,
+  },
+  friends: { id: $root.*.friend_ids.* },
+  id: $root.*.id,
+  name: $root.*.name,
+  xs: $root.*.arrayOfArrays.x,
+  ys: $root.*.arrayOfArrays.y,
+}"#,
+        );
+
+        assert_eq!(
+            selection!(
+                r#"
+                id
+                name
+                friends: friend_ids->map({ id: @ })
+                alias: arrayOfArrays { x y }
+                ys: arrayOfArrays.y xs: arrayOfArrays.x
+            "#,
+                spec
+            )
+            .shape()
+            .pretty_print(),
+            r#"{
+  alias: {
+    x: $root.*.arrayOfArrays.*.x,
+    y: $root.*.arrayOfArrays.*.y,
+  },
+  friends: [...{ id: $root.*.friend_ids.* }],
+  id: $root.*.id,
+  name: $root.*.name,
+  xs: $root.*.arrayOfArrays.x,
+  ys: $root.*.arrayOfArrays.y,
+}"#,
+        );
+
+        assert_eq!(
+            selection!("$->echo({ thrice: [@, @, @] })", spec)
+                .shape()
+                .pretty_print(),
+            "{ thrice: [$root, $root, $root] }",
+        );
+
+        assert_eq!(
+            selection!("$->echo({ thrice: [@, @, @] })->entries", spec)
+                .shape()
+                .pretty_print(),
+            "[{ key: \"thrice\", value: [$root, $root, $root] }]",
+        );
+
+        assert_eq!(
+            selection!("$->echo({ thrice: [@, @, @] })->entries.key", spec)
+                .shape()
+                .pretty_print(),
+            "[\"thrice\"]",
+        );
+
+        assert_eq!(
+            selection!("$->echo({ thrice: [@, @, @] })->entries.value", spec)
+                .shape()
+                .pretty_print(),
+            "[[$root, $root, $root]]",
+        );
+
+        assert_eq!(
+            selection!("$->echo({ wrapped: @ })->entries { k: key v: value }", spec)
+                .shape()
+                .pretty_print(),
+            "[{ k: \"wrapped\", v: $root }]",
+        );
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_key_access_with_existing_property(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "profile": {
+                    "name": "Alice"
+                }
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile.name", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(result, Some(json!("Alice")));
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_key_access_with_null_value(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data_null = json!({
+            "user": null
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile.name", spec)
+            .unwrap()
+            .apply_to(&data_null);
+        assert!(errors.is_empty());
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_key_access_on_non_object(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data_non_obj = json!({
+            "user": "not an object"
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile.name", spec)
+            .unwrap()
+            .apply_to(&data_non_obj);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .message()
+                .contains("Property .profile not found in string")
+        );
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_key_access_with_missing_property(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "other": "value"
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile.name", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .message()
+                .contains("Property .profile not found in object")
+        );
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_chained_optional_key_access(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "profile": {
+                    "name": "Alice"
+                }
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile?.name", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(result, Some(json!("Alice")));
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_chained_optional_access_with_null_in_middle(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data_partial_null = json!({
+            "user": {
+                "profile": null
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile?.name", spec)
+            .unwrap()
+            .apply_to(&data_partial_null);
+        assert!(errors.is_empty());
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_method_on_null(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "items": null
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.items?->first", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_method_with_valid_method(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "values": [1, 2, 3]
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.values?->first", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(result, Some(json!(1)));
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_method_with_unknown_method(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "values": [1, 2, 3]
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.values?->length", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message().contains("Method ->length not found"));
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_chaining_with_subselection_on_valid_data(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "profile": {
+                    "name": "Alice",
+                    "age": 30,
+                    "email": "alice@example.com"
+                }
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile { name age }", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(
+            result,
+            Some(json!({
+                "name": "Alice",
+                "age": 30
+            }))
+        );
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_chaining_with_subselection_on_null_data(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data_null = json!({
+            "user": null
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user?.profile { name age }", spec)
+            .unwrap()
+            .apply_to(&data_null);
+        assert!(errors.is_empty());
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_mixed_regular_and_optional_chaining_working_case(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "response": {
+                "data": {
+                    "user": {
+                        "profile": {
+                            "name": "Bob"
+                        }
+                    }
+                }
+            }
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.response.data?.user.profile.name", spec)
+                .unwrap()
+                .apply_to(&data);
+        assert!(errors.is_empty());
+        assert_eq!(result, Some(json!("Bob")));
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_mixed_regular_and_optional_chaining_with_null(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data_null_data = json!({
+            "response": {
+                "data": null
+            }
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.response.data?.user.profile.name", spec)
+                .unwrap()
+                .apply_to(&data_null_data);
+        assert!(errors.is_empty());
+        assert_eq!(result, None);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_with_valid_data(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "id": 123,
+                "name": "Alice"
+            }
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user ?{ id name }", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(
+            result,
+            Some(json!({
+                "id": 123,
+                "name": "Alice"
+            }))
+        );
+        assert_eq!(errors, vec![]);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_with_null_data(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": null
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user ?{ id name }", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(result, None);
+        assert_eq!(errors, vec![]);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_with_missing_property(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "other": "value"
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user ?{ id name }", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_with_non_object(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": "not an object"
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.user ?{ id name }", spec)
+            .unwrap()
+            .apply_to(&data);
+        // When data is not null but not an object, SubSelection still tries to access properties
+        // This results in errors, but returns the original value since no properties were found
+        assert_eq!(result, Some(json!("not an object")));
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors[0]
+                .message()
+                .contains("Property .id not found in string")
+        );
+        assert!(
+            errors[1]
+                .message()
+                .contains("Property .name not found in string")
+        );
+    }
+
+    #[test]
+    fn test_optional_field_selections() {
+        let spec = ConnectSpec::V0_3;
+        let author_selection = selection!("author? { age middleName? }", spec);
+        assert_debug_snapshot!(author_selection);
+        assert_eq!(
+            author_selection.pretty_print(),
+            "author? { age middleName? }",
+        );
+        assert_eq!(
+            author_selection.shape().pretty_print(),
+            r#"{ author: One<
+    {
+      age: $root.*.author?.*.age,
+      middleName: $root.*.author?.*.middleName?,
+    },
+    None,
+  > }"#,
+        );
+    }
+
+    #[test]
+    fn test_optional_input_shape_with_selection() {
+        let spec = ConnectSpec::V0_3;
+        let optional_author_shape_selection =
+            selection!("unreliableAuthor { age middleName? }", spec);
+
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes([(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "unreliableAuthor".to_string(),
+                            Shape::one(
+                                [
+                                    Shape::closed_record(
+                                        {
+                                            let mut map = Shape::empty_map();
+                                            map.insert("age".to_string(), Shape::int([]));
+                                            map.insert(
+                                                "middleName".to_string(),
+                                                Shape::one([Shape::string([]), Shape::none()], []),
+                                            );
+                                            map
+                                        },
+                                        [],
+                                    ),
+                                    Shape::none(),
+                                ],
+                                [],
+                            ),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            )]);
+
+        assert_eq!(
+            optional_author_shape_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes().get("$root").unwrap().clone(),
+                )
+                .pretty_print(),
+            "{ unreliableAuthor: One<{ age: Int, middleName: One<String, None> }, None> }",
+        );
+    }
+
+    // TODO Reenable these tests in ConnectSpec::V0_4 when we support ... spread
+    // syntax and abstract types.
+    /** #[cfg(test)]
+    mod spread {
+        use serde_json_bytes::Value as JSON;
+        use serde_json_bytes::json;
+        use shape::Shape;
+        use shape::location::SourceId;
+
+        use crate::connectors::ConnectSpec;
+        use crate::connectors::json_selection::ShapeContext;
+
+        #[derive(Debug)]
+        pub(super) struct SetupItems {
+            pub data: JSON,
+            pub shape_context: ShapeContext,
+            pub root_shape: Shape,
+        }
+
+        pub(super) fn setup(spec: ConnectSpec) -> SetupItems {
+            let a_b_data = json!({
+                "a": { "phonetic": "ay" },
+                "b": { "phonetic": "bee" },
+            });
+
+            let a_b_data_shape = Shape::from_json_bytes(&a_b_data);
+
+            let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes([("$root".to_string(), a_b_data_shape)]);
+
+            let root_shape = shape_context.named_shapes().get("$root").unwrap().clone();
+
+            SetupItems {
+                data: a_b_data,
+                shape_context,
+                root_shape,
+            }
+        }
+    }
+
+    #[test]
+    fn test_spread_syntax_spread_a() {
+        let spec = ConnectSpec::V0_4;
+        let spread::SetupItems {
+            data: a_b_data,
+            shape_context,
+            root_shape,
+        } = spread::setup(spec);
+
+        let spread_a = selection!("...a", spec);
+        assert_eq!(
+            spread_a.apply_to(&a_b_data),
+            (Some(json!({"phonetic": "ay"})), vec![]),
+        );
+        assert_eq!(spread_a.shape().pretty_print(), "$root.*.a",);
+        assert_eq!(
+            spread_a
+                .compute_output_shape(&shape_context, root_shape)
+                .pretty_print(),
+            "{ phonetic: \"ay\" }",
+        );
+    }
+    **/
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_nested_optional_selection_sets(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "profile": {
+                    "name": "Alice",
+                    "email": "alice@example.com"
+                }
+            }
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.user.profile ?{ name email }", spec)
+                .unwrap()
+                .apply_to(&data);
+        assert_eq!(
+            result,
+            Some(json!({
+                "name": "Alice",
+                "email": "alice@example.com"
+            }))
+        );
+        assert_eq!(errors, vec![]);
+
+        // Test with null nested data
+        let data_with_null_profile = json!({
+            "user": {
+                "profile": null
+            }
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.user.profile ?{ name email }", spec)
+                .unwrap()
+                .apply_to(&data_with_null_profile);
+        assert_eq!(result, None);
+        assert_eq!(errors, vec![]);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_mixed_optional_selection_and_optional_chaining(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "user": {
+                "id": 123,
+                "profile": null
+            }
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.user ?{ id profileName: profile?.name }", spec)
+                .unwrap()
+                .apply_to(&data);
+        assert_eq!(
+            result,
+            Some(json!({
+                "id": 123
+            }))
+        );
+        assert_eq!(errors, vec![]);
+
+        // Test with missing user
+        let data_no_user = json!({
+            "other": "value"
+        });
+
+        let (result, errors) =
+            JSONSelection::parse_with_spec("$.user ?{ id profileName: profile?.name }", spec)
+                .unwrap()
+                .apply_to(&data_no_user);
+        assert_eq!(result, None);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_parsing(#[case] spec: ConnectSpec) {
+        // Test that the parser correctly handles optional selection sets
+        let selection = JSONSelection::parse_with_spec("$.user? { id name }", spec).unwrap();
+        assert_eq!(selection.pretty_print(), "$.user? { id name }");
+
+        // Test with nested optional selection sets
+        let selection = JSONSelection::parse_with_spec("$.user.profile? { name }", spec).unwrap();
+        assert_eq!(selection.pretty_print(), "$.user.profile? { name }");
+
+        // Test mixed with regular selection sets
+        let selection =
+            JSONSelection::parse_with_spec("$.user? { id profile { name } }", spec).unwrap();
+        assert_eq!(selection.pretty_print(), "$.user? { id profile { name } }");
+    }
+
+    #[rstest]
+    #[case::v0_3(ConnectSpec::V0_3)]
+    #[case::v0_4(ConnectSpec::V0_4)]
+    #[case::v0_5(ConnectSpec::V0_5)]
+    fn test_optional_selection_set_with_arrays(#[case] spec: ConnectSpec) {
+        use serde_json_bytes::json;
+
+        let data = json!({
+            "users": [
+                {
+                    "id": 1,
+                    "name": "Alice"
+                },
+                null,
+                {
+                    "id": 3,
+                    "name": "Charlie"
+                }
+            ]
+        });
+
+        let (result, errors) = JSONSelection::parse_with_spec("$.users ?{ id name }", spec)
+            .unwrap()
+            .apply_to(&data);
+        assert_eq!(
+            result,
+            Some(json!([
+                {
+                    "id": 1,
+                    "name": "Alice"
+                },
+                null,
+                {
+                    "id": 3,
+                    "name": "Charlie"
+                }
+            ]))
+        );
+
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors[0]
+                .message()
+                .contains("Property .id not found in null")
+        );
+        assert!(
+            errors[1]
+                .message()
+                .contains("Property .name not found in null")
+        );
+    }
+
+    // TODO Reenable these tests in ConnectSpec::V0_4 when we support ... spread
+    // syntax and abstract types.
+    /*
+    #[test]
+    fn test_spread_syntax_a_spread_b() {
+        let spec = ConnectSpec::V0_4;
+        let spread::SetupItems {
+            data: a_b_data,
+            shape_context,
+            root_shape,
+        } = spread::setup(spec);
+
+        let a_spread_b = selection!("a...b", spec);
+        assert_eq!(
+            a_spread_b.apply_to(&a_b_data),
+            (
+                Some(json!({"a": { "phonetic": "ay" }, "phonetic": "bee" })),
+                vec![]
+            ),
+        );
+        assert_eq!(
+            a_spread_b.shape().pretty_print(),
+            "All<$root.*.b, { a: $root.*.a }>",
+        );
+        assert_eq!(
+            a_spread_b
+                .compute_output_shape(&shape_context, root_shape)
+                .pretty_print(),
+            "{ a: { phonetic: \"ay\" }, phonetic: \"bee\" }",
+        );
+    }
+
+    #[test]
+    fn test_spread_syntax_spread_a_b() {
+        let spec = ConnectSpec::V0_4;
+        let spread::SetupItems {
+            data: a_b_data,
+            shape_context,
+            root_shape,
+        } = spread::setup(spec);
+
+        let spread_a_b = selection!("...a b", spec);
+        assert_eq!(
+            spread_a_b.apply_to(&a_b_data),
+            (
+                Some(json!({"phonetic": "ay", "b": { "phonetic": "bee" }})),
+                vec![]
+            ),
+        );
+        assert_eq!(
+            spread_a_b.shape().pretty_print(),
+            "All<$root.*.a, { b: $root.*.b }>",
+        );
+        assert_eq!(
+            spread_a_b
+                .compute_output_shape(&shape_context, root_shape)
+                .pretty_print(),
+            "{ b: { phonetic: \"bee\" }, phonetic: \"ay\" }",
+        );
+    }
+
+    #[test]
+    fn test_spread_match_none() {
+        let spec = ConnectSpec::V0_4;
+
+        let sel = selection!(
+            "before ...condition->match([true, { matched: true }]) after",
+            spec
+        );
+        assert_eq!(
+            sel.shape().pretty_print(),
+            r#"One<
+  {
+    after: $root.*.after,
+    before: $root.*.before,
+    matched: true,
+  },
+  { after: $root.*.after, before: $root.*.before },
+>"#,
+        );
+
+        assert_eq!(
+            sel.apply_to(&json!({
+                "before": "before value",
+                "after": "after value",
+                "condition": true,
+            })),
+            (
+                Some(json!({
+                    "before": "before value",
+                    "after": "after value",
+                    "matched": true,
+                })),
+                vec![],
+            ),
+        );
+
+        assert_eq!(
+            sel.apply_to(&json!({
+                "before": "before value",
+                "after": "after value",
+                "condition": false,
+            })),
+            (
+                Some(json!({
+                    "before": "before value",
+                    "after": "after value",
+                })),
+                vec![
+                    ApplyToError::new(
+                        "Method ->match did not match any [candidate, value] pair".to_string(),
+                        vec![json!("condition"), json!("->match")],
+                        Some(21..53),
+                        spec,
+                    ),
+                    ApplyToError::new(
+                        "Inlined path produced no value".to_string(),
+                        vec![],
+                        Some(10..53),
+                        spec,
+                    )
+                ],
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    mod spread_with_match {
+        use crate::connectors::ConnectSpec;
+        use crate::connectors::JSONSelection;
+        use crate::selection;
+
+        pub(super) fn get_selection(spec: ConnectSpec) -> JSONSelection {
+            let sel = selection!(
+                r#"
+                upc
+                ... type->match(
+                    ["book", {
+                        __typename: "Book",
+                        title: title,
+                        author: { name: author.name },
+                    }],
+                    ["movie", {
+                        __typename: "Movie",
+                        title: title,
+                        director: director.name,
+                    }],
+                    ["magazine", {
+                        __typename: "Magazine",
+                        title: title,
+                        editor: editor.name,
+                    }],
+                    ["dummy", {}],
+                    [@, null],
+                )
+                "#,
+                spec
+            );
+
+            assert_eq!(
+                sel.shape().pretty_print(),
+                r#"One<
+  {
+    __typename: "Book",
+    author: { name: $root.*.author.name },
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Movie",
+    director: $root.*.director.name,
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Magazine",
+    editor: $root.*.editor.name,
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  { upc: $root.*.upc },
+  null,
+>"#
+            );
+
+            sel
+        }
+    }
+
+    #[test]
+    fn test_spread_with_match_book() {
+        let spec = ConnectSpec::V0_4;
+        let sel = spread_with_match::get_selection(spec);
+
+        let book_data = json!({
+            "upc": "1234567890",
+            "type": "book",
+            "title": "The Great Gatsby",
+            "author": { "name": "F. Scott Fitzgerald" },
+        });
+        assert_eq!(
+            sel.apply_to(&book_data),
+            (
+                Some(json!({
+                    "__typename": "Book",
+                    "upc": "1234567890",
+                    "title": "The Great Gatsby",
+                    "author": { "name": "F. Scott Fitzgerald" },
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_with_match_movie() {
+        let spec = ConnectSpec::V0_4;
+        let sel = spread_with_match::get_selection(spec);
+
+        let movie_data = json!({
+            "upc": "0987654321",
+            "type": "movie",
+            "title": "Inception",
+            "director": { "name": "Christopher Nolan" },
+        });
+        assert_eq!(
+            sel.apply_to(&movie_data),
+            (
+                Some(json!({
+                    "__typename": "Movie",
+                    "upc": "0987654321",
+                    "title": "Inception",
+                    "director": "Christopher Nolan",
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_with_match_magazine() {
+        let spec = ConnectSpec::V0_4;
+        let sel = spread_with_match::get_selection(spec);
+
+        let magazine_data = json!({
+            "upc": "1122334455",
+            "type": "magazine",
+            "title": "National Geographic",
+            "editor": { "name": "Susan Goldberg" },
+        });
+        assert_eq!(
+            sel.apply_to(&magazine_data),
+            (
+                Some(json!({
+                    "__typename": "Magazine",
+                    "upc": "1122334455",
+                    "title": "National Geographic",
+                    "editor": "Susan Goldberg",
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_with_match_dummy() {
+        let spec = ConnectSpec::V0_4;
+        let sel = spread_with_match::get_selection(spec);
+
+        let dummy_data = json!({
+            "upc": "5566778899",
+            "type": "dummy",
+        });
+        assert_eq!(
+            sel.apply_to(&dummy_data),
+            (
+                Some(json!({
+                    "upc": "5566778899",
+                })),
+                vec![],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_with_match_unknown() {
+        let spec = ConnectSpec::V0_4;
+        let sel = spread_with_match::get_selection(spec);
+
+        let unknown_data = json!({
+            "upc": "9988776655",
+            "type": "music",
+            "title": "The White Stripes",
+            "artist": { "name": "Jack White" },
+        });
+        assert_eq!(sel.apply_to(&unknown_data), (Some(json!(null)), vec![]));
+    }
+
+    #[test]
+    fn test_spread_null() {
+        let spec = ConnectSpec::V0_4;
+        assert_eq!(
+            selection!("...$(null)", spec).apply_to(&json!({ "ignored": "data" })),
+            (Some(json!(null)), vec![]),
+        );
+        assert_eq!(
+            selection!("ignored ...$(null)", spec).apply_to(&json!({ "ignored": "data" })),
+            (Some(json!(null)), vec![]),
+        );
+        assert_eq!(
+            selection!("...$(null) ignored", spec).apply_to(&json!({ "ignored": "data" })),
+            (Some(json!(null)), vec![]),
+        );
+        assert_eq!(
+            selection!("group: { a ...b }", spec).apply_to(&json!({ "a": "ay", "b": null })),
+            (Some(json!({ "group": null })), vec![]),
+        );
+    }
+
+    #[test]
+    fn test_spread_missing() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(
+            selection!("a ...missing z", spec).apply_to(&json!({ "a": "ay", "z": "zee" })),
+            (
+                Some(json!({
+                    "a": "ay",
+                    "z": "zee",
+                })),
+                vec![
+                    ApplyToError::new(
+                        "Property .missing not found in object".to_string(),
+                        vec![json!("missing")],
+                        Some(5..12),
+                        spec,
+                    ),
+                    ApplyToError::new(
+                        "Inlined path produced no value".to_string(),
+                        vec![],
+                        Some(5..12),
+                        spec,
+                    ),
+                ],
+            ),
+        );
+
+        assert_eq!(
+            selection!("a ...$(missing) z", spec).apply_to(&json!({ "a": "ay", "z": "zee" })),
+            (
+                Some(json!({
+                    "a": "ay",
+                    "z": "zee",
+                })),
+                vec![
+                    ApplyToError::new(
+                        "Property .missing not found in object".to_string(),
+                        vec![json!("missing")],
+                        Some(7..14),
+                        spec,
+                    ),
+                    ApplyToError::new(
+                        "Inlined path produced no value".to_string(),
+                        vec![],
+                        Some(5..15),
+                        spec,
+                    ),
+                ],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_invalid_numbers() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(
+            selection!("...invalid", spec).apply_to(&json!({ "invalid": 123 })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not number".to_string(),
+                    vec![],
+                    Some(3..10),
+                    spec,
+                )],
+            ),
+        );
+
+        assert_eq!(
+            selection!(" ... $( invalid ) ", spec).apply_to(&json!({ "invalid": 234 })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not number".to_string(),
+                    vec![],
+                    Some(5..17),
+                    spec,
+                )],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_invalid_bools() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(
+            selection!("...invalid", spec).apply_to(&json!({ "invalid": true })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not boolean".to_string(),
+                    vec![],
+                    Some(3..10),
+                    spec,
+                )],
+            ),
+        );
+
+        assert_eq!(
+            selection!("...$(invalid)", spec).apply_to(&json!({ "invalid": false })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not boolean".to_string(),
+                    vec![],
+                    Some(3..13),
+                    spec,
+                )],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_invalid_strings() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(
+            selection!("...invalid", spec).apply_to(&json!({ "invalid": "string" })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not string".to_string(),
+                    vec![],
+                    Some(3..10),
+                    spec,
+                )],
+            ),
+        );
+
+        assert_eq!(
+            selection!("...$(invalid)", spec).apply_to(&json!({ "invalid": "string" })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not string".to_string(),
+                    vec![],
+                    Some(3..13),
+                    spec,
+                )],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_invalid_arrays() {
+        let spec = ConnectSpec::V0_4;
+
+        // The ... operator only works for objects for now, as it spreads their
+        // keys into some larger object. We may support array spreading in the
+        // future, but it will probably work somewhat differently (it may be
+        // available only within literal expressions, for example).
+        assert_eq!(
+            selection!("...invalid", spec).apply_to(&json!({ "invalid": [1, 2, 3] })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not array".to_string(),
+                    vec![],
+                    Some(3..10),
+                    spec,
+                )],
+            ),
+        );
+
+        assert_eq!(
+            selection!("...$(invalid)", spec).apply_to(&json!({ "invalid": [] })),
+            (
+                Some(json!({})),
+                vec![ApplyToError::new(
+                    "Expected object or null, not array".to_string(),
+                    vec![],
+                    Some(3..13),
+                    spec,
+                )],
+            ),
+        );
+    }
+
+    #[test]
+    fn test_spread_output_shapes() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(selection!("...a", spec).shape().pretty_print(), "$root.*.a");
+        assert_eq!(
+            selection!("...$(a)", spec).shape().pretty_print(),
+            "$root.*.a",
+        );
+
+        assert_eq!(
+            selection!("a ...b", spec).shape().pretty_print(),
+            "All<$root.*.b, { a: $root.*.a }>",
+        );
+        assert_eq!(
+            selection!("a ...$(b)", spec).shape().pretty_print(),
+            "All<$root.*.b, { a: $root.*.a }>",
+        );
+
+        assert_eq!(
+            selection!("a ...b c", spec).shape().pretty_print(),
+            "All<$root.*.b, { a: $root.*.a, c: $root.*.c }>",
+        );
+        assert_eq!(
+            selection!("a ...$(b) c", spec).shape().pretty_print(),
+            "All<$root.*.b, { a: $root.*.a, c: $root.*.c }>",
+        );
+    }
+    **/
+
+    #[test]
+    fn null_coalescing_should_return_left_when_left_not_null() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$('Foo' ?? 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!("Foo")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_return_right_when_left_is_null() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!("Bar")), vec![]),
+        );
+    }
+
+    #[test]
+    fn none_coalescing_should_return_left_when_left_not_none() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$('Foo' ?! 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!("Foo")), vec![]),
+        );
+    }
+
+    #[test]
+    fn none_coalescing_should_preserve_null_when_left_is_null() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?! 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    #[test]
+    fn nullish_coalescing_should_return_final_null() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(missing ?? null)", spec).apply_to(&json!({})),
+            (Some(json!(null)), vec![]),
+        );
+        assert_eq!(
+            selection!("$(missing ?! null)", spec).apply_to(&json!({})),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    #[test]
+    fn nullish_coalescing_should_return_final_none() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(missing ?? also_missing)", spec).apply_to(&json!({})),
+            (
+                None,
+                vec![
+                    ApplyToError::new(
+                        "Property .missing not found in object".to_string(),
+                        vec![json!("missing")],
+                        Some(2..9),
+                        spec,
+                    ),
+                    ApplyToError::new(
+                        "Property .also_missing not found in object".to_string(),
+                        vec![json!("also_missing")],
+                        Some(13..25),
+                        spec,
+                    ),
+                ]
+            ),
+        );
+        assert_eq!(
+            selection!("maybe: $(missing ?! also_missing)", spec).apply_to(&json!({})),
+            (
+                Some(json!({})),
+                vec![
+                    ApplyToError::new(
+                        "Property .missing not found in object".to_string(),
+                        vec![json!("missing")],
+                        Some(9..16),
+                        spec,
+                    ),
+                    ApplyToError::new(
+                        "Property .also_missing not found in object".to_string(),
+                        vec![json!("also_missing")],
+                        Some(20..32),
+                        spec,
+                    ),
+                ]
+            ),
+        );
+    }
+
+    #[test]
+    fn coalescing_operators_should_return_earlier_values_if_later_missing() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(1234 ?? missing)", spec).apply_to(&json!({})),
+            (Some(json!(1234)), vec![]),
+        );
+        assert_eq!(
+            selection!("$(item ?? missing)", spec).apply_to(&json!({ "item": 1234 })),
+            (Some(json!(1234)), vec![]),
+        );
+        assert_eq!(
+            selection!("$(item ?? missing)", spec).apply_to(&json!({ "item": null })),
+            (
+                None,
+                vec![ApplyToError::new(
+                    "Property .missing not found in object".to_string(),
+                    vec![json!("missing")],
+                    Some(10..17),
+                    spec,
+                )]
+            ),
+        );
+        assert_eq!(
+            selection!("$(null ?! missing)", spec).apply_to(&json!({})),
+            (Some(json!(null)), vec![]),
+        );
+        assert_eq!(
+            selection!("$(item ?! missing)", spec).apply_to(&json!({ "item": null })),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_chain_left_to_right_when_multiple_nulls() {
+        // TODO: TEST HERE
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? null ?? 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!("Bar")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_stop_at_first_non_null_when_chaining() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$('Foo' ?? null ?? 'Bar')", spec).apply_to(&json!({})),
+            (Some(json!("Foo")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_fallback_when_field_is_null() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"field1": null, "field2": "value2"});
+        assert_eq!(
+            selection!("$($.field1 ?? $.field2)", spec).apply_to(&data),
+            (Some(json!("value2")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_use_literal_fallback_when_all_fields_null() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"field1": null, "field3": null});
+        assert_eq!(
+            selection!("$($.field1 ?? $.field3 ?? 'fallback')", spec).apply_to(&data),
+            (Some(json!("fallback")), vec![]),
+        );
+    }
+
+    #[test]
+    fn none_coalescing_should_preserve_null_field() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"nullField": null});
+        assert_eq!(
+            selection!("$($.nullField ?! 'fallback')", spec).apply_to(&data),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    #[test]
+    fn none_coalescing_should_replace_missing_field() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"nullField": null});
+        assert_eq!(
+            selection!("$($.missingField ?! 'fallback')", spec).apply_to(&data),
+            (Some(json!("fallback")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_replace_null_field() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"nullField": null});
+        assert_eq!(
+            selection!("$($.nullField ?? 'fallback')", spec).apply_to(&data),
+            (Some(json!("fallback")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_replace_missing_field() {
+        let spec = ConnectSpec::V0_3;
+        let data = json!({"nullField": null});
+        assert_eq!(
+            selection!("$($.missingField ?? 'fallback')", spec).apply_to(&data),
+            (Some(json!("fallback")), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_preserve_number_type() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? 42)", spec).apply_to(&json!({})),
+            (Some(json!(42)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_preserve_boolean_type() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? true)", spec).apply_to(&json!({})),
+            (Some(json!(true)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_preserve_object_type() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? {'key': 'value'})", spec).apply_to(&json!({})),
+            (Some(json!({"key": "value"})), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_preserve_array_type() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$(null ?? [1, 2, 3])", spec).apply_to(&json!({})),
+            (Some(json!([1, 2, 3])), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_fallback_when_null_used_as_method_arg() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$.a->add(b ?? c)", spec).apply_to(&json!({"a": 5, "b": null, "c": 5})),
+            (Some(json!(10)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_fallback_when_none_used_as_method_arg() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$.a->add(missing ?? c)", spec)
+                .apply_to(&json!({"a": 5, "b": null, "c": 5})),
+            (Some(json!(10)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_not_fallback_when_not_null_used_as_method_arg() {
+        let spec = ConnectSpec::V0_3;
+        assert_eq!(
+            selection!("$.a->add(b ?? c)", spec).apply_to(&json!({"a": 5, "b": 3, "c": 5})),
+            (Some(json!(8)), vec![]),
+        );
+    }
+
+    #[test]
+    fn null_coalescing_should_allow_multiple_method_args() {
+        let spec = ConnectSpec::V0_3;
+        let add_selection = selection!("a->add(b ?? c, missing ?! c)", spec);
+        assert_eq!(
+            add_selection.apply_to(&json!({ "a": 5, "b": 3, "c": 7 })),
+            (Some(json!(15)), vec![]),
+        );
+        assert_eq!(
+            add_selection.apply_to(&json!({ "a": 5, "b": null, "c": 7 })),
+            (Some(json!(19)), vec![]),
+        );
+    }
+
+    // TODO Reenable this test in ConnectSpec::V0_4 when we support ... spread
+    // syntax and abstract types.
+    /*
+    #[test]
+    fn none_coalescing_should_allow_defaulting_match() {
+        let spec = ConnectSpec::V0_4;
+
+        assert_eq!(
+            selection!("a ...b->match(['match', { b: 'world' }])", spec)
+                .apply_to(&json!({ "a": "hello", "b": "match" })),
+            (Some(json!({ "a": "hello", "b": "world" })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("a ...$(b->match(['match', { b: 'world' }]) ?? {})", spec)
+                .apply_to(&json!({ "a": "hello", "b": "match" })),
+            (Some(json!({ "a": "hello", "b": "world" })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("a ...$(b->match(['match', { b: 'world' }]) ?? {})", spec)
+                .apply_to(&json!({ "a": "hello", "b": "bogus" })),
+            (Some(json!({ "a": "hello" })), vec![]),
+        );
+
+        assert_eq!(
+            selection!("a ...$(b->match(['match', { b: 'world' }]) ?! null)", spec)
+                .apply_to(&json!({ "a": "hello", "b": "bogus" })),
+            (Some(json!(null)), vec![]),
+        );
+    }
+
+    #[test]
+    fn nullish_coalescing_chains_should_have_predictable_shape() {
+        let spec = ConnectSpec::V0_4;
+
+        let chain = selection!("$(1 ?? true ?? null)", spec);
+        assert_eq!(chain.shape().pretty_print(), "One<1, true, null>",);
+
+        let complex_chain = selection!(
+            r#"
+            ... $(
+                message?->echo({ __typename: "Good", message: @ }) ??
+                error?->echo({ __typename: "Bad", error: @ }) ??
+                null
+            )
+        "#,
+            spec
+        );
+        assert_eq!(
+            complex_chain.shape().pretty_print(),
+            "One<{ __typename: \"Good\", message: $root.*.message }, { __typename: \"Bad\", error: $root.*.error }, null>",
+        );
+
+        let complex_chain_no_fallback = selection!(
+            r#"
+            ... $(
+                message?->echo({ __typename: "Good", message: @ }) ??
+                error?->echo({ __typename: "Bad", error: @ })
+            )
+        "#,
+            spec
+        );
+        assert_eq!(
+            complex_chain_no_fallback.shape().pretty_print(),
+            // None should not be an option here, even though both message and
+            // error might not exist, because the ... spread operator spreads
+            // nothing in that case.
+            // "One<{ __typename: \"Good\", message: $root.*.message }, { __typename: \"Bad\", error: $root.*.error }, None>",
+            "One<{ __typename: \"Good\", message: $root.*.message }, { __typename: \"Bad\", error: $root.*.error }, {}>",
+        );
+        assert_eq!(
+            complex_chain_no_fallback.apply_to(&json!({})),
+            (Some(json!({})), vec![
+                ApplyToError::new(
+                    "Inlined path produced no value".to_string(),
+                    vec![],
+                    Some(17..165),
+                    spec,
+                ),
+            ]),
+        );
+    }
+    */
+
+    #[test]
+    fn wtf_operator_should_not_exclude_null_from_nullable_union_shape() {
+        let spec = ConnectSpec::V0_3;
+
+        // We're also testing the ?? operator here, to show the difference.
+        let nullish_selection = selection!("$($value ?? 'fallback')", spec);
+        let wtf_selection = selection!("$($value ?! 'fallback')", spec);
+
+        let mut vars = IndexMap::default();
+        vars.insert("$value".to_string(), json!(null));
+
+        assert_eq!(
+            nullish_selection.apply_with_vars(&json!({}), &vars),
+            (Some(json!("fallback")), vec![]),
+        );
+
+        assert_eq!(
+            wtf_selection.apply_with_vars(&json!({}), &vars),
+            (Some(json!(null)), vec![]),
+        );
+
+        let mut vars_with_string_value = IndexMap::default();
+        vars_with_string_value.insert("$value".to_string(), json!("fine"));
+
+        assert_eq!(
+            nullish_selection.apply_with_vars(&json!({}), &vars_with_string_value),
+            (Some(json!("fine")), vec![]),
+        );
+
+        assert_eq!(
+            wtf_selection.apply_with_vars(&json!({}), &vars_with_string_value),
+            (Some(json!("fine")), vec![]),
+        );
+
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes([(
+                "$value".to_string(),
+                Shape::one([Shape::string([]), Shape::null([]), Shape::none()], []),
+            )]);
+
+        assert_eq!(
+            nullish_selection
+                // Since we're not using the input shape $root here, it should
+                // not be a problem to pass Shape::none() as $root.
+                .compute_output_shape(&shape_context, Shape::none())
+                .pretty_print(),
+            "String",
+        );
+
+        assert_eq!(
+            wtf_selection
+                // Since we're not using the input shape $root here, it should
+                // not be a problem to pass Shape::none() as $root.
+                .compute_output_shape(&shape_context, Shape::none())
+                .pretty_print(),
+            "One<String, null>",
+        );
+    }
+
+    #[test]
+    fn question_operator_should_map_null_to_none() {
+        let spec = ConnectSpec::V0_3;
+
+        let nullish_string_selection = selection!("$(stringOrNull?)", spec);
+        assert_eq!(
+            nullish_string_selection.apply_to(&json!({"stringOrNull": "a string"})),
+            (Some(json!("a string")), vec![]),
+        );
+        assert_eq!(
+            nullish_string_selection.apply_to(&json!({"stringOrNull": null})),
+            (None, vec![]),
+        );
+        assert_eq!(
+            nullish_string_selection.apply_to(&json!({})),
+            (None, vec![]),
+        );
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "stringOrNull".to_string(),
+                            Shape::one([Shape::string([]), Shape::null([])], []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        assert_eq!(
+            nullish_string_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "One<String, None>",
+        );
+    }
+
+    #[test]
+    fn question_operator_should_add_none_to_named_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let string_or_null_expr = selection!("$(stringOrNull?)", spec);
+
+        assert_eq!(
+            string_or_null_expr.shape().pretty_print(),
+            "$root.stringOrNull?",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_nested_objects() {
+        let spec = ConnectSpec::V0_3;
+
+        let nested_selection = selection!("$(user?.profile?.name)", spec);
+        assert_eq!(
+            nested_selection.apply_to(&json!({"user": {"profile": {"name": "Alice"}}})),
+            (Some(json!("Alice")), vec![]),
+        );
+        assert_eq!(
+            nested_selection.apply_to(&json!({"user": null})),
+            (None, vec![]),
+        );
+        assert_eq!(
+            nested_selection.apply_to(&json!({"user": {"profile": null}})),
+            (None, vec![]),
+        );
+        assert_eq!(nested_selection.apply_to(&json!({})), (None, vec![]));
+    }
+
+    #[test]
+    fn question_operator_with_nested_objects_shape() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            let person_shape = Shape::closed_record(
+                {
+                    let mut map = Shape::empty_map();
+                    map.insert("name".to_string(), Shape::string([]));
+                    map.insert("age".to_string(), Shape::int([]));
+                    map
+                },
+                [],
+            );
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert("person".to_string(), person_shape);
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let nested_selection = selection!("$(person?.name)", spec);
+        assert_eq!(
+            nested_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "One<String, None>",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_array_access() {
+        let spec = ConnectSpec::V0_3;
+
+        let array_selection = selection!("$(items?->first?.name)", spec);
+        assert_eq!(
+            array_selection.apply_to(&json!({"items": [{"name": "first"}]})),
+            (Some(json!("first")), vec![]),
+        );
+        assert_eq!(
+            array_selection.apply_to(&json!({"items": []})),
+            (None, vec![]),
+        );
+        assert_eq!(
+            array_selection.apply_to(&json!({"items": null})),
+            (None, vec![]),
+        );
+        assert_eq!(array_selection.apply_to(&json!({})), (None, vec![]));
+    }
+
+    #[test]
+    fn question_operator_with_union_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "unionField".to_string(),
+                            Shape::one([Shape::string([]), Shape::int([]), Shape::null([])], []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let union_selection = selection!("$(unionField?)", spec);
+
+        assert_eq!(
+            union_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes().get("$root").unwrap().clone(),
+                )
+                .pretty_print(),
+            "One<String, Int, None>",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_union_shapes_non_nullable() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "value".to_string(),
+                            Shape::one([Shape::string([]), Shape::int([])], []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let union_selection = selection!("$(value?)", spec);
+        assert_eq!(
+            union_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "One<String, Int>",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_error_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "errorField".to_string(),
+                            Shape::error_with_partial(
+                                "Test error".to_string(),
+                                Shape::one([Shape::string([]), Shape::null([])], []),
+                                [],
+                            ),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let error_selection = selection!("$(errorField?)", spec);
+
+        let result_shape = error_selection.compute_output_shape(
+            &shape_context,
+            shape_context.named_shapes().get("$root").unwrap().clone(),
+        );
+
+        // The question mark should be applied recursively to the partial shape within the error
+        assert!(result_shape.pretty_print().contains("(err "));
+        assert!(result_shape.pretty_print().contains("None"));
+    }
+
+    #[test]
+    fn question_operator_with_simple_error_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "error".to_string(),
+                            Shape::error("Something went wrong".to_string(), []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let error_selection = selection!("$(error?)", spec);
+        assert_eq!(
+            error_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "Unknown (err \"Something went wrong\")",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_all_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "allField".to_string(),
+                            Shape::all(
+                                [
+                                    Shape::string([]),
+                                    Shape::one([Shape::string([]), Shape::null([])], []),
+                                ],
+                                [],
+                            ),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let all_selection = selection!("$(allField?)", spec);
+
+        assert_eq!(
+            all_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes().get("$root").unwrap().clone(),
+                )
+                .pretty_print(),
+            "One<String, None>",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_simple_all_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "intersection".to_string(),
+                            Shape::all([Shape::string([]), Shape::int([])], []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let all_selection = selection!("$(intersection?)", spec);
+        assert_eq!(
+            all_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "All<String, Int>",
+        );
+    }
+
+    #[test]
+    fn question_operator_preserves_non_null_shapes() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert("nonNullString".to_string(), Shape::string([]));
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let non_null_selection = selection!("$(nonNullString?)", spec);
+
+        assert_eq!(
+            non_null_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes().get("$root").unwrap().clone(),
+                )
+                .pretty_print(),
+            "String",
+        );
+    }
+
+    #[test]
+    fn question_operator_with_multiple_operators_in_chain() {
+        let spec = ConnectSpec::V0_3;
+
+        // Test combining ? with other operators
+        let mixed_chain_selection = selection!("$(field? ?? 'default')", spec);
+        assert_eq!(
+            mixed_chain_selection.apply_to(&json!({"field": "value"})),
+            (Some(json!("value")), vec![]),
+        );
+        assert_eq!(
+            mixed_chain_selection.apply_to(&json!({"field": null})),
+            (Some(json!("default")), vec![]),
+        );
+        assert_eq!(
+            mixed_chain_selection.apply_to(&json!({})),
+            (Some(json!("default")), vec![]),
+        );
+    }
+
+    #[test]
+    fn question_operator_chained_shape() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "level1".to_string(),
+                            Shape::closed_record(
+                                {
+                                    let mut inner_map = Shape::empty_map();
+                                    inner_map.insert(
+                                        "level2".to_string(),
+                                        Shape::closed_record(
+                                            {
+                                                let mut inner_inner_map = Shape::empty_map();
+                                                inner_inner_map
+                                                    .insert("value".to_string(), Shape::string([]));
+                                                inner_inner_map
+                                            },
+                                            [],
+                                        ),
+                                    );
+                                    inner_map
+                                },
+                                [],
+                            ),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            );
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let chained_selection = selection!("$(level1?.level2?.value)", spec);
+        assert_eq!(
+            chained_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "One<String, None>",
+        );
+    }
+
+    #[test]
+    fn question_operator_direct_null_input_shape() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = {
+            let mut named_shapes = IndexMap::default();
+
+            named_shapes.insert("$root".to_string(), Shape::null([]));
+
+            ShapeContext::new(SourceId::Other("JSONSelection".into()))
+                .with_spec(spec)
+                .with_named_shapes(named_shapes)
+        };
+
+        let null_selection = selection!("$root?", spec);
+
+        assert_eq!(
+            null_selection
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes().get("$root").unwrap().clone(),
+                )
+                .pretty_print(),
+            "None",
+        );
+    }
+
+    #[test]
+    fn test_unknown_name() {
+        let spec = ConnectSpec::V0_3;
+        let sel = selection!("book.author? { name age? }", spec);
+        assert_eq!(
+            sel.shape().pretty_print(),
+            r#"One<
+  {
+    age: $root.book.author?.*.age?,
+    name: $root.book.author?.*.name,
+  },
+  None,
+>"#,
+        );
+    }
+
+    #[test]
+    fn test_nullish_coalescing_shape() {
+        let spec = ConnectSpec::V0_3;
+        let sel = selection!("$(a ?? b ?? c)", spec);
+        assert_eq!(
+            sel.shape().pretty_print(),
+            "One<$root.a?!, $root.b?!, $root.c>",
+        );
+
+        let mut named_shapes = IndexMap::default();
+        named_shapes.insert(
+            "$root".to_string(),
+            Shape::closed_record(
+                {
+                    let mut map = Shape::empty_map();
+                    map.insert(
+                        "a".to_string(),
+                        Shape::one([Shape::string([]), Shape::null([])], []),
+                    );
+                    map.insert("b".to_string(), Shape::string([]));
+                    map.insert("c".to_string(), Shape::int([]));
+                    map
+                },
+                [],
+            ),
+        );
+
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes(named_shapes);
+
+        assert_eq!(
+            sel.compute_output_shape(
+                &shape_context,
+                shape_context.named_shapes().get("$root").unwrap().clone(),
+            )
+            .pretty_print(),
+            "One<String, Int>",
+        );
+    }
+
+    #[test]
+    fn test_none_coalescing_shape() {
+        let spec = ConnectSpec::V0_3;
+        let sel = selection!("$(a ?! b ?! c)", spec);
+        assert_eq!(
+            sel.shape().pretty_print(),
+            "One<$root.a!, $root.b!, $root.c>",
+        );
+
+        let mut named_shapes = IndexMap::default();
+        named_shapes.insert(
+            "$root".to_string(),
+            Shape::closed_record(
+                {
+                    let mut map = Shape::empty_map();
+                    map.insert(
+                        "a".to_string(),
+                        Shape::one([Shape::string([]), Shape::null([])], []),
+                    );
+                    map.insert(
+                        "b".to_string(),
+                        Shape::one([Shape::string([]), Shape::none()], []),
+                    );
+                    map.insert("c".to_string(), Shape::null([]));
+                    map
+                },
+                [],
+            ),
+        );
+
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes(named_shapes);
+
+        assert_eq!(
+            sel.compute_output_shape(
+                &shape_context,
+                shape_context.named_shapes().get("$root").unwrap().clone(),
+            )
+            .pretty_print(),
+            "One<String, null>",
+        );
+    }
+
+    #[test]
+    fn test_none_coalescing_with_literal_fallback() {
+        let spec = ConnectSpec::V0_3;
+
+        let shape_context = ShapeContext::new(SourceId::Other("JSONSelection".into()))
+            .with_spec(spec)
+            .with_named_shapes([(
+                "$root".to_string(),
+                Shape::closed_record(
+                    {
+                        let mut map = Shape::empty_map();
+                        map.insert(
+                            "optional".to_string(),
+                            Shape::one([Shape::string([]), Shape::none()], []),
+                        );
+                        map
+                    },
+                    [],
+                ),
+            )]);
+
+        let none_coalesce = selection!("$(optional ?! 'fallback')", spec);
+        assert_eq!(
+            none_coalesce
+                .compute_output_shape(
+                    &shape_context,
+                    shape_context.named_shapes()["$root"].clone()
+                )
+                .pretty_print(),
+            "String",
+        );
+    }
+
+    /// Test that multiple `... ->match()` spreads produce correct shape structure.
+    ///
+    /// When both spreads set __typename, the cartesian product creates
+    /// intersections like All<"Book", "Digital"> which are unsatisfiable.
+    /// This test documents the shape structure before filtering.
+    #[test]
+    fn test_multiple_spreads_shape_with_conflicting_typename() {
+        let spec = ConnectSpec::V0_4;
+
+        // Two spreads both setting __typename - creates conflicts
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... format->match(
+                ['digital', { __typename: $('Digital'), downloadUrl: $.url }],
+                ['physical', { __typename: $('Physical'), weight: $.weight }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // Cartesian product of spreads creates unsatisfiable All<> intersections
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: All<"Book", "Digital">,
+    downloadUrl: $root.*.url,
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: All<"Book", "Physical">,
+    title: $root.*.title,
+    upc: $root.*.upc,
+    weight: $root.*.weight,
+  },
+  null,
+  {
+    __typename: All<"Film", "Digital">,
+    director: $root.*.director,
+    downloadUrl: $root.*.url,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: All<"Film", "Physical">,
+    director: $root.*.director,
+    upc: $root.*.upc,
+    weight: $root.*.weight,
+  },
+>"#,
+        );
+    }
+
+    /// Test multiple spreads where only the first sets __typename (valid pattern).
+    ///
+    /// This is the correct pattern: first spread determines __typename,
+    /// second spread adds fields without conflicting.
+    #[test]
+    fn test_multiple_spreads_shape_without_typename_conflict() {
+        let spec = ConnectSpec::V0_4;
+
+        // First spread sets __typename, second adds fields without __typename
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... format->match(
+                ['digital', { downloadUrl: $.url }],
+                ['physical', { weight: $.weight }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // No conflict: second spread adds fields but doesn't override __typename
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: "Book",
+    downloadUrl: $root.*.url,
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Book",
+    title: $root.*.title,
+    upc: $root.*.upc,
+    weight: $root.*.weight,
+  },
+  null,
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    downloadUrl: $root.*.url,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    upc: $root.*.upc,
+    weight: $root.*.weight,
+  },
+>"#,
+        );
+    }
+
+    /// Test single spread with ->match() to verify baseline behavior.
+    #[test]
+    fn test_single_spread_shape() {
+        let spec = ConnectSpec::V0_4;
+
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // Single spread produces clean One<> with distinct __typename values
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: "Book",
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    upc: $root.*.upc,
+  },
+  null,
+>"#,
+        );
+    }
+
+    /// Test multiple spreads where both specify the same __typename.
+    ///
+    /// When both spreads set __typename to the same value (e.g., "Book"),
+    /// the second spread matches category->match independently.
+    #[test]
+    fn test_multiple_spreads_same_typename_no_conflict() {
+        let spec = ConnectSpec::V0_4;
+
+        // Both spreads match 'book' and set __typename: "Book"
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { __typename: $('Book'), author: $.author }]
+            )
+            "#,
+            spec
+        );
+
+        // Cartesian product: each first spread case × each second spread case
+        // - Book (first) + Book (second) = Book with both fields
+        // - Book (first) + no match (second) = Book without author
+        // - Film (first) + Book (second) = conflicting All<"Film", "Book">
+        // - Film (first) + no match (second) = Film unchanged
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: "Book",
+    author: $root.*.author,
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Book",
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: All<"Film", "Book">,
+    author: $root.*.author,
+    director: $root.*.director,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    upc: $root.*.upc,
+  },
+  null,
+>"#,
+        );
+    }
+
+    /// Test field shadowing when second spread overwrites a field from first.
+    #[test]
+    fn test_multiple_spreads_field_shadowing() {
+        let spec = ConnectSpec::V0_4;
+
+        // First spread sets greeting: "hello", second sets greeting: "goodbye"
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), greeting: $('hello') }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { __typename: $('Book'), greeting: $('goodbye') }]
+            )
+            "#,
+            spec
+        );
+
+        // Two Book shapes depending on whether second spread matched:
+        // - Both matched: greeting is All<"hello", "goodbye">
+        // - Only first matched: greeting is just "hello"
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: "Book",
+    greeting: All<"hello", "goodbye">,
+    upc: $root.*.upc,
+  },
+  { __typename: "Book", greeting: "hello", upc: $root.*.upc },
+  null,
+>"#,
+        );
+    }
+
+    /// Test that second spread without __typename adds to all shapes.
+    #[test]
+    fn test_second_spread_no_typename_adds_to_all() {
+        let spec = ConnectSpec::V0_4;
+
+        // First spread sets __typename, second spread has no __typename
+        // so its fields merge with ALL shapes from first spread
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book') }],
+                ['film', { __typename: $('Film') }],
+                [@, null]
+            )
+            ... format->match(
+                ['digital', { isDigital: $(true) }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // isDigital field appears on both Book and Film shapes
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  { __typename: "Book", isDigital: true, upc: $root.*.upc },
+  null,
+  { __typename: "Film", isDigital: true, upc: $root.*.upc },
+>"#,
+        );
+    }
+
+    /// Test cartesian product of spreads with different match conditions.
+    ///
+    /// Shape analysis is conservative: it creates all combinations of spread
+    /// results, even when runtime conditions would prevent some combinations.
+    /// Here, the second spread only matches 'book', but shape analysis still
+    /// creates Film × extraField combinations since it doesn't track that
+    /// category='film' would never match ['book', ...].
+    #[test]
+    fn test_spread_cartesian_product_conservative() {
+        let spec = ConnectSpec::V0_4;
+
+        // First spread handles all categories, second only handles 'book'
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { extraField: $('only for books') }]
+            )
+            "#,
+            spec
+        );
+
+        // Shape analysis conservatively creates ALL combinations:
+        // - Book × extraField-matched = Book with extraField
+        // - Book × extraField-unmatched = Book without extraField
+        // - Film × extraField-matched = Film with extraField (even though runtime won't produce this)
+        // - Film × extraField-unmatched = Film without extraField
+        assert_eq!(
+            selection.shape().pretty_print(),
+            r#"One<
+  {
+    __typename: "Book",
+    extraField: "only for books",
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Book",
+    title: $root.*.title,
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    extraField: "only for books",
+    upc: $root.*.upc,
+  },
+  {
+    __typename: "Film",
+    director: $root.*.director,
+    upc: $root.*.upc,
+  },
+  null,
+>"#,
+        );
+    }
+
+    // ==========================================
+    // Runtime tests for multiple spread behavior
+    // ==========================================
+
+    /// Runtime test: Both spreads match 'book', fields are merged.
+    #[test]
+    fn test_multiple_spreads_runtime_both_match_book() {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { __typename: $('Book'), author: $.author }]
+            )
+            "#,
+            spec
+        );
+
+        // Book: both spreads match, fields merge
+        let book_data = json!({
+            "upc": "123",
+            "category": "book",
+            "title": "Great Gatsby",
+            "author": "Fitzgerald"
+        });
+        let (result, errors) = selection.apply_to(&book_data);
+        assert_eq!(errors, vec![]);
+        assert_eq!(
+            result,
+            Some(json!({
+                "upc": "123",
+                "__typename": "Book",
+                "title": "Great Gatsby",
+                "author": "Fitzgerald"
+            }))
+        );
+    }
+
+    /// Runtime test: First spread matches 'film', second doesn't match.
+    #[test]
+    fn test_multiple_spreads_runtime_film_no_second_match() {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { __typename: $('Book'), author: $.author }]
+            )
+            "#,
+            spec
+        );
+
+        // Film: first spread matches, second doesn't (category != 'book')
+        let film_data = json!({
+            "upc": "456",
+            "category": "film",
+            "director": "Nolan"
+        });
+        let (result, errors) = selection.apply_to(&film_data);
+        // Second spread produces no-match error but result is still valid
+        assert!(!errors.is_empty());
+        assert_eq!(
+            result,
+            Some(json!({
+                "upc": "456",
+                "__typename": "Film",
+                "director": "Nolan"
+            }))
+        );
+    }
+
+    /// Runtime test: Field shadowing - second spread overwrites field.
+    #[test]
+    fn test_multiple_spreads_runtime_field_shadowing() {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), greeting: $('hello') }],
+                [@, null]
+            )
+            ... category->match(
+                ['book', { __typename: $('Book'), greeting: $('goodbye') }]
+            )
+            "#,
+            spec
+        );
+
+        // Book: both spreads match, second overwrites 'greeting'
+        let book_data = json!({
+            "upc": "789",
+            "category": "book"
+        });
+        let (result, errors) = selection.apply_to(&book_data);
+        assert_eq!(errors, vec![]);
+        // Second spread's greeting: 'goodbye' shadows first's 'hello'
+        assert_eq!(
+            result,
+            Some(json!({
+                "upc": "789",
+                "__typename": "Book",
+                "greeting": "goodbye"
+            }))
+        );
+    }
+
+    /// Runtime test: Second spread without __typename adds to all types.
+    #[test]
+    fn test_multiple_spreads_runtime_no_typename_adds_to_all() {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book') }],
+                ['film', { __typename: $('Film') }],
+                [@, null]
+            )
+            ... format->match(
+                ['digital', { isDigital: $(true) }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // Book + digital: both spreads match
+        let book_digital = json!({
+            "upc": "111",
+            "category": "book",
+            "format": "digital"
+        });
+        let (result, errors) = selection.apply_to(&book_digital);
+        assert_eq!(errors, vec![]);
+        assert_eq!(
+            result,
+            Some(json!({
+                "upc": "111",
+                "__typename": "Book",
+                "isDigital": true
+            }))
+        );
+
+        // Film + digital: both spreads match
+        let film_digital = json!({
+            "upc": "222",
+            "category": "film",
+            "format": "digital"
+        });
+        let (result, errors) = selection.apply_to(&film_digital);
+        assert_eq!(errors, vec![]);
+        assert_eq!(
+            result,
+            Some(json!({
+                "upc": "222",
+                "__typename": "Film",
+                "isDigital": true
+            }))
+        );
+
+        // Book + physical: first spread matches, second spread hits [@, null] fallback
+        // which returns null for the whole spread, resulting in null for the output
+        let book_physical = json!({
+            "upc": "333",
+            "category": "book",
+            "format": "physical"
+        });
+        let (result, errors) = selection.apply_to(&book_physical);
+        assert_eq!(errors, vec![]);
+        // When second spread returns null via [@, null], the entire result becomes null
+        assert_eq!(result, Some(json!(null)));
+    }
+
+    /// Runtime test: Category doesn't match any case, returns null.
+    #[test]
+    fn test_multiple_spreads_runtime_no_match_returns_null() {
+        let spec = ConnectSpec::V0_4;
+        let selection = selection!(
+            r#"
+            upc
+            ... category->match(
+                ['book', { __typename: $('Book'), title: $.title }],
+                ['film', { __typename: $('Film'), director: $.director }],
+                [@, null]
+            )
+            "#,
+            spec
+        );
+
+        // Unknown category: matches [@, null] fallback
+        let unknown_data = json!({
+            "upc": "999",
+            "category": "unknown"
+        });
+        let (result, errors) = selection.apply_to(&unknown_data);
+        assert_eq!(errors, vec![]);
+        assert_eq!(result, Some(json!(null)));
+    }
+}

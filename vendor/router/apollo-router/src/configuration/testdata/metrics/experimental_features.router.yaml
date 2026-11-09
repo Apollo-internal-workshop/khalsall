@@ -1,0 +1,42 @@
+experimental_type_conditioned_fetching: true
+
+experimental_hoist_orphan_errors:
+  all:
+    enabled: true
+
+experimental_mock_subgraphs:
+  test_subgraph:
+    query:
+      hello: "world"
+
+traffic_shaping:
+  all:
+    http2: enable
+    experimental_http2_keep_alive_interval: 30s
+    experimental_http2_keep_alive_timeout: 20s
+
+supergraph:
+  log_on_broken_pipe: true
+  query_planning:
+    experimental_plans_limit: 10
+    experimental_paths_limit: 10
+    experimental_cooperative_cancellation:
+      enabled: true
+
+persisted_queries:
+  enabled: true
+  experimental_prewarm_query_plan_cache:
+    on_startup: true
+
+telemetry:
+  apollo:
+    experimental_local_field_metrics: true
+    otlp_endpoint: "https://custom.example.com/otlp"
+    otlp_tracing_protocol: grpc
+    otlp_metrics_protocol: http
+  exporters:
+    tracing:
+      response_trace_id:
+        enabled: true
+
+expose_query_plan: true

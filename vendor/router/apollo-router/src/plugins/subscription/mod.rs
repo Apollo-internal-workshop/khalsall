@@ -1,0 +1,1214 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ops::ControlFlow;
+use std::time::Duration;
+
+use multimap::MultiMap;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde::Serialize;
+use tower::BoxError;
+use tower::ServiceBuilder;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use self::callback::CallbackService;
+use self::notification::Notify;
+use crate::Endpoint;
+use crate::ListenAddr;
+use crate::configuration::subgraph::SubgraphConfiguration;
+use crate::graphql;
+use crate::json_ext::Object;
+use crate::layers::ServiceBuilderExt;
+use crate::plugin::Plugin;
+use crate::plugin::PluginInit;
+use crate::protocols::websocket::WebSocketProtocol;
+use crate::query_planner::OperationKind;
+use crate::services::SubgraphRequest;
+use crate::services::SubgraphResponse;
+
+mod callback;
+mod execution;
+mod fetch;
+pub(crate) mod notification;
+// Only pub(crate) for tests: tests that rely on subscription internals should probably
+// be moved into the plugin.
+pub(crate) mod subgraph;
+
+pub(crate) use callback::SUBSCRIPTION_CALLBACK_HMAC_KEY;
+pub(crate) use execution::SUBSCRIPTION_CONFIG_RELOAD_EXTENSION_CODE;
+pub(crate) use execution::SUBSCRIPTION_MAX_LIFETIME_EXTENSION_CODE;
+pub(crate) use execution::SUBSCRIPTION_SCHEMA_RELOAD_EXTENSION_CODE;
+pub(crate) use execution::SubscriptionExecutionLayer;
+pub(crate) use execution::SubscriptionTaskParams;
+pub(crate) use fetch::fetch_service_handle_subscription;
+
+pub(crate) const APOLLO_SUBSCRIPTION_PLUGIN: &str = "apollo.subscription";
+pub(crate) const SUBSCRIPTION_ERROR_EXTENSION_KEY: &str = "apollo::subscriptions::fatal_error";
+pub(crate) const SUBSCRIPTION_WS_CUSTOM_CONNECTION_PARAMS: &str =
+    "apollo.subscription.custom_connection_params";
+pub(crate) const SUBSCRIPTION_SUBGRAPH_NAME_CONTEXT_KEY: &str =
+    "apollo::subscription::subgraph_name";
+
+#[derive(Debug, Clone)]
+pub(crate) struct Subscription {
+    notify: Notify<String, graphql::Response>,
+    callback_hmac_key: Option<String>,
+    pub(crate) config: SubscriptionConfig,
+}
+
+/// Subscriptions configuration
+#[apollo_configuration::configuration]
+#[derive(Serialize)]
+pub(crate) struct SubscriptionConfig {
+    /// Enable subscription
+    #[config(default = true)]
+    pub(crate) enabled: bool,
+    /// Select a subscription mode (callback or passthrough)
+    pub(crate) mode: SubscriptionModeConfig,
+    /// Configure subgraph subscription deduplication
+    // Generic with a hand-written merging Deserialize, which the macro can't express.
+    #[config(skip_validate)]
+    pub(crate) deduplication: SubgraphConfiguration<DeduplicationConfig>,
+    /// This is a limit to only have maximum X opened subscriptions at the same time. By default if it's not set there is no limit.
+    pub(crate) max_opened_subscriptions: Option<usize>,
+    /// It represent the capacity of the in memory queue to know how many events we can keep in a buffer
+    pub(crate) queue_capacity: Option<usize>,
+    /// Maximum lifetime of a subscription. After this duration the subscription will be closed. Accepts durations like '10m', '1h', '30s'. By default there is no limit.
+    #[schemars(with = "Option<String>", default)]
+    pub(crate) max_lifetime: Option<apollo_configuration::types::Duration>,
+}
+
+/// Subscription deduplication configuration
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct DeduplicationConfig {
+    /// Enable subgraph subscription deduplication. When enabled, multiple identical requests to the same subgraph will share one WebSocket connection in passthrough mode.
+    /// (default: true)
+    pub(crate) enabled: bool,
+    /// List of headers to ignore for deduplication. Even if these headers are different, the subscription request is considered identical.
+    /// For example, if you forward the "User-Agent" header, but the subgraph doesn't depend on the value of that header,
+    /// adding it to this list will let the router dedupe subgraph subscriptions even if the header value is different.
+    pub(crate) ignored_headers: HashSet<String>,
+    /// When true, JWT claims from the authorization context are excluded from the deduplication key.
+    /// Use this when your subgraph data does not vary by user identity and you want authenticated
+    /// users to share a single subgraph WebSocket connection.
+    ///
+    /// Security note: with this enabled, a user may receive events from a connection originally
+    /// opened by a different user.  Only enable this when subgraph subscription data is truly
+    /// non-personalized.
+    /// (default: false)
+    pub(crate) ignore_auth_context: bool,
+}
+
+impl Default for DeduplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignored_headers: Default::default(),
+            ignore_auth_context: false,
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq, Serialize)]
+pub(crate) struct SubscriptionModeConfig {
+    /// Enable callback mode for subgraph(s)
+    pub(crate) callback: Option<CallbackMode>,
+    /// Enable passthrough mode for subgraph(s)
+    pub(crate) passthrough: Option<SubgraphPassthroughMode>,
+}
+
+impl SubscriptionModeConfig {
+    pub(crate) fn get_subgraph_config(&self, service_name: &str) -> Option<SubscriptionMode> {
+        if let Some(passthrough_cfg) = &self.passthrough {
+            if let Some(subgraph_cfg) = passthrough_cfg.subgraphs.get(service_name) {
+                return SubscriptionMode::Passthrough(subgraph_cfg.clone()).into();
+            }
+            if let Some(all_cfg) = &passthrough_cfg.all {
+                return SubscriptionMode::Passthrough(all_cfg.clone()).into();
+            }
+        }
+
+        if let Some(callback_cfg) = &self.callback
+            && (callback_cfg.subgraphs.contains(service_name) || callback_cfg.subgraphs.is_empty())
+        {
+            let callback_cfg = CallbackMode {
+                public_url: callback_cfg.public_url.clone(),
+                heartbeat_interval: callback_cfg.heartbeat_interval,
+                listen: callback_cfg.listen.clone(),
+                path: callback_cfg.path.clone(),
+                subgraphs: HashSet::new(), // We don't need it
+            };
+            return SubscriptionMode::Callback(callback_cfg).into();
+        }
+
+        None
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq, Serialize)]
+pub(crate) struct SubgraphPassthroughMode {
+    /// Configuration for all subgraphs
+    pub(crate) all: Option<WebSocketConfiguration>,
+    /// Configuration for specific subgraphs
+    pub(crate) subgraphs: HashMap<String, WebSocketConfiguration>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SubscriptionMode {
+    /// Using a callback url
+    Callback(CallbackMode),
+    /// Using websocket to directly connect to subgraph
+    Passthrough(WebSocketConfiguration),
+}
+
+/// Using a callback url
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq, Serialize)]
+pub(crate) struct CallbackMode {
+    #[schemars(with = "String")]
+    /// URL used to access this router instance, including the path configured on the Router
+    #[config(required)]
+    pub(crate) public_url: apollo_configuration::types::Url,
+
+    /// Heartbeat interval for callback mode (default: 5secs)
+    #[config(default = HeartbeatInterval::new_enabled())]
+    pub(crate) heartbeat_interval: HeartbeatInterval,
+    // `skip_serializing` We don't need it in the context
+    /// Listen address on which the callback must listen (default: 127.0.0.1:4000)
+    // ListenAddr's UnixSocket variant holds a PathBuf, which has no Validate impl.
+    #[config(skip_validate)]
+    #[serde(skip_serializing)]
+    pub(crate) listen: Option<ListenAddr>,
+    // `skip_serializing` We don't need it in the context
+    /// Specify on which path you want to listen for callbacks (default: /callback)
+    #[serde(skip_serializing)]
+    pub(crate) path: Option<String>,
+
+    /// Specify on which subgraph we enable the callback mode for subscription
+    /// If empty it applies to all subgraphs (passthrough mode takes precedence)
+    // HashSet has no Validate impl.
+    #[config(skip_validate)]
+    pub(crate) subgraphs: HashSet<String>,
+}
+
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum HeartbeatInterval {
+    /// disable heartbeat
+    Disabled(Disabled),
+    /// enable with default interval of 5s
+    Enabled(Enabled),
+    /// enable with custom interval, e.g. '100ms', '10s' or '1m'
+    #[schemars(with = "String")]
+    Duration(apollo_configuration::types::Duration),
+}
+
+impl HeartbeatInterval {
+    pub(crate) fn new_enabled() -> Self {
+        Self::Enabled(Enabled::Enabled)
+    }
+    pub(crate) fn new_disabled() -> Self {
+        Self::Disabled(Disabled::Disabled)
+    }
+    pub(crate) fn into_option(self) -> Option<Duration> {
+        match self {
+            Self::Disabled(_) => None,
+            Self::Enabled(_) => Some(Duration::from_secs(5)),
+            Self::Duration(duration) => Some(*duration),
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum Disabled {
+    Disabled,
+}
+
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum Enabled {
+    Enabled,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq, Eq, Serialize)]
+/// WebSocket configuration for a specific subgraph
+pub(crate) struct WebSocketConfiguration {
+    /// Path on which WebSockets are listening
+    pub(crate) path: Option<String>,
+    /// Which WebSocket GraphQL protocol to use for this subgraph possible values are: 'graphql_ws' | 'graphql_transport_ws' (default: graphql_ws)
+    pub(crate) protocol: WebSocketProtocol,
+    /// Heartbeat interval for graphql-ws protocol (default: disabled)
+    #[config(default = HeartbeatInterval::new_disabled())]
+    pub(crate) heartbeat_interval: HeartbeatInterval,
+    /// Maximum number of times to attempt to reconnect a dropped WebSocket subscription connection.
+    /// The default is 0 (no reconnection attempts).
+    pub(crate) max_reconnect_attempts: u32,
+    /// Delay before each WebSocket reconnection attempt. Accepts durations like '1s', '500ms'. When unset (null) the default is 1 second; use '0s' for no delay.
+    #[schemars(with = "Option<String>", default)]
+    pub(crate) reconnect_delay: Option<apollo_configuration::types::Duration>,
+}
+
+fn default_callback_path() -> String {
+    String::from("/callback")
+}
+
+pub(crate) fn default_listen_addr() -> ListenAddr {
+    ListenAddr::SocketAddr("127.0.0.1:4000".parse().expect("valid ListenAddr"))
+}
+
+#[async_trait::async_trait]
+impl Plugin for Subscription {
+    type Config = SubscriptionConfig;
+
+    async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
+        let mut callback_hmac_key = None;
+        if let Some(callback) = &init.config.mode.callback {
+            callback_hmac_key = Some(
+                SUBSCRIPTION_CALLBACK_HMAC_KEY
+                    .get_or_init(|| Uuid::new_v4().to_string())
+                    .clone(),
+            );
+            #[cfg(not(test))]
+            init.notify
+                .set_ttl(callback.heartbeat_interval.into_option())
+                .await?;
+            #[cfg(test)]
+            let _ = callback;
+        }
+
+        Ok(Subscription {
+            notify: init.notify,
+            callback_hmac_key,
+            config: init.config,
+        })
+    }
+
+    fn subgraph_service(
+        &self,
+        _subgraph_name: &str,
+        service: crate::services::subgraph::BoxCloneService,
+    ) -> crate::services::subgraph::BoxCloneService {
+        let enabled = self.config.enabled
+            && (self.config.mode.callback.is_some() || self.config.mode.passthrough.is_some());
+        ServiceBuilder::new()
+            .checkpoint_async(move |req: SubgraphRequest| async move {
+                if req.operation_kind == OperationKind::Subscription && !enabled {
+                    Ok(ControlFlow::Break(
+                        SubgraphResponse::builder()
+                            .context(req.context)
+                            .subgraph_name(req.subgraph_name)
+                            .error(
+                                graphql::Error::builder()
+                                    .message("cannot execute a subscription if it's not enabled in the configuration")
+                                    .extension_code("SUBSCRIPTION_DISABLED")
+                                    .build(),
+                            )
+                            .extensions(Object::default())
+                            .build()
+                            .answered_by_router(),
+                    ))
+                } else {
+                    Ok(ControlFlow::Continue(req))
+                }
+            })
+            .service(service)
+            .boxed_clone()
+    }
+
+    fn web_endpoints(&self) -> MultiMap<ListenAddr, Endpoint> {
+        let mut map = MultiMap::new();
+
+        if let Some(CallbackMode { listen, path, .. }) = &self.config.mode.callback {
+            let path = path.clone().unwrap_or_else(default_callback_path);
+            let path = path.trim_end_matches('/');
+            let callback_hmac_key = self
+                .callback_hmac_key
+                .clone()
+                .expect("cannot run subscription in callback mode without a hmac key");
+            let endpoint = Endpoint::from_router_service(
+                format!("{path}/{{callback}}"),
+                CallbackService::new(self.notify.clone(), path.to_string(), callback_hmac_key)
+                    .boxed_clone(),
+            );
+            map.insert(listen.clone().unwrap_or_else(default_listen_addr), endpoint);
+        }
+
+        map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+    use http::HeaderName;
+    use http::HeaderValue;
+    use serde_json::Value;
+    use tower::Service;
+    use tower::ServiceExt;
+    use tower::util::BoxCloneService;
+
+    use super::*;
+    use crate::assert_response_eq_ignoring_error_id;
+    use crate::graphql::Request;
+    use crate::http_ext;
+    use crate::plugin::DynPlugin;
+    use crate::plugins::subscription::callback::create_verifier;
+    use crate::plugins::subscription::notification::Notify;
+    use crate::services::SubgraphRequest;
+    use crate::services::SubgraphResponse;
+    use crate::services::router;
+    use crate::services::router::body;
+    use crate::uplink::license_enforcement::LicenseState;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn it_test_callback_endpoint() {
+        let mut notify = Notify::builder().build();
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
+            .expect("Plugin not found")
+            .create_instance(
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
+                "enabled": true,
+                "mode": {
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
+                        "path": "/subscription/callback",
+                        "subgraphs": ["test"]
+                    }
+                }
+            }"#,
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let http_req_prom = http::Request::get("http://localhost:4000/subscription/callback")
+            .body(body::empty())
+            .unwrap();
+        let mut web_endpoint = dyn_plugin
+            .web_endpoints()
+            .into_iter()
+            .next()
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_router();
+        let resp = web_endpoint
+            .as_service()
+            .ready()
+            .await
+            .unwrap()
+            .call(http_req_prom)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        let new_sub_id = uuid::Uuid::new_v4().to_string();
+        let (handler, _created, _) = notify
+            .create_or_subscribe(new_sub_id.clone(), true, None)
+            .await
+            .unwrap();
+        let verifier = create_verifier(&new_sub_id).unwrap();
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(
+                callback::SubscriptionPayload::Check {
+                    id: new_sub_id.clone(),
+                    verifier: verifier.clone(),
+                },
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(HeaderName::from_static(
+                    callback::CALLBACK_SUBSCRIPTION_HEADER_NAME
+                ))
+                .unwrap(),
+            HeaderValue::from_static(callback::CALLBACK_SUBSCRIPTION_HEADER_VALUE)
+        );
+
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(callback::SubscriptionPayload::Next {
+                id: new_sub_id.clone(),
+                payload: Box::new(graphql::Response::builder()
+                    .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                    .build()),
+                verifier: verifier.clone(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut handler = handler.into_stream();
+        let msg = handler.next().await.unwrap();
+
+        assert_eq!(
+            msg,
+            graphql::Response::builder()
+                .subscribed(true)
+                .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                .build()
+        );
+        drop(handler);
+
+        // Should answer NOT FOUND because I dropped the only existing handler and so no one is still listening to the sub
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(callback::SubscriptionPayload::Next {
+                id: new_sub_id.clone(),
+                payload: Box::new(graphql::Response::builder()
+                    .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                    .build()),
+                verifier: verifier.clone(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+
+        // Should answer NOT FOUND because I dropped the only existing handler and so no one is still listening to the sub
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(
+                callback::SubscriptionPayload::Heartbeat {
+                    id: new_sub_id.clone(),
+                    ids: vec![new_sub_id, "FAKE_SUB_ID".to_string()],
+                    verifier: verifier.clone(),
+                },
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn it_test_callback_endpoint_with_bad_verifier() {
+        let mut notify = Notify::builder().build();
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
+            .expect("Plugin not found")
+            .create_instance(
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
+                        "enabled": true,
+                        "mode": {
+                            "callback": {
+                                "public_url": "http://localhost:4000/subscription/callback",
+                                "path": "/subscription/callback",
+                                "subgraphs": ["test"]
+                            }
+                        }
+                    }"#,
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .license(Arc::new(LicenseState::default()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let http_req_prom = http::Request::get("http://localhost:4000/subscription/callback")
+            .body(body::empty())
+            .unwrap();
+        let mut web_endpoint = dyn_plugin
+            .web_endpoints()
+            .into_iter()
+            .next()
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_router();
+        let resp = web_endpoint
+            .as_service()
+            .ready()
+            .await
+            .unwrap()
+            .call(http_req_prom)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        let new_sub_id = uuid::Uuid::new_v4().to_string();
+        let (_handler, _created, _) = notify
+            .create_or_subscribe(new_sub_id.clone(), true, None)
+            .await
+            .unwrap();
+        let verifier = String::from("XXX");
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(
+                callback::SubscriptionPayload::Check {
+                    id: new_sub_id.clone(),
+                    verifier: verifier.clone(),
+                },
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(callback::SubscriptionPayload::Next {
+                id: new_sub_id.clone(),
+                payload: Box::new(graphql::Response::builder()
+                    .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                    .build()),
+                verifier: verifier.clone(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn it_test_callback_endpoint_with_complete_subscription() {
+        let mut notify = Notify::builder().build();
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
+            .expect("Plugin not found")
+            .create_instance(
+                PluginInit::fake_builder()
+                    .config(
+                        Value::from_str(
+                            r#"{
+                "enabled": true,
+                "mode": {
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
+                        "path": "/subscription/callback",
+                        "subgraphs": ["test"]
+                    }
+                }
+            }"#,
+                        )
+                        .unwrap(),
+                    )
+                    .notify(notify.clone())
+                    .license(Arc::new(LicenseState::default()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let http_req_prom = http::Request::get("http://localhost:4000/subscription/callback")
+            .body(body::empty())
+            .unwrap();
+        let mut web_endpoint = dyn_plugin
+            .web_endpoints()
+            .into_iter()
+            .next()
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_router();
+        let resp = web_endpoint
+            .as_service()
+            .ready()
+            .await
+            .unwrap()
+            .call(http_req_prom)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        let new_sub_id = uuid::Uuid::new_v4().to_string();
+        let (handler, _created, _) = notify
+            .create_or_subscribe(new_sub_id.clone(), true, None)
+            .await
+            .unwrap();
+        let verifier = create_verifier(&new_sub_id).unwrap();
+
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(
+                callback::SubscriptionPayload::Check {
+                    id: new_sub_id.clone(),
+                    verifier: verifier.clone(),
+                },
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(HeaderName::from_static(
+                    callback::CALLBACK_SUBSCRIPTION_HEADER_NAME
+                ))
+                .unwrap(),
+            HeaderValue::from_static(callback::CALLBACK_SUBSCRIPTION_HEADER_VALUE)
+        );
+
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(callback::SubscriptionPayload::Next {
+                id: new_sub_id.clone(),
+                payload: Box::new(graphql::Response::builder()
+                    .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                    .build()),
+                verifier: verifier.clone(),
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut handler = handler.into_stream();
+        let msg = handler.next().await.unwrap();
+
+        assert_eq!(
+            msg,
+            graphql::Response::builder()
+                .subscribed(true)
+                .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                .build()
+        );
+
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(
+                callback::SubscriptionPayload::Complete {
+                    id: new_sub_id.clone(),
+                    errors: Some(vec![
+                        graphql::Error::builder()
+                            .message("cannot complete the subscription")
+                            .extension_code("SUBSCRIPTION_ERROR")
+                            .build(),
+                    ]),
+                    verifier: verifier.clone(),
+                },
+            ))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.clone().oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::ACCEPTED);
+        let msg = handler.next().await.unwrap();
+        assert_response_eq_ignoring_error_id!(
+            msg,
+            graphql::Response::builder()
+                .errors(vec![
+                    graphql::Error::builder()
+                        .message("cannot complete the subscription")
+                        .extension_code("SUBSCRIPTION_ERROR")
+                        .build()
+                ])
+                .build()
+        );
+
+        // Should answer NOT FOUND because we completed the sub
+        let http_req = http::Request::post(format!(
+            "http://localhost:4000/subscription/callback/{new_sub_id}"
+        ))
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&callback::CallbackPayload::Subscription(callback::SubscriptionPayload::Next {
+                id: new_sub_id.clone(),
+                payload: Box::new(graphql::Response::builder()
+                    .data(serde_json_bytes::json!({"userWasCreated": {"username": "ada_lovelace"}}))
+                    .build()),
+                verifier,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+        let resp = web_endpoint.oneshot(http_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn it_test_subgraph_service_with_subscription_disabled() {
+        let dyn_plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
+            .expect("Plugin not found")
+            .create_instance_without_schema(
+                &Value::from_str(
+                    r#"{
+                    "enabled": false
+                }"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The subscription plugin intercepts this request and never calls the inner service.
+        let (mock, handle) = tower_test::mock::pair::<SubgraphRequest, SubgraphResponse>();
+
+        let mut subgraph_service =
+            dyn_plugin.subgraph_service("my_subgraph_name", BoxCloneService::new(mock));
+        let subgraph_req = SubgraphRequest::fake_builder()
+            .subgraph_request(
+                http_ext::Request::fake_builder()
+                    .body(
+                        Request::fake_builder()
+                            .query(String::from(
+                                "subscription {\n  userWasCreated {\n    username\n  }\n}",
+                            ))
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .operation_kind(OperationKind::Subscription)
+            .build();
+        let subgraph_response = subgraph_service
+            .ready()
+            .await
+            .unwrap()
+            .call(subgraph_req)
+            .await
+            .unwrap();
+
+        assert_response_eq_ignoring_error_id!(
+            subgraph_response.response.body(),
+            &graphql::Response::builder()
+                .data(serde_json_bytes::Value::Null)
+                .error(
+                    graphql::Error::builder()
+                        .message(
+                            "cannot execute a subscription if it's not enabled in the configuration"
+                        )
+                        .extension_code("SUBSCRIPTION_DISABLED")
+                        .build()
+                )
+                .extensions(Object::default())
+                .build()
+        );
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+    }
+
+    #[test]
+    fn it_test_subscription_config() {
+        let config_with_callback: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                    "subgraphs": ["test"]
+                }
+            }
+        }))
+        .unwrap();
+
+        let subgraph_cfg = config_with_callback.mode.get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Callback(
+                serde_json::from_value::<CallbackMode>(serde_json::json!({
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                    "subgraphs": []
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_callback_default: SubscriptionConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "mode": {
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
+                        "path": "/subscription/callback",
+                    }
+                }
+            }))
+            .unwrap();
+
+        let subgraph_cfg = config_with_callback_default
+            .mode
+            .get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Callback(
+                serde_json::from_value::<CallbackMode>(serde_json::json!({
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                    "subgraphs": []
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_passthrough: SubscriptionConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "mode": {
+                    "passthrough": {
+                        "subgraphs": {
+                            "test": {
+                                "path": "/ws",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let subgraph_cfg = config_with_passthrough.mode.get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Passthrough(
+                serde_json::from_value::<WebSocketConfiguration>(serde_json::json!({
+                    "path": "/ws",
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_passthrough_override: SubscriptionConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "mode": {
+                    "passthrough": {
+                        "all": {
+                            "path": "/wss",
+                            "protocol": "graphql_transport_ws"
+                        },
+                        "subgraphs": {
+                            "test": {
+                                "path": "/ws",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let subgraph_cfg = config_with_passthrough_override
+            .mode
+            .get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Passthrough(
+                serde_json::from_value::<WebSocketConfiguration>(serde_json::json!({
+                    "path": "/ws",
+                    "protocol": "graphql_ws"
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_passthrough_all: SubscriptionConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "mode": {
+                    "passthrough": {
+                        "all": {
+                            "path": "/wss",
+                            "protocol": "graphql_transport_ws"
+                        },
+                        "subgraphs": {
+                            "foo": {
+                                "path": "/ws",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let subgraph_cfg = config_with_passthrough_all.mode.get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Passthrough(
+                serde_json::from_value::<WebSocketConfiguration>(serde_json::json!({
+                    "path": "/wss",
+                    "protocol": "graphql_transport_ws"
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_both_mode: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                },
+                "passthrough": {
+                    "subgraphs": {
+                        "foo": {
+                            "path": "/ws",
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let subgraph_cfg = config_with_both_mode.mode.get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Callback(
+                serde_json::from_value::<CallbackMode>(serde_json::json!({
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_with_passthrough_precedence: SubscriptionConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "mode": {
+                    "callback": {
+                        "public_url": "http://localhost:4000/subscription/callback",
+                        "path": "/subscription/callback",
+                    },
+                    "passthrough": {
+                        "all": {
+                            "path": "/wss",
+                            "protocol": "graphql_transport_ws"
+                        },
+                        "subgraphs": {
+                            "foo": {
+                                "path": "/ws",
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let subgraph_cfg = config_with_passthrough_precedence
+            .mode
+            .get_subgraph_config("test");
+        assert_eq!(
+            subgraph_cfg,
+            Some(SubscriptionMode::Passthrough(
+                serde_json::from_value::<WebSocketConfiguration>(serde_json::json!({
+                    "path": "/wss",
+                    "protocol": "graphql_transport_ws"
+                }))
+                .unwrap()
+            ))
+        );
+
+        let config_without_mode: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true
+        }))
+        .unwrap();
+
+        let subgraph_cfg = config_without_mode.mode.get_subgraph_config("test");
+        assert_eq!(subgraph_cfg, None);
+
+        let sub_config: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                    "subgraphs": ["test"]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(sub_config.enabled);
+        assert!(sub_config.deduplication.all.enabled);
+        assert!(sub_config.max_opened_subscriptions.is_none());
+        assert!(sub_config.queue_capacity.is_none());
+        assert!(sub_config.max_lifetime.is_none());
+
+        // ignore_auth_context: explicit true via global all
+        let cfg_ignore_auth: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "mode": {
+                "callback": {
+                    "public_url": "https://example.com/callback",
+                    "subgraphs": ["accounts"]
+                }
+            },
+            "deduplication": { "all": { "ignore_auth_context": true } }
+        }))
+        .unwrap();
+        assert!(cfg_ignore_auth.deduplication.all.ignore_auth_context);
+
+        // ignore_auth_context: default is false when field is absent
+        let cfg_default_auth: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "mode": {
+                "callback": {
+                    "public_url": "https://example.com/callback",
+                    "subgraphs": ["accounts"]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!cfg_default_auth.deduplication.all.ignore_auth_context);
+
+        // per-subgraph override: disable dedup for one subgraph while keeping it enabled globally
+        let cfg_per_subgraph: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "mode": {
+                "callback": {
+                    "public_url": "https://example.com/callback",
+                    "subgraphs": ["accounts"]
+                }
+            },
+            "deduplication": {
+                "all": { "enabled": true },
+                "subgraphs": {
+                    "article": { "enabled": false }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(cfg_per_subgraph.deduplication.get("accounts").enabled);
+        assert!(!cfg_per_subgraph.deduplication.get("article").enabled);
+    }
+
+    #[test]
+    fn it_test_subscription_config_max_lifetime() {
+        let config: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                }
+            },
+            "max_lifetime": "10m"
+        }))
+        .unwrap();
+
+        assert_eq!(config.max_lifetime, Some(Duration::from_secs(600).into()));
+
+        let config_no_lifetime: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": {
+                "callback": {
+                    "public_url": "http://localhost:4000/subscription/callback",
+                    "path": "/subscription/callback",
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(config_no_lifetime.max_lifetime.is_none());
+    }
+
+    #[test]
+    fn it_test_subscription_config_reconnect() {
+        // Reconnect policy lives on the per-subgraph passthrough WebSocketConfiguration, with the
+        // `all` block providing the default and per-subgraph entries overriding it.
+        let config: SubscriptionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": {
+                "passthrough": {
+                    "all": {
+                        "path": "/subscriptions",
+                        "max_reconnect_attempts": 5,
+                        "reconnect_delay": "2s"
+                    },
+                    "subgraphs": {
+                        "no_reconnect": {
+                            "path": "/subscriptions"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        // The `all` default carries the reconnect policy.
+        let all_cfg = match config.mode.get_subgraph_config("some_other_subgraph") {
+            Some(SubscriptionMode::Passthrough(ws)) => ws,
+            other => panic!("expected passthrough config, got {other:?}"),
+        };
+        assert_eq!(all_cfg.max_reconnect_attempts, 5);
+        assert_eq!(all_cfg.reconnect_delay, Some(Duration::from_secs(2).into()));
+
+        // A subgraph that doesn't set the fields falls back to their defaults (no reconnection).
+        let no_reconnect_cfg = match config.mode.get_subgraph_config("no_reconnect") {
+            Some(SubscriptionMode::Passthrough(ws)) => ws,
+            other => panic!("expected passthrough config, got {other:?}"),
+        };
+        assert_eq!(no_reconnect_cfg.max_reconnect_attempts, 0);
+        assert!(no_reconnect_cfg.reconnect_delay.is_none());
+    }
+
+    /// The error for a subscription sent while subscriptions are disabled is the router's own
+    /// answer, so the subgraph's circuit records nothing for it.
+    #[tokio::test]
+    async fn a_subscription_turned_away_while_disabled_records_no_circuit_outcome() {
+        use crate::plugins::circuit_breaker::test_support::assert_router_answers_record_nothing;
+        use crate::plugins::circuit_breaker::test_support::subgraph_request;
+
+        let plugin: Box<dyn DynPlugin> = crate::plugin::plugins()
+            .find(|factory| factory.name == APOLLO_SUBSCRIPTION_PLUGIN)
+            .expect("Plugin not found")
+            .create_instance_without_schema(&serde_json::json!({ "enabled": false }))
+            .await
+            .unwrap();
+
+        assert_router_answers_record_nothing(
+            async |subgraph| plugin.subgraph_service("products", subgraph),
+            || subgraph_request("Query"),
+            || {
+                let mut request = subgraph_request("Subscription");
+                request.operation_kind = OperationKind::Subscription;
+                request
+            },
+        )
+        .await;
+    }
+}
+
+register_plugin!("apollo", "subscription", Subscription);

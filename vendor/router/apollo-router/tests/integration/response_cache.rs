@@ -1,0 +1,1896 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
+
+use apollo_router::graphql;
+use apollo_router::services::router;
+use apollo_router::services::router::body::RouterBody;
+use apollo_router::services::supergraph;
+use apollo_router::test_harness::HttpService;
+use fred::clients::Client;
+use fred::interfaces::ClientLike;
+use fred::interfaces::KeysInterface;
+use fred::types::Builder;
+use fred::types::scan::ScanType;
+use fred::types::scan::Scanner;
+use futures::StreamExt as _;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
+use http_body_util::BodyExt as _;
+use indexmap::IndexMap;
+use serde_json::Value;
+use serde_json::json;
+use tokio_util::future::FutureExt;
+use tower::BoxError;
+use tower::Service as _;
+use tower::ServiceExt as _;
+
+use crate::integration::IntegrationTest;
+use crate::integration::common::graph_os_enabled;
+use crate::integration::common::namespace;
+use crate::integration::common::redact_cache_debug_query_hash;
+
+const REDIS_URL: &str = "redis://127.0.0.1:6379";
+const INVALIDATION_PATH: &str = "/invalidation";
+const INVALIDATION_SHARED_KEY: &str = "supersecret";
+
+async fn redis_client() -> Result<Client, BoxError> {
+    let client =
+        Builder::from_config(fred::prelude::Config::from_url(REDIS_URL).unwrap()).build()?;
+    client.init().await?;
+    Ok(client)
+}
+
+/// Block until Redis responds to PING within `per_attempt` on a freshly built fred
+/// client, retrying for up to `total` before panicking.
+///
+/// Why: the router's response_cache uses fred with a default `default_command_timeout`
+/// of 500ms. When a `TestHarness` spins up a new fred pool under CI load, the pool's
+/// first per-client command can race that 500ms budget if Redis or the host has not
+/// yet stabilised (e.g. another harness is still tearing down its connections, or
+/// the container is warming up). Issuing a PING from a fresh fred client here proves
+/// that a brand-new connection can complete one full request/response round-trip
+/// within the same budget the router will be operating under, which is exactly the
+/// condition the router needs for its first lookup not to time out.
+async fn wait_for_redis_responsive(per_attempt: Duration, total: Duration) {
+    let deadline = Instant::now() + total;
+    let mut last_err: Option<String>;
+    loop {
+        // Build a fresh client each attempt so we exercise the same cold-start path
+        // the router's pool exercises, not a long-lived warm connection.
+        let attempt = async {
+            let config =
+                fred::prelude::Config::from_url(REDIS_URL).map_err(|e| format!("config: {e}"))?;
+            let client = Builder::from_config(config)
+                .build()
+                .map_err(|e| format!("build: {e}"))?;
+            client.init().await.map_err(|e| format!("init: {e}"))?;
+            let _: () = client.ping(None).await.map_err(|e| format!("ping: {e}"))?;
+            // Best-effort tidy-up; ignore errors during teardown.
+            let _ = client.quit().await;
+            Ok::<(), String>(())
+        };
+        match attempt.timeout(per_attempt).await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => last_err = Some(format!("PING did not complete within {per_attempt:?}")),
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "redis at {REDIS_URL} was not responsive within {total:?} \
+                 (per-attempt deadline {per_attempt:?}); last error: {}",
+                last_err.unwrap_or_else(|| "<none>".into())
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn extract_cache_keys_from_response(response: &graphql::Response) -> Vec<String> {
+    response
+        .extensions
+        .get("apolloCacheDebugging")
+        .and_then(|v| v.get("data"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("key"))
+                .filter_map(|k| k.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_cache_keys_by_subgraph(
+    response: &graphql::Response,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut result: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    if let Some(data) = response
+        .extensions
+        .get("apolloCacheDebugging")
+        .and_then(|v| v.get("data"))
+        .and_then(|v| v.as_array())
+    {
+        for item in data {
+            if let (Some(key), Some(subgraph)) = (
+                item.get("key").and_then(|k| k.as_str()),
+                item.get("subgraphName").and_then(|s| s.as_str()),
+            ) {
+                result
+                    .entry(subgraph.to_string())
+                    .or_default()
+                    .push(key.to_string());
+            }
+        }
+    }
+    result
+}
+
+fn base_config() -> Value {
+    json!({
+        "include_subgraph_errors": {
+            "all": true,
+        },
+        "rhai": {
+            "scripts": "tests/integration/fixtures",
+            "main": "test_cache.rhai",
+        },
+        "headers": {
+            "all": {
+                "request": { "operations": [
+                    {
+                        "propagate": {
+                            "named": "private_id"
+                        }
+                    }
+                ]}
+            }
+        },
+        "response_cache": {
+            "enabled": true,
+            "subgraph": {
+                "all": {
+                    "redis": {
+                        "urls": ["redis://127.0.0.1:6379"],
+                        "pool_size": 3,
+                        "namespace": namespace(),
+                        "required_to_start": true,
+                    },
+                    "ttl": "10m",
+                    "invalidation": {
+                        "enabled": true,
+                        "shared_key": INVALIDATION_SHARED_KEY,
+                    },
+                    "private_id": "private_id"
+                },
+            },
+            "invalidation": {
+                "listen": "127.0.0.1:4000",
+                "path": INVALIDATION_PATH,
+            },
+        },
+    })
+}
+
+fn config_with_subgraph_prometheus() -> Value {
+    json!({
+        "telemetry": {
+          "exporters": {
+              "metrics": {
+                  "prometheus": {
+                      "enabled": true,
+                      "path": "/metrics"
+                  }
+              }
+          }
+        },
+        "response_cache": {
+            "enabled": true,
+            "subgraph": {
+                "all": {
+                    "redis": {
+                        "urls": ["redis://127.0.0.1:6379"],
+                        "pool_size": 3,
+                        "namespace": namespace(),
+                        "required_to_start": true,
+                    },
+                    "ttl": "10m",
+                    "private_id": "private_id"
+                },
+                "subgraphs": {
+                    "user": {
+                        "enabled": true,
+                        "private_id": "user"
+                    }
+                }
+            }
+        },
+    })
+}
+
+fn failure_config() -> Value {
+    json!({
+        "include_subgraph_errors": {
+            "all": true,
+        },
+        "response_cache": {
+            "enabled": true,
+            "subgraph": {
+                "all": {
+                    "redis": {
+                        "urls": ["redis://invalid"],
+                        "pool_size": 3,
+                        "namespace": namespace(),
+                        "required_to_start": false,
+                    },
+                    "ttl": "10m",
+                    "invalidation": {
+                        "enabled": true,
+                        "shared_key": INVALIDATION_SHARED_KEY,
+                    },
+                },
+            },
+            "invalidation": {
+                "listen": "127.0.0.1:4000",
+                "path": INVALIDATION_PATH,
+            },
+        },
+    })
+}
+
+fn base_subgraphs() -> Value {
+    json!({
+        "products": {
+            "headers": {"cache-control": "public"},
+            "query": {
+                "topProducts": [
+                    {"upc": "1", "__cacheTags": ["topProducts"]},
+                    {"upc": "2"},
+                ],
+            },
+        },
+        "reviews": {
+            "headers": {"cache-control": "public"},
+            "entities": [
+                {
+                    "__cacheTags": ["product-1"],
+                    "__typename": "Product",
+                    "upc": "1",
+                    "reviews": [{"id": "r1a"}, {"id": "r1b"}],
+                },
+                {
+                    "__cacheTags": ["product-2"],
+                    "__typename": "Product",
+                    "upc": "2",
+                    "reviews": [{"id": "r2"}],
+                },
+            ],
+        },
+    })
+}
+
+fn private_base_subgraphs() -> Value {
+    json!({
+        "products": {
+            "headers": {"cache-control": "private"},
+            "query": {
+                "topProducts": [
+                    {"upc": "1", "__cacheTags": ["topProducts"]},
+                    {"upc": "2"},
+                ],
+            },
+        },
+        "reviews": {
+            "headers": {"cache-control": "private"},
+            "entities": [
+                {
+                    "__cacheTags": ["product-1"],
+                    "__typename": "Product",
+                    "upc": "1",
+                    "reviews": [{"id": "r1a"}, {"id": "r1b"}],
+                },
+                {
+                    "__cacheTags": ["product-2"],
+                    "__typename": "Product",
+                    "upc": "2",
+                    "reviews": [{"id": "r2"}],
+                },
+            ],
+        },
+    })
+}
+
+async fn harness(
+    mut config: Value,
+    subgraphs: Value,
+) -> (HttpService, Arc<IndexMap<String, Arc<AtomicUsize>>>) {
+    let counters = Arc::new(IndexMap::from([
+        ("products".into(), Default::default()),
+        ("reviews".into(), Default::default()),
+    ]));
+    let counters2 = Arc::clone(&counters);
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert("experimental_mock_subgraphs".into(), subgraphs);
+    let router = apollo_router::TestHarness::builder()
+        .schema(include_str!("../../testing_schema.graphql"))
+        .configuration_json(config)
+        .unwrap()
+        .subgraph_hook(move |subgraph_name, service| {
+            if let Some(counter) = counters2.get(subgraph_name) {
+                let counter = Arc::<AtomicUsize>::clone(counter);
+                service
+                    .map_request(move |req| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        req
+                    })
+                    .boxed_clone()
+            } else {
+                service
+            }
+        })
+        .build_http_service()
+        .await
+        .unwrap();
+    (router, counters)
+}
+
+async fn make_graphql_request(router: &mut HttpService) -> (HeaderMap<String>, graphql::Response) {
+    let query = "{ topProducts { reviews { id } } }";
+    let request = graphql_request(query);
+    make_http_request(router, request.into()).await
+}
+
+async fn make_debug_graphql_request(
+    router: &mut HttpService,
+) -> (HeaderMap<String>, graphql::Response) {
+    let query = "{ topProducts { reviews { id } } }";
+    let request = graphql_request(query);
+    let mut request: http::Request<router::Body> = request.into();
+    request.headers_mut().insert(
+        HeaderName::from_static("apollo-cache-debugging"),
+        HeaderValue::from_static("true"),
+    );
+
+    make_http_request(router, request).await
+}
+
+async fn makegraphql_request_with_headers(
+    router: &mut HttpService,
+    headers: HeaderMap,
+) -> (HeaderMap<String>, graphql::Response) {
+    let query = "{ topProducts { reviews { id } } }";
+    let request = graphql_request(query);
+    let mut request: http::Request<router::Body> = request.into();
+    for (key, value) in headers {
+        request.headers_mut().insert(key.unwrap(), value);
+    }
+
+    make_http_request(router, request).await
+}
+
+fn graphql_request(query: &str) -> router::Request {
+    supergraph::Request::fake_builder()
+        .query(query)
+        .build()
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+async fn make_json_request(
+    router: &mut HttpService,
+    request: http::Request<Value>,
+) -> (HeaderMap<String>, Value) {
+    let request = request.map(|body| router::body::from_bytes(serde_json::to_vec(&body).unwrap()));
+    make_http_request(router, request).await
+}
+
+async fn make_http_request<ResponseBody>(
+    router: &mut HttpService,
+    request: http::Request<router::Body>,
+) -> (HeaderMap<String>, ResponseBody)
+where
+    ResponseBody: for<'a> serde::Deserialize<'a>,
+{
+    let response = router.ready().await.unwrap().call(request).await.unwrap();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_str().unwrap().to_owned()))
+        .collect();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (headers, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dont_duplicate_redis_connections() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let mut router = IntegrationTest::builder()
+        .config(serde_yaml::to_string(&config_with_subgraph_prometheus()).unwrap())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    router
+        .assert_metrics_contains(
+            r#"apollo_router_cache_redis_clients{otel_scope_name="apollo/router"} 3"#,
+            None,
+        )
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn basic_cache_skips_subgraph_request() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let config = base_config();
+    let (mut router, subgraph_request_counters) = harness(config.clone(), base_subgraphs()).await;
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 0
+    reviews: 0
+    ");
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    // The cache insert happens in a background tokio task after the response is
+    // returned, so the second request can race the writes. The first request
+    // produces a `products` root cache entry plus one cache entry per reviews
+    // entity (2 entities) → 3 keys minimum. Polling for >= 3 keys proves all
+    // three writes have landed before we issue the cache-hit request below.
+    // Replaces a fixed 100 ms sleep that flaked on CI.
+    wait_for_cache_writes(&config, 3).await;
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    // Unchanged, everything is in cache so we don’t need to make more subgraph requests:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+}
+
+/// This test ensures that the plugin ordering is correct and we can customize the private_id at the subgraph request level.
+#[tokio::test(flavor = "multi_thread")]
+async fn private_id_set_at_subgraph_request() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let config = base_config();
+    let (mut router, subgraph_request_counters) =
+        harness(config.clone(), private_base_subgraphs()).await;
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 0
+    reviews: 0
+    ");
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("private"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("private_id"),
+        HeaderValue::from_static("123"),
+    );
+    let (resp_headers, body) = makegraphql_request_with_headers(&mut router, headers.clone()).await;
+    assert!(resp_headers["cache-control"].contains("private"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    // Incremented because the previous one was not cached because it didn't contain the private_id set by the rhai script using private_id header value
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 2
+    reviews: 2
+    ");
+    // The cache insert happens in a background tokio task after the response is
+    // returned. The first (no-id) request does not cache; the second
+    // (private_id=123) request produces the first set of cache entries (one
+    // products root + two reviews entities = 3 keys). Poll until those have
+    // landed before issuing the cache-hit request below. Replaces a fixed
+    // 100 ms sleep that flaked on CI.
+    wait_for_cache_writes(&config, 3).await;
+    let (headers, body) = makegraphql_request_with_headers(&mut router, headers.clone()).await;
+    assert!(headers["cache-control"].contains("private"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    // Unchanged, everything is in cache so we don’t need to make more subgraph requests:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 2
+    reviews: 2
+    ");
+}
+
+fn check_cache_tags(response: &graphql::Response, cache_tags: Vec<Vec<String>>) {
+    let mut debugger_entries = response
+        .extensions
+        .get("apolloCacheDebugging")
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .get("data")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter();
+
+    for mut expected_cache_tags in cache_tags {
+        let entry = debugger_entries.next().unwrap().as_object().unwrap();
+        // `invalidationKeys` is rendered from `HashSet`-backed tiers, so its element order isn't
+        // guaranteed; sort both sides before comparing rather than asserting on a specific order.
+        let mut actual_cache_tags: Vec<String> = entry
+            .get("invalidationKeys")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cache_tag| cache_tag.as_str().unwrap().to_string())
+            .collect();
+        actual_cache_tags.sort();
+        expected_cache_tags.sort();
+        assert_eq!(actual_cache_tags, expected_cache_tags);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_cache_tags_from_debugger_data() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let mut config = base_config();
+    config
+        .get_mut("response_cache")
+        .and_then(|c| c.as_object_mut())
+        .and_then(|c| c.insert("debug".to_string(), true.into()));
+
+    let (mut router, subgraph_request_counters) = harness(config.clone(), base_subgraphs()).await;
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 0
+    reviews: 0
+    ");
+    let (headers, body) = make_debug_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    insta::assert_yaml_snapshot!(body.data, @r"
+    topProducts:
+      - reviews:
+          - id: r1a
+          - id: r1b
+      - reviews:
+          - id: r2
+    ");
+    check_cache_tags(
+        &body,
+        vec![
+            vec![
+                "subgraph-products".to_string(),
+                "type-products-Query".to_string(),
+                "topProducts".to_string(),
+            ],
+            vec![
+                "subgraph-reviews".to_string(),
+                "type-reviews-Product".to_string(),
+                "product-1".to_string(),
+            ],
+            vec![
+                "subgraph-reviews".to_string(),
+                "type-reviews-Product".to_string(),
+                "product-2".to_string(),
+            ],
+        ],
+    );
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    // The cache insert happens in a background tokio task after the response is
+    // returned. The first request produces a `products` root cache entry plus
+    // one cache entry per reviews entity (2 entities) → 3 keys minimum. Poll
+    // until those have landed before issuing the cache-hit request below.
+    // Replaces a fixed 100 ms sleep that flaked on CI.
+    wait_for_cache_writes(&config, 3).await;
+    let (headers, body) = make_debug_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    insta::assert_yaml_snapshot!(body.data, @r"
+    topProducts:
+      - reviews:
+          - id: r1a
+          - id: r1b
+      - reviews:
+          - id: r2
+    ");
+
+    check_cache_tags(
+        &body,
+        vec![
+            vec![
+                "subgraph-products".to_string(),
+                "type-products-Query".to_string(),
+                "topProducts".to_string(),
+            ],
+            vec![
+                "subgraph-reviews".to_string(),
+                "type-reviews-Product".to_string(),
+                "product-1".to_string(),
+            ],
+            vec![
+                "subgraph-reviews".to_string(),
+                "type-reviews-Product".to_string(),
+                "product-2".to_string(),
+            ],
+        ],
+    );
+    // Unchanged, everything is in cache so we don’t need to make more subgraph requests:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_failure_when_storage_unavailable() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let (mut router, subgraph_request_counters) = harness(failure_config(), base_subgraphs()).await;
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 0
+    reviews: 0
+    ");
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    // Would have been unchanged because both subgraph requests were cacheable,
+    // but cache storage isn’t available to we fall back to calling the subgraph again
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 2
+    reviews: 2
+    ");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn not_cached_without_cache_control_header() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let mut subgraphs = base_subgraphs();
+    subgraphs["products"]
+        .as_object_mut()
+        .unwrap()
+        .remove("headers");
+    subgraphs["reviews"]
+        .as_object_mut()
+        .unwrap()
+        .remove("headers");
+    let (mut router, subgraph_request_counters) = harness(base_config(), subgraphs).await;
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 0
+    reviews: 0
+    ");
+    let (headers, body) = make_graphql_request(&mut router).await;
+    // When subgraphs don’t set a cache-control header, Router defaults to not caching
+    // and instructs any downstream cache to do the same:
+    assert_eq!(headers["cache-control"], "no-store");
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    // No sleep needed: cache-control is no-store, so neither request writes to
+    // the cache and the second request always re-hits the subgraph regardless
+    // of timing. The previous fixed 100 ms sleep was a copy-pasted defensive
+    // pause with no race to defend against.
+
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert_eq!(headers["cache-control"], "no-store");
+    insta::assert_yaml_snapshot!(body, @r"
+    data:
+      topProducts:
+        - reviews:
+            - id: r1a
+            - id: r1b
+        - reviews:
+            - id: r2
+    ");
+    // More supergraph requsets lead to more subgraph requests:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 2
+    reviews: 2
+    ");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalidate_with_endpoint_by_type() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let (mut router, subgraph_request_counters) = harness(base_config(), base_subgraphs()).await;
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(INVALIDATION_PATH)
+        .header("Authorization", INVALIDATION_SHARED_KEY)
+        .body(json!([{
+            "kind": "type",
+            "subgraph": "reviews",
+            "type": "Product"
+        }]))
+        .unwrap();
+    // Needed because insert in the cache is async
+    for i in 0..10 {
+        let (_headers, body) = make_json_request(&mut router, request.clone()).await;
+        let expected_value = json!({"count": 2});
+
+        if body == expected_value {
+            break;
+        } else if i == 9 {
+            insta::assert_yaml_snapshot!(body, @"count: 2");
+        }
+    }
+
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    // After invalidation, reviews need to be requested again but products are still in cache:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 2
+    ");
+}
+
+/// Tests cache invalidation by entity cache tags set via the `apolloEntityCacheTags` extension.
+///
+/// The `experimental_mock_subgraphs` plugin generates `apolloEntityCacheTags` from `__cacheTags`
+/// fields in the mock entity data. The extension is an array of arrays where each inner array
+/// corresponds **positionally** to entities in the `_entities` response array.
+///
+/// For example, with this mock configuration in `base_subgraphs()`:
+/// ```json
+/// "entities": [
+///     {"__cacheTags": ["product-1"], "__typename": "Product", "upc": "1", ...},
+///     {"__cacheTags": ["product-2"], "__typename": "Product", "upc": "2", ...},
+/// ]
+/// ```
+///
+/// The subgraph response will include:
+/// ```json
+/// "extensions": {"apolloEntityCacheTags": [["product-1"], ["product-2"]]}
+/// ```
+///
+/// The router associates cache tags positionally: the first entity (upc "1") gets tags
+/// `["product-1"]`, the second entity (upc "2") gets tags `["product-2"]`.
+///
+/// This test verifies that invalidating by cache tag `"product-1"` only invalidates the
+/// first entity's cache, requiring a new fetch from the reviews subgraph.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalidate_with_endpoint_by_entity_cache_tag() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let (mut router, subgraph_request_counters) = harness(base_config(), base_subgraphs()).await;
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 1
+    ");
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(INVALIDATION_PATH)
+        .header("Authorization", INVALIDATION_SHARED_KEY)
+        .body(json!([{
+            "kind": "cache_tag",
+            "subgraphs": ["reviews"],
+            "cache_tag": "product-1",
+        }]))
+        .unwrap();
+    // Needed because insert in the cache is async
+    for i in 0..10 {
+        let (_headers, body) = make_json_request(&mut router, request.clone()).await;
+        let expected_value = json!({"count": 1});
+
+        if body == expected_value {
+            break;
+        } else if i == 9 {
+            insta::assert_yaml_snapshot!(body, @"count: 1");
+        }
+    }
+    let (headers, body) = make_graphql_request(&mut router).await;
+    assert!(headers["cache-control"].contains("public"));
+    assert!(body.errors.is_empty());
+    // After invalidation, reviews need to be requested again but products are still in cache:
+    insta::assert_yaml_snapshot!(subgraph_request_counters, @r"
+    products: 1
+    reviews: 2
+    ");
+}
+
+#[tokio::test]
+async fn cache_control_merging_single_fetch() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let mut subgraphs = base_subgraphs();
+    subgraphs["products"]["headers"]["cache-control"] = "public, s-maxage=120".into();
+    subgraphs["reviews"]["headers"]["cache-control"] = "public, s-maxage=60".into();
+    let (mut router, _subgraph_request_counters) = harness(base_config(), subgraphs).await;
+    let query = "{ topProducts { upc } }";
+
+    // Router responds with `max-age` even if a single subgraph used `s-maxage`
+    let (headers, _body) =
+        make_http_request::<graphql::Response>(&mut router, graphql_request(query).into()).await;
+    let cache_control = &headers["cache-control"];
+    let max_age = parse_max_age(cache_control);
+    // Usually 120, but the response's `max-age` is recomputed from a stored
+    // `created` epoch-seconds value each time it is serialized, so a wall-clock
+    // second can tick between subgraph response and the router writing the
+    // header. Accept 119 or 120 to avoid that race.
+    assert!(
+        (119..=120).contains(&max_age),
+        "expected max-age 119 or 120, got '{cache_control}'"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let query = "{ topProducts { upc } }";
+    let (headers, _body) =
+        make_http_request::<graphql::Response>(&mut router, graphql_request(query).into()).await;
+    let cache_control = &headers["cache-control"];
+    let max_age = parse_max_age(cache_control);
+    // Usually 120 - 2 = 118, but allow some slack in case CI CPUs are busy
+    assert!(max_age > 100 && max_age < 120, "got '{cache_control}'");
+}
+
+#[tokio::test]
+async fn complex_entity_key_response_cache() {
+    // GIVEN:
+    //   * that graphOS is enabled
+    //   * that we have a supergraph with:
+    //     * join__type with a complex key (ie, using an array)
+    //     * two subgraphs that both have the
+    //       type Status, but with an extra field given by those subgraphs
+    //       (ie, stuffDetails and statusDetails)
+    //   * a router running the above
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let subgraphs = json!({
+        "stuff": {
+            "query": {
+                "getStatus": {
+                    "id": "1",
+                    "items": [{"id": "i1", "name": "Item"}],
+                    "stuffDetails": "stuff we have"
+                }
+            }
+        },
+        "status": {
+            "entities": [{
+                "__typename": "Status",
+                "id": "1",
+                "items": [{"id": "i1", "name": "Item"}],
+                "statusDetails": "status details"
+            }]
+        }
+    });
+
+    let mut config = base_config();
+    {
+        let config_mut = config.as_object_mut().unwrap();
+        config_mut.insert("experimental_mock_subgraphs".into(), subgraphs);
+        config_mut
+            .get_mut("response_cache")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("debug".into(), true.into());
+    }
+
+    let router = apollo_router::TestHarness::builder()
+        .schema(include_str!("./fixtures/entity_key_complex.graphql"))
+        .configuration_json(config)
+        .unwrap()
+        .build_http_service()
+        .await
+        .unwrap();
+
+    let mut router = router;
+
+    // WHEN:
+    //   * a query for the Status type but with data from both the stuff and
+    //     status subgraphs
+
+    let query = r#"{
+        getStatus(id: "1") {
+            id
+            items { id name }
+            stuffDetails
+            statusDetails
+        }
+    }"#;
+    let mut http_req: http::Request<RouterBody> = graphql_request(query).into();
+    http_req.headers_mut().insert(
+        HeaderName::from_static("apollo-cache-debugging"),
+        HeaderValue::from_static("true"),
+    );
+    let (_, body) = make_http_request::<graphql::Response>(&mut router, http_req).await;
+
+    // THEN:
+    //   * no errors emitted! This means that the key was parsed correctly, or
+    //     else we'd see malformed request errors
+    //   * we get data from both subgraphs
+    //
+    assert!(body.errors.is_empty());
+    let expectation: serde_json_bytes::Value = json!({"getStatus":{"id":"1","items":[{"id":"i1","name":"Item"}],"stuffDetails":"stuff we have","statusDetails":"status details"}}).into();
+    assert_eq!(body.data, Some(expectation));
+    insta::assert_json_snapshot!(body.extensions, {
+        ".apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+}
+
+#[tokio::test]
+async fn test_cache_keys_nullable_data() {
+    // GIVEN:
+    //   * that graphOS is enabled
+    //   * that we have a supergraph with:
+    //     * join__type with a complex key (ie, using an array)
+    //     * a complex key with a nullable field
+    //   * a router running the above
+    if !graph_os_enabled() {
+        return;
+    }
+
+    // NOTE: nulls here to represent nullable data to cache
+    let subgraphs = json!({
+        "stuff": {
+            "query": {
+                "getStatus": {
+                    "id": "1",
+                    "items": [{"id": "i1", "name": null}],
+                    "stuffDetails": "stuff we have"
+                }
+            }
+        },
+        "status": {
+            "entities": [{
+                "__typename": "Status",
+                "id": "1",
+                "items": [{"id": "i1", "name": null}],
+                "statusDetails": "status details"
+            }]
+        }
+    });
+
+    let mut config = base_config();
+    {
+        let config_mut = config.as_object_mut().unwrap();
+        config_mut.insert("experimental_mock_subgraphs".into(), subgraphs);
+        config_mut
+            .get_mut("response_cache")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("debug".into(), true.into());
+    }
+
+    let router = apollo_router::TestHarness::builder()
+        .schema(include_str!(
+            "./fixtures/entity_key_with_null_fields.graphql"
+        ))
+        .configuration_json(config)
+        .unwrap()
+        .build_http_service()
+        .await
+        .unwrap();
+
+    let mut router = router;
+
+    // WHEN:
+    //   * a query for the Status type but with data from both the stuff and
+    //     status subgraphs
+
+    let query = r#"{
+        getStatus(id: "1") {
+            id
+            items { id name }
+            stuffDetails
+            statusDetails
+        }
+    }"#;
+
+    let mut http_req: http::Request<RouterBody> = graphql_request(query).into();
+    http_req.headers_mut().insert(
+        HeaderName::from_static("apollo-cache-debugging"),
+        HeaderValue::from_static("true"),
+    );
+    let (_, body) = make_http_request::<graphql::Response>(&mut router, http_req).await;
+
+    // THEN:
+    //   * no errors emitted! The key parses correctly
+    //   * we get data from both subgraphs
+    assert!(body.errors.is_empty());
+
+    // NOTE: nulls here are what we're testing
+    let expectation: serde_json_bytes::Value = json!({"getStatus":{"id":"1","items":[{"id":"i1","name": null}],"stuffDetails":"stuff we have","statusDetails":"status details"}}).into();
+    assert_eq!(body.data, Some(expectation));
+    insta::assert_json_snapshot!(body.extensions, {
+        ".apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+}
+
+#[tokio::test]
+async fn cache_control_merging_multi_fetch() {
+    if !graph_os_enabled() {
+        return;
+    }
+
+    let mut subgraphs = base_subgraphs();
+    subgraphs["products"]["headers"]["cache-control"] = "public, s-maxage=120".into();
+    subgraphs["reviews"]["headers"]["cache-control"] = "public, s-maxage=60".into();
+    let (mut router, _subgraph_request_counters) = harness(base_config(), subgraphs).await;
+    let query = "{ topProducts { reviews { id } } }";
+
+    // Router responds with `max-age` even if a subgraphs used `s-maxage`.
+    // The smaller value is used.
+    let (headers, _body) =
+        make_http_request::<graphql::Response>(&mut router, graphql_request(query).into()).await;
+    let cache_control = &headers["cache-control"];
+    let max_age = parse_max_age(cache_control);
+    // Usually 60, but the response's `max-age` is recomputed from a stored
+    // `created` epoch-seconds value each time it is serialized, so a wall-clock
+    // second can tick between subgraph response and the router writing the
+    // header. Accept 59 or 60 to avoid that race.
+    assert!(
+        (59..=60).contains(&max_age),
+        "expected max-age 59 or 60, got '{cache_control}'"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (headers, _body) =
+        make_http_request::<graphql::Response>(&mut router, graphql_request(query).into()).await;
+    let cache_control = &headers["cache-control"];
+    let max_age = parse_max_age(cache_control);
+    // Usually 60 - 2 = 58, but allow some slack in case CI CPUs are busy
+    assert!(max_age > 40 && max_age < 60, "got '{cache_control}'");
+}
+
+fn parse_max_age(cache_control: &str) -> u32 {
+    let extract_directive_value =
+        |dir: &&str| dir.split('=').nth(1).unwrap().parse::<u32>().unwrap();
+
+    let cache_control_elems = cache_control.split(",").collect::<Vec<&str>>();
+
+    if let Some(s_max_age_directive) = cache_control_elems
+        .iter()
+        .find(|x| x.starts_with("s-maxage"))
+    {
+        return extract_directive_value(s_max_age_directive);
+    }
+
+    if let Some(max_age_directive) = cache_control_elems
+        .iter()
+        .find(|x| x.starts_with("max-age"))
+    {
+        return extract_directive_value(max_age_directive);
+    }
+
+    panic!("expected max-age or s-maxage, got '{cache_control}'");
+}
+
+macro_rules! check_cache_key {
+    ($namespace: expr, $cache_key: expr, $client: expr) => {
+        let key = format!("{}:{}", $namespace, $cache_key);
+        let mut record: Option<String> = None;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        for _ in 0..10 {
+            interval.tick().await;
+            match $client
+                .get(key.clone())
+                .timeout(Duration::from_secs(5))
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    record = Some(resp);
+                    break;
+                }
+                Err(_) => panic!("long timeout connecting to redis - did you call client.init()?"),
+                _ => {}
+            }
+        }
+        match record {
+            Some(s) => {
+                let cache_value: Value = serde_json::from_str(&s).unwrap();
+                let v: Value = cache_value.get("data").unwrap().clone();
+                insta::assert_json_snapshot!(v);
+            }
+            None => panic!("cache key not found after retries: {}", key),
+        }
+    };
+}
+
+macro_rules! assert_cache_key_exists {
+    ($namespace: expr, $cache_key: expr, $client: expr) => {
+        let key = format!("{}:{}", $namespace, $cache_key);
+        let mut found = false;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        for _ in 0..10 {
+            interval.tick().await;
+            match $client
+                .get::<Option<String>, _>(key.clone())
+                .timeout(Duration::from_secs(5))
+                .await
+            {
+                Ok(Ok(Some(_))) => {
+                    found = true;
+                    break;
+                }
+                Err(_) => panic!("long timeout connecting to redis - did you call client.init()?"),
+                _ => {}
+            }
+        }
+        if !found {
+            panic!("cache key not found after retries: {}", key);
+        }
+    };
+}
+
+async fn cache_key_exists(
+    namespace: &str,
+    cache_key: &str,
+    client: &Client,
+) -> Result<bool, fred::error::Error> {
+    let key = format!("{namespace}:{cache_key}");
+    let count: u32 = client.exists(key).await?;
+    Ok(count == 1)
+}
+
+/// Polls Redis until at least `expected_min_keys` cache entries exist under the
+/// `response_cache.subgraph.all.redis.namespace` embedded in `config`, with a
+/// generous deadline. This replaces the previous
+/// `tokio::time::sleep(Duration::from_millis(100))` "Needed because insert in
+/// the cache is async" pattern, which was a fixed timing buffer that raced
+/// under CI load — the cache write happens in a background tokio task after
+/// the response is returned, and 100 ms was simply too tight when the host was
+/// busy. Polling the actual redis state until the writes have landed makes
+/// the test deterministic regardless of system load.
+async fn wait_for_cache_writes(config: &Value, expected_min_keys: usize) {
+    let namespace = config
+        .pointer("/response_cache/subgraph/all/redis/namespace")
+        .and_then(|v| v.as_str())
+        .expect(
+            "wait_for_cache_writes() requires a redis namespace at \
+             config.response_cache.subgraph.all.redis.namespace",
+        )
+        .to_owned();
+    let pattern = format!("{namespace}:*");
+    let client = redis_client()
+        .await
+        .expect("connect to redis at 127.0.0.1:6379");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut scanner = client.scan(&pattern, Some(100), Some(ScanType::String));
+        let mut count: usize = 0;
+        while let Some(result) = scanner.next().await {
+            if let Ok(scan_result) = result
+                && let Some(keys) = scan_result.results()
+            {
+                count += keys.len();
+            }
+        }
+        if count >= expected_min_keys {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after 10s waiting for >= {expected_min_keys} cache key(s) \
+                 under namespace {namespace}; observed {count}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn integration_test_basic() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    // The router's response_cache uses fred's default 500ms `default_command_timeout`.
+    // Each `TestHarness::builder()` below spins up a brand-new fred pool, and we have
+    // historically seen the second pool's first per-client lookup time out under CI
+    // load: fred reports the client as "connected" but the first request/response
+    // round-trip exceeds 500ms because the host (or Redis itself) has not yet
+    // stabilised. Prove Redis can serve a fresh-client PING within a budget
+    // comfortably below 500ms before each harness is built, so the router pool's
+    // first command operates against a demonstrably warm Redis.
+    wait_for_redis_responsive(Duration::from_millis(250), Duration::from_secs(10)).await;
+    let namespace = namespace();
+    let client = redis_client().await?;
+
+    let subgraphs = json!({
+        "products": {
+            "query": {"topProducts": [{
+                "__typename": "Product",
+                "upc": "1",
+                "name": "chair"
+            },
+            {
+                "__typename": "Product",
+                "upc": "2",
+                "name": "table"
+            },
+            {
+                "__typename": "Product",
+                "upc": "3",
+                "name": "plate"
+            }]},
+            "headers": {"cache-control": "public"},
+        },
+        "reviews": {
+            "entities": [{
+                "__typename": "Product",
+                "upc": "1",
+                "reviews": [{
+                    "__typename": "Review",
+                    "body": "I can sit on it",
+                }]
+            },
+            {
+                "__typename": "Product",
+                "upc": "2",
+                "reviews": [{
+                    "__typename": "Review",
+                    "body": "I can sit on it",
+                }, {
+                    "__typename": "Review",
+                    "body": "I can sit on it2",
+                }]
+            },
+            {
+                "__typename": "Product",
+                "upc": "3",
+                "reviews": [{
+                    "__typename": "Review",
+                    "body": "I can sit on it",
+                }, {
+                    "__typename": "Review",
+                    "body": "I can sit on it2",
+                }, {
+                    "__typename": "Review",
+                    "body": "I can sit on it3",
+                }]
+            }],
+            "headers": {"cache-control": "public"},
+        }
+    });
+    let supergraph = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "debug": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": true,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                            "pool_size": 3
+                        },
+                    },
+                    "subgraphs": {
+                        "products": {
+                            "enabled": true,
+                            "ttl": "60s"
+                        },
+                        "reviews": {
+                            "enabled": true,
+                            "ttl": "10s"
+                        }
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph-auth.graphql"))
+        .build_supergraph()
+        .await?;
+
+    let request = supergraph::Request::fake_builder()
+        .query(r#"{ topProducts { name reviews { body } } }"#)
+        .method(http::Method::POST)
+        .header("apollo-cache-debugging", "true")
+        .build()?;
+
+    let response = supergraph
+        .oneshot(request)
+        .await?
+        .next_response()
+        .await
+        .unwrap();
+
+    let cache_keys = extract_cache_keys_from_response(&response);
+    let cache_keys_by_subgraph = extract_cache_keys_by_subgraph(&response);
+
+    insta::assert_json_snapshot!(response, {
+        ".extensions.apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".extensions.apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+
+    let products_cache_key = cache_keys_by_subgraph
+        .get("products")
+        .and_then(|v| v.first())
+        .unwrap();
+    let reviews_cache_keys = cache_keys_by_subgraph.get("reviews").unwrap();
+
+    // Snapshot specific cache entries
+    check_cache_key!(&namespace, products_cache_key, &client);
+    check_cache_key!(&namespace, reviews_cache_keys.last().unwrap(), &client);
+
+    // Verify all cache keys exist
+    for cache_key in &cache_keys {
+        assert_cache_key_exists!(&namespace, cache_key, &client);
+    }
+
+    // Tearing down the first harness's fred pool and standing up the second one's can
+    // briefly contend with Redis. Re-prove the server is responsive before building
+    // the next harness so its pool's first lookup doesn't race the 500ms default
+    // command timeout (see the comment at the top of this test).
+    wait_for_redis_responsive(Duration::from_millis(250), Duration::from_secs(10)).await;
+
+    let supergraph = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "debug": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": false,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                        },
+                    },
+                    "subgraphs": {
+                        "products": {
+                            "enabled": true,
+                            "ttl": "60s"
+                        },
+                        "reviews": {
+                            "enabled": true,
+                            "ttl": "10s"
+                        }
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph-auth.graphql"))
+        .build_supergraph()
+        .await?;
+
+    let request = supergraph::Request::fake_builder()
+        .query(r#"{ topProducts(first: 2) { name reviews { body } } }"#)
+        .header("apollo-cache-debugging", "true")
+        .method(http::Method::POST)
+        .build()?;
+
+    let response = supergraph
+        .oneshot(request)
+        .await?
+        .next_response()
+        .await
+        .unwrap();
+    insta::assert_json_snapshot!(response, {
+        ".extensions.apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".extensions.apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+
+    for review_key in reviews_cache_keys {
+        assert_cache_key_exists!(&namespace, review_key, &client);
+    }
+
+    wait_for_redis_responsive(Duration::from_millis(250), Duration::from_secs(10)).await;
+
+    const SECRET_SHARED_KEY: &str = "supersecret";
+    let http_service = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": true,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                        },
+                        "invalidation": {
+                            "enabled": true,
+                            "shared_key": SECRET_SHARED_KEY
+                        }
+                    },
+                    "subgraphs": {
+                        "products": {
+                            "enabled": true,
+                            "ttl": "60s",
+                            "invalidation": {
+                                "enabled": true,
+                                "shared_key": SECRET_SHARED_KEY
+                            }
+                        },
+                        "reviews": {
+                            "enabled": true,
+                            "ttl": "10s",
+                            "invalidation": {
+                                "enabled": true,
+                                "shared_key": SECRET_SHARED_KEY
+                            }
+                        }
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(include_str!("../fixtures/supergraph-auth.graphql"))
+        .build_http_service()
+        .await?;
+
+    let request = http::Request::builder()
+        .uri("http://127.0.0.1:4000/invalidation")
+        .method(http::Method::POST)
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .header(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static(SECRET_SHARED_KEY),
+        )
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&vec![json!({
+                "subgraph": "reviews",
+                "kind": "type",
+                "type": "Product"
+            })])
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = http_service.oneshot(request).await.unwrap();
+    let response_status = response.status();
+    let mut resp: Value = serde_json::from_str(
+        &router::body::into_string(response.into_body())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resp.as_object_mut()
+            .unwrap()
+            .get("count")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        3u64
+    );
+    assert!(response_status.is_success());
+
+    // This should be in error because we invalidated this entity
+    for review_key in reviews_cache_keys {
+        assert!(!cache_key_exists(&namespace, review_key, &client).await?);
+    }
+
+    // This entry should still be in redis because we didn't invalidate this entry
+    assert!(cache_key_exists(&namespace, products_cache_key, &client).await?);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn integration_test_with_nested_field_set() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let namespace = namespace();
+    let schema = include_str!("../../src/testdata/supergraph_nested_fields.graphql");
+
+    let client = redis_client().await?;
+
+    let subgraphs = json!({
+        "products": {
+            "query": {"allProducts": [{
+                "id": "1",
+                "name": "Test",
+                "sku": "150",
+                "createdBy": { "__typename": "User", "email": "test@test.com", "country": {"a": "France"} }
+            }]},
+            "headers": {"cache-control": "public"},
+        },
+        "users": {
+            "entities": [{
+                "__typename": "User",
+                "email": "test@test.com",
+                "name": "test",
+                "country": {
+                    "a": "France"
+                }
+            }],
+            "headers": {"cache-control": "public"},
+        }
+    });
+
+    let supergraph = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "debug": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": true,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                            "pool_size": 3
+                        },
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(schema)
+        .build_supergraph()
+        .await?;
+    let query = "query { allProducts { name createdBy { name country { a } } } }";
+
+    let request = supergraph::Request::fake_builder()
+        .query(query)
+        .header("apollo-cache-debugging", "true")
+        .method(http::Method::POST)
+        .build()?;
+
+    let response = supergraph
+        .oneshot(request)
+        .await?
+        .next_response()
+        .await
+        .unwrap();
+    let cache_keys = extract_cache_keys_from_response(&response);
+    let cache_keys_by_subgraph = extract_cache_keys_by_subgraph(&response);
+
+    insta::assert_json_snapshot!(response, {
+        ".extensions.apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".extensions.apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+
+    let users_cache_keys = cache_keys_by_subgraph.get("users").unwrap();
+    let products_cache_key = cache_keys_by_subgraph
+        .get("products")
+        .and_then(|v| v.first())
+        .unwrap();
+
+    // Snapshot specific cache entries
+    check_cache_key!(&namespace, products_cache_key, &client);
+    check_cache_key!(&namespace, users_cache_keys.first().unwrap(), &client);
+
+    // Verify all cache keys exist
+    for cache_key in &cache_keys {
+        assert_cache_key_exists!(&namespace, cache_key, &client);
+    }
+
+    let supergraph = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "debug": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": false,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                        },
+                    },
+                    "subgraphs": {
+                        "products": {
+                            "enabled": true,
+                            "ttl": "60s"
+                        },
+                        "reviews": {
+                            "enabled": true,
+                            "ttl": "10s"
+                        }
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(schema)
+        .build_supergraph()
+        .await?;
+
+    let request = supergraph::Request::fake_builder()
+        .query(query)
+        .method(http::Method::POST)
+        .build()?;
+
+    let response = supergraph
+        .oneshot(request)
+        .await?
+        .next_response()
+        .await
+        .unwrap();
+    insta::assert_json_snapshot!(response, {
+        ".extensions.apolloCacheDebugging.data[].key" => insta::dynamic_redaction(|value, _path| {
+            redact_cache_debug_query_hash(value.as_str().unwrap())
+        }),
+        ".extensions.apolloCacheDebugging.data[].cacheControl.created" => 0
+    });
+
+    for user_key in users_cache_keys {
+        assert_cache_key_exists!(&namespace, user_key, &client);
+    }
+
+    const SECRET_SHARED_KEY: &str = "supersecret";
+    let http_service = apollo_router::TestHarness::builder()
+        .configuration_json(json!({
+            "response_cache": {
+                "enabled": true,
+                "debug": true,
+                "invalidation": {
+                    "listen": "127.0.0.1:4000",
+                    "path": "/invalidation"
+                },
+                "subgraph": {
+                    "all": {
+                        "enabled": true,
+                        "redis": {
+                            "urls": ["redis://127.0.0.1:6379"],
+                            "namespace": namespace,
+                        },
+                        "invalidation": {
+                            "enabled": true,
+                            "shared_key": SECRET_SHARED_KEY
+                        }
+                    },
+                    "subgraphs": {
+                        "products": {
+                            "enabled": true,
+                            "ttl": "60s",
+                            "invalidation": {
+                                "enabled": true,
+                                "shared_key": SECRET_SHARED_KEY
+                            }
+                        },
+                        "reviews": {
+                            "enabled": true,
+                            "ttl": "10s",
+                            "invalidation": {
+                                "enabled": true,
+                                "shared_key": SECRET_SHARED_KEY
+                            }
+                        }
+                    }
+                }
+            },
+            "include_subgraph_errors": {
+                "all": true
+            },
+            "experimental_mock_subgraphs": subgraphs.clone()
+        }))
+        .unwrap()
+        .schema(schema)
+        .build_http_service()
+        .await?;
+
+    let request = http::Request::builder()
+        .uri("http://127.0.0.1:4000/invalidation")
+        .method(http::Method::POST)
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .header(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static(SECRET_SHARED_KEY),
+        )
+        .body(router::body::from_bytes(
+            serde_json::to_vec(&vec![json!({
+                "subgraph": "users",
+                "kind": "type",
+                "type": "User"
+            })])
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = http_service.oneshot(request).await.unwrap();
+    let response_status = response.status();
+    let mut resp: Value = serde_json::from_str(
+        &router::body::into_string(response.into_body())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resp.as_object_mut()
+            .unwrap()
+            .get("count")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        1u64
+    );
+    assert!(response_status.is_success());
+
+    // This should be in error because we invalidated this entity
+    for user_key in users_cache_keys {
+        assert!(!cache_key_exists(&namespace, user_key, &client).await?);
+    }
+
+    // This entry should still be in redis because we didn't invalidate this entry
+    let products_cache_key = cache_keys_by_subgraph
+        .get("products")
+        .and_then(|v| v.first())
+        .unwrap();
+    assert!(cache_key_exists(&namespace, products_cache_key, &client).await?);
+
+    Ok(())
+}

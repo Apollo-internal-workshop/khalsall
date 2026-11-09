@@ -1,0 +1,1794 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::io::IsTerminal;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use opentelemetry::Key;
+use opentelemetry::KeyValue;
+use tracing::field;
+use tracing_core::Event;
+use tracing_core::Field;
+use tracing_core::span::Id;
+use tracing_core::span::Record;
+use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::Context;
+
+use super::config_new::ToOtelValue;
+use super::dynamic_attribute::LogAttributes;
+use super::formatters::EXCLUDED_ATTRIBUTES;
+use super::formatters::EventFormatter;
+use crate::plugins::telemetry::config;
+use crate::plugins::telemetry::config_new::logging::Format;
+use crate::plugins::telemetry::config_new::logging::StdOut;
+use crate::plugins::telemetry::consts::EVENT_ATTRIBUTE_OMIT_LOG;
+use crate::plugins::telemetry::formatters::RateLimitFormatter;
+use crate::plugins::telemetry::formatters::json::Json;
+use crate::plugins::telemetry::formatters::text::Text;
+use crate::plugins::telemetry::reload::otel::IsSampled;
+use crate::plugins::telemetry::reload::otel::LayeredTracer;
+use crate::plugins::telemetry::resource::ConfigResource;
+
+/// Returns the layer that writes logs to stdout, or `None` when stdout logging is disabled.
+pub(crate) fn create_fmt_layer(
+    config: &config::Conf,
+) -> Option<Box<dyn Layer<LayeredTracer> + Send + Sync>> {
+    match &config.exporters.logging.stdout {
+        StdOut {
+            enabled,
+            format,
+            tty_format,
+            rate_limit,
+        } if *enabled => {
+            let format = match tty_format {
+                Some(tty) if std::io::stdout().is_terminal() => tty,
+                _ => format,
+            };
+            match format {
+                Format::Json(format_config) => {
+                    let format = Json::new(
+                        config.exporters.logging.common.to_resource(),
+                        format_config.clone(),
+                    );
+                    Some(
+                        FmtLayer::new(RateLimitFormatter::new(format, rate_limit), std::io::stdout)
+                            .boxed(),
+                    )
+                }
+
+                Format::Text(format_config) => {
+                    let format = Text::new(
+                        config.exporters.logging.common.to_resource(),
+                        format_config.clone(),
+                    );
+                    Some(
+                        FmtLayer::new(RateLimitFormatter::new(format, rate_limit), std::io::stdout)
+                            .boxed(),
+                    )
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) struct FmtLayer<T, S, W> {
+    fmt_event: T,
+    excluded_attributes: HashSet<&'static str>,
+    make_writer: W,
+    _inner: PhantomData<S>,
+}
+
+impl<T, S, W> FmtLayer<T, S, W>
+where
+    S: tracing_core::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    T: EventFormatter<S>,
+    W: for<'writer> MakeWriter<'writer> + 'static,
+{
+    pub(crate) fn new(fmt_event: T, make_writer: W) -> Self {
+        Self {
+            fmt_event,
+            excluded_attributes: EXCLUDED_ATTRIBUTES.into(),
+            make_writer,
+            _inner: PhantomData,
+        }
+    }
+}
+
+impl<S, T, W> Layer<S> for FmtLayer<T, S, W>
+where
+    S: tracing_core::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    T: EventFormatter<S> + 'static,
+    W: for<'writer> MakeWriter<'writer> + 'static,
+{
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+        event.record(&mut visitor);
+        if visitor.omit_from_logs {
+            return;
+        }
+
+        thread_local! {
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
+        }
+
+        BUF.with(|buf| {
+            let borrow = buf.try_borrow_mut();
+            let mut a;
+            let mut b;
+            let mut buf = match borrow {
+                Ok(buf) => {
+                    a = buf;
+                    &mut *a
+                }
+                _ => {
+                    b = String::new();
+                    &mut b
+                }
+            };
+            if self.fmt_event.format_event(&ctx, &mut buf, event).is_ok() {
+                let mut writer = self.make_writer.make_writer();
+                if let Err(err) = std::io::Write::write_all(&mut writer, buf.as_bytes()) {
+                    eprintln!("FmtLayer::on_event: cannot flush the logging buffer, this is a bug: {err:?}");
+                }
+            }
+            buf.clear();
+        });
+    }
+}
+
+/// Records each span's fields in its [`LogAttributes`], where the log formatters find them.
+///
+/// [`FmtLayer`] only formats events, so it needs this layer beside it to show span fields. The
+/// router installs this layer outside the reload layer that holds its `FmtLayer`, so that span
+/// callbacks don't take the reload lock. See
+/// [`EventsOnly`](crate::plugins::telemetry::reload::log_layers::EventsOnly).
+///
+/// Recording can be switched off through [`SpanFieldsLayer::enabled`] while nothing writes logs.
+/// It starts on.
+pub(crate) struct SpanFieldsLayer {
+    excluded_attributes: HashSet<&'static str>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl Default for SpanFieldsLayer {
+    fn default() -> Self {
+        Self {
+            excluded_attributes: EXCLUDED_ATTRIBUTES.into(),
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl SpanFieldsLayer {
+    /// The switch for this layer's recording, shared with the layer.
+    ///
+    /// While it is `false`, the layer records nothing. A span created then keeps none of the
+    /// fields it was created with, even after recording is switched back on.
+    pub(crate) fn enabled(&self) -> Arc<AtomicBool> {
+        self.enabled.clone()
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+}
+
+impl<S> Layer<S> for SpanFieldsLayer
+where
+    S: tracing_core::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing_core::span::Attributes<'_>,
+        id: &tracing_core::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+            // We're checking if it's sampled to not add both attributes in OtelData and our LogAttributes
+            if !span.is_sampled() {
+                attrs.record(&mut visitor);
+            }
+            let mut extensions = span.extensions_mut();
+            if let Some(log_attrs) = extensions.get_mut::<LogAttributes>() {
+                log_attrs.extend(visitor.values.into_iter().filter_map(|(k, v)| {
+                    Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
+                }));
+            } else {
+                let mut fields = LogAttributes::default();
+                fields.extend(visitor.values.into_iter().filter_map(|(k, v)| {
+                    Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
+                }));
+                extensions.insert(fields);
+            }
+        } else {
+            eprintln!("SpanFieldsLayer::on_new_span: Span not found, this is a bug");
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            let mut extensions = span.extensions_mut();
+            if let Some(fields) = extensions.get_mut::<LogAttributes>() {
+                let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+                values.record(&mut visitor);
+                fields.extend(visitor.values.into_iter().filter_map(|(k, v)| {
+                    Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
+                }));
+            } else {
+                eprintln!(
+                    "SpanFieldsLayer::on_record: cannot access to LogAttributes, this is a bug"
+                );
+            }
+        } else {
+            eprintln!("SpanFieldsLayer::on_record: Span not found, this is a bug");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FieldsVisitor<'a, 'b> {
+    pub(crate) values: HashMap<&'a str, serde_json::Value>,
+    excluded_attributes: &'b HashSet<&'static str>,
+    omit_from_logs: bool,
+}
+
+impl<'b> FieldsVisitor<'_, 'b> {
+    fn new(excluded_attributes: &'b HashSet<&'static str>) -> Self {
+        Self {
+            values: HashMap::with_capacity(0),
+            excluded_attributes,
+            omit_from_logs: false,
+        }
+    }
+}
+
+impl field::Visit for FieldsVisitor<'_, '_> {
+    /// Visit a double precision floating point value.
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.values
+            .insert(field.name(), serde_json::Value::from(value));
+    }
+
+    /// Visit a signed 64-bit integer value.
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.values
+            .insert(field.name(), serde_json::Value::from(value));
+    }
+
+    /// Visit an unsigned 64-bit integer value.
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.values
+            .insert(field.name(), serde_json::Value::from(value));
+    }
+
+    /// Visit a boolean value.
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.values
+            .insert(field.name(), serde_json::Value::from(value));
+
+        if field.name() == EVENT_ATTRIBUTE_OMIT_LOG && value {
+            self.omit_from_logs = true;
+        }
+    }
+
+    /// Visit a string value.
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let field_name = field.name();
+        if self.excluded_attributes.contains(field_name) {
+            return;
+        }
+        self.values
+            .insert(field_name, serde_json::Value::from(value));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let field_name = field.name();
+        if self.excluded_attributes.contains(field_name) {
+            return;
+        }
+        match field_name {
+            name if name.starts_with("r#") => {
+                self.values
+                    .insert(&name[2..], serde_json::Value::from(format!("{value:?}")));
+            }
+            name => {
+                self.values
+                    .insert(name, serde_json::Value::from(format!("{value:?}")));
+            }
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use apollo_compiler::name;
+    use apollo_federation::connectors::ConnectId;
+    use apollo_federation::connectors::ConnectSpec;
+    use apollo_federation::connectors::Connector;
+    use apollo_federation::connectors::HttpJsonTransport;
+    use apollo_federation::connectors::JSONSelection;
+    use apollo_federation::connectors::ProblemLocation;
+    use apollo_federation::connectors::SourceName;
+    use apollo_federation::connectors::StringTemplate;
+    use apollo_federation::connectors::runtime::http_json_transport::HttpRequest;
+    use apollo_federation::connectors::runtime::http_json_transport::HttpResponse;
+    use apollo_federation::connectors::runtime::http_json_transport::TransportRequest;
+    use apollo_federation::connectors::runtime::key::ResponseKey;
+    use apollo_federation::connectors::runtime::mapping::Problem;
+    use apollo_federation::connectors::runtime::responses::MappedResponse;
+    use http::HeaderValue;
+    use http::header::CONTENT_LENGTH;
+    use opentelemetry::InstrumentationScope;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use parking_lot::Mutex;
+    use parking_lot::MutexGuard;
+    use tests::events::EventLevel;
+    use tracing::error;
+    use tracing::info;
+    use tracing::info_span;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
+    use crate::graphql;
+    use crate::plugins::telemetry::config_new::events;
+    use crate::plugins::telemetry::config_new::events::log_event;
+    use crate::plugins::telemetry::config_new::logging::JsonFormat;
+    use crate::plugins::telemetry::config_new::logging::RateLimit;
+    use crate::plugins::telemetry::config_new::logging::TextFormat;
+    use crate::plugins::telemetry::config_new::router::events::RouterResponseBodyExtensionType;
+    use crate::plugins::telemetry::dynamic_attribute::DynAttributeLayer;
+    use crate::plugins::telemetry::dynamic_attribute::SpanDynAttribute;
+    use crate::plugins::telemetry::otel;
+    use crate::plugins::telemetry::reload::log_layers::EventsOnly;
+    use crate::services::connector::request_service::Request;
+    use crate::services::connector::request_service::Response;
+    use crate::services::connector::request_service::TransportOutcome;
+    use crate::services::router;
+    use crate::services::router::body;
+    use crate::services::subgraph;
+    use crate::services::supergraph;
+
+    const EVENT_CONFIGURATION: &str = r#"
+router:
+  # Standard events
+  request: info
+  response: info
+  error: info
+
+  # Custom events
+  my.request_event:
+    message: "my event message"
+    level: info
+    on: request
+    attributes:
+      http.request.body.size: true
+    # Only log when the x-log-request header is `log`
+    condition:
+      eq:
+        - "log"
+        - request_header: "x-log-request"
+  my.response_event:
+    message: "my response event message"
+    level: info
+    on: response
+    attributes:
+      http.response.body.size: true
+    # Only log when the x-log-request header is `log`
+    condition:
+      eq:
+        - "log"
+        - response_header: "x-log-request"
+supergraph:
+  # Standard events
+  request: info
+  response: warn
+  error: info
+
+  # Custom events
+  my.request.event:
+    message: "my event message"
+    level: info
+    on: request
+    # Only log when the x-log-request header is `log`
+    condition:
+      eq:
+        - "log"
+        - request_header: "x-log-request"
+  my.response_event:
+    message: "my response event message"
+    level: warn
+    on: response
+    condition:
+      eq:
+        - "log"
+        - response_header: "x-log-request"
+subgraph:
+  # Standard events
+  request: info
+  response: warn
+  error: error
+
+  # Custom events
+  my.subgraph.request.event:
+    message: "my event message"
+    level: info
+    on: request
+  my.subgraph.response.event:
+    message: "my response event message"
+    level: error
+    on: response
+    attributes:
+      subgraph.name: true
+      response_status:
+        subgraph_response_status: code
+      "my.custom.attribute":
+        subgraph_response_data: "$.*"
+        default: "missing"
+
+connector:
+  # Standard events cannot be tested, because the test does not call the service that emits them
+
+  # Custom events
+  my.connector.request.event:
+    message: "my request event message"
+    level: info
+    on: request
+    attributes:
+      subgraph.name: true
+      connector_source:
+        connector_source: name
+      http_method:
+        connector_http_method: true
+      url_template:
+        connector_url_template: true
+      mapping_problems:
+        connector_request_mapping_problems: problems
+      mapping_problems_count:
+        connector_request_mapping_problems: count
+  my.connector.response.event:
+    message: "my response event message"
+    level: error
+    on: response
+    attributes:
+      subgraph.name: true
+      connector_source:
+        connector_source: name
+      http_method:
+        connector_http_method: true
+      url_template:
+        connector_url_template: true
+      response_status:
+        connector_http_response_status: code
+      mapping_problems:
+        connector_response_mapping_problems: problems
+      mapping_problems_count:
+        connector_response_mapping_problems: count"#;
+
+    #[derive(Default, Clone)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl<'a> MakeWriter<'a> for LogBuffer {
+        type Writer = Guard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Guard(self.0.lock())
+        }
+    }
+
+    struct Guard<'a>(MutexGuard<'a, Vec<u8>>);
+    impl std::io::Write for Guard<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl std::fmt::Display for LogBuffer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let content = String::from_utf8(self.0.lock().clone()).map_err(|_e| std::fmt::Error)?;
+
+            write!(f, "{content}")
+        }
+    }
+
+    fn make_tracer() -> opentelemetry_sdk::trace::Tracer {
+        SdkTracerProvider::default()
+            .tracer_with_scope(InstrumentationScope::builder("test").build())
+    }
+
+    /// Return insta filters that redact non-deterministic values from JSON log snapshots.
+    ///
+    /// The JSON formatter emits real timestamps and OTel trace/span IDs whose values change
+    /// every run.  Applying these filters in tests keeps the snapshots hermetic without
+    /// changing the formatter's behaviour in production.
+    fn json_snapshot_filters() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (r#""timestamp":"[^"]*""#, r#""timestamp":"[timestamp]""#),
+            (r#""trace_id":"[0-9a-f]{32}""#, r#""trace_id":"[trace_id]""#),
+            (r#""span_id":"[0-9a-f]{16}""#, r#""span_id":"[span_id]""#),
+        ]
+    }
+
+    fn generate_simple_span() {
+        let test_span = info_span!(
+            "test",
+            first = "one",
+            apollo_private.should_not_display = "this should be skipped"
+        );
+        test_span.set_span_dyn_attribute("another".into(), 2.into());
+        test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+        let _enter = test_span.enter();
+        info!(event_attr = "foo", "Hello from test");
+    }
+
+    fn generate_nested_spans() {
+        let test_span = info_span!(
+            "test",
+            first = "one",
+            apollo_private.should_not_display = "this should be skipped"
+        );
+        test_span.set_span_dyn_attribute("another".into(), 2.into());
+        test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+        let _enter = test_span.enter();
+        {
+            let nested_test_span = info_span!(
+                "nested_test",
+                two = "two",
+                apollo_private.is_private = "this should be skipped"
+            );
+            let _enter = nested_test_span.enter();
+
+            nested_test_span.set_span_dyn_attributes([
+                KeyValue::new("inner", -42_i64),
+                KeyValue::new("graphql.operation.kind", "Subscription"),
+            ]);
+
+            error!(http.method = "GET", "Hello from nested test");
+        }
+        info!(event_attr = "foo", "Hello from test");
+    }
+
+    /// A [`FmtLayer`] writing to `buff`, with the [`SpanFieldsLayer`] that records the span fields
+    /// it shows.
+    fn log_layers<S, T>(format: T, buff: &LogBuffer) -> impl Layer<S>
+    where
+        S: tracing_core::Subscriber
+            + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+        T: EventFormatter<S> + 'static,
+    {
+        FmtLayer::new(format, buff.clone()).and_then(SpanFieldsLayer::default())
+    }
+
+    #[test]
+    fn routers_logging_layers_log_span_fields() {
+        for with_tracer in [false, true] {
+            let buff = LogBuffer::default();
+            let format = Json::new(
+                Resource::builder_empty().build(),
+                JsonFormat {
+                    display_timestamp: false,
+                    ..Default::default()
+                },
+            );
+            let subscriber = tracing_subscriber::Registry::default()
+                .with(DynAttributeLayer::new())
+                .with(with_tracer.then(|| otel::layer().with_tracer(make_tracer())))
+                .with(EventsOnly::new(FmtLayer::new(format, buff.clone())))
+                .with(SpanFieldsLayer::default());
+
+            ::tracing::subscriber::with_default(subscriber, || {
+                let span = info_span!("outer", first = "one", late = ::tracing::field::Empty);
+                let _outer = span.enter();
+                span.record("late", "recorded");
+                span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+                let nested = info_span!("nested", two = "two");
+                let _nested = nested.enter();
+                info!(event_attr = "foo", "Hello from nested");
+            });
+
+            let logs = buff.to_string();
+            for field in [
+                r#""first":"one""#,
+                r#""late":"recorded""#,
+                r#""custom_dyn":"test""#,
+                r#""two":"two""#,
+            ] {
+                assert!(logs.contains(field), "with_tracer: {with_tracer}, {logs}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_text_logging_attributes() {
+        let buff = LogBuffer::default();
+        let format = Text::default();
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_simple_span,
+        );
+        insta::assert_snapshot!(buff);
+    }
+
+    #[tokio::test]
+    async fn test_text_logging_attributes_nested_spans() {
+        let buff = LogBuffer::default();
+        let format = Text::default();
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_nested_spans,
+        );
+
+        insta::assert_snapshot!(buff.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_no_duplicate_empty_message() {
+        // otel_error!(name: "op", message = "explicit") expands to:
+        //   error!(name = "op", message = "explicit", "")
+        // The trailing "" sets message = "" while the kv field sets message = "explicit",
+        // producing duplicate JSON keys. Verify the formatter drops the empty-string one.
+        let buff = LogBuffer::default();
+        let json_format = JsonFormat {
+            display_timestamp: false,
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), json_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(fmt::Subscriber::new().with(fmt_layer), || {
+            error!(
+                name = "export_failure",
+                message = "explicit error message",
+                ""
+            );
+        });
+
+        let raw = buff.to_string();
+        let raw = raw.trim();
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("output should be valid JSON");
+        assert_eq!(
+            parsed["message"], "explicit error message",
+            "explicit message should be present"
+        );
+        assert!(
+            !raw.contains(r#""message":"""#) && !raw.contains(r#""message": """#),
+            "empty-string message should be dropped; got: {raw}"
+        );
+    }
+
+    /// Fields recorded with `tracing::field::valuable` only exist in builds that set
+    /// `--cfg tracing_unstable`; the nightly CI run exercises these tests.
+    #[cfg(tracing_unstable)]
+    mod valuable_fields {
+        use super::*;
+
+        #[derive(valuable::Valuable)]
+        struct Entitlements {
+            bypass: Option<bool>,
+        }
+
+        #[derive(valuable::Valuable)]
+        struct AccessLog {
+            client_id: String,
+            entitlements: Entitlements,
+            persisted_query_id: Option<String>,
+        }
+
+        fn access_log() -> AccessLog {
+            AccessLog {
+                client_id: "test-client-id".to_string(),
+                entitlements: Entitlements { bypass: Some(true) },
+                persisted_query_id: None,
+            }
+        }
+
+        /// Formats the single event emitted by `emit` and returns the raw JSON line.
+        fn json_log_line(emit: impl FnOnce()) -> String {
+            let buff = LogBuffer::default();
+            let json_format = JsonFormat {
+                display_timestamp: false,
+                display_span_list: false,
+                display_current_span: false,
+                display_resource: false,
+                ..Default::default()
+            };
+            let format = Json::new(Resource::builder_empty().build(), json_format);
+            let fmt_layer = log_layers(format, &buff);
+
+            ::tracing::subscriber::with_default(fmt::Subscriber::new().with(fmt_layer), emit);
+
+            buff.to_string().trim().to_string()
+        }
+
+        #[test]
+        fn test_json_logging_valuable_is_nested_json() {
+            let log = access_log();
+            let raw = json_log_line(|| {
+                info!(log = ::tracing::field::valuable(&log), "request finished");
+            });
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("output should be valid JSON");
+
+            assert_eq!(
+                parsed["log"],
+                serde_json::json!({
+                    "client_id": "test-client-id",
+                    "entitlements": { "bypass": true },
+                    "persisted_query_id": null,
+                }),
+                "`log` should be a nested object, not a Debug string; got: {raw}"
+            );
+        }
+
+        #[test]
+        fn test_json_logging_valuable_keeps_empty_message_deduplication() {
+            // `otel_error!` style: an explicit `message` field plus a trailing empty format string.
+            let log = access_log();
+            let raw = json_log_line(|| {
+                error!(
+                    log = ::tracing::field::valuable(&log),
+                    message = "explicit error message",
+                    ""
+                );
+            });
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("output should be valid JSON");
+
+            assert!(parsed["log"].is_object(), "got: {raw}");
+            assert_eq!(parsed["message"], "explicit error message");
+            assert_eq!(
+                raw.matches(r#""message":"#).count(),
+                1,
+                "empty-string message should be dropped; got: {raw}"
+            );
+        }
+
+        #[test]
+        fn test_json_logging_valuable_unserializable_falls_back_to_debug() {
+            // JSON object keys must be strings, so a map keyed by a list cannot be converted.
+            let keyed_by_list = std::collections::BTreeMap::from([(vec![1, 2], true)]);
+            let raw = json_log_line(|| {
+                info!(
+                    keys = ::tracing::field::valuable(&keyed_by_list),
+                    code = 43,
+                    "still logged"
+                );
+            });
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("output should be valid JSON");
+
+            assert_eq!(parsed["keys"], "{[1, 2]: true}");
+            // Only check that a reason is present: its wording belongs to serde_json.
+            let errors = parsed["serialization_errors"]
+                .as_object()
+                .unwrap_or_else(|| panic!("expected a serialization_errors object; got: {raw}"));
+            assert_eq!(errors.len(), 1, "got: {raw}");
+            assert!(
+                errors["keys"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty()),
+                "the fallback should record why conversion failed; got: {raw}"
+            );
+            assert_eq!(parsed["code"], 43);
+            assert_eq!(parsed["message"], "still logged");
+        }
+
+        #[test]
+        fn test_json_logging_valuable_own_serialization_errors_field_wins() {
+            let keyed_by_list = std::collections::BTreeMap::from([(vec![1, 2], true)]);
+            let raw = json_log_line(|| {
+                info!(
+                    keys = ::tracing::field::valuable(&keyed_by_list),
+                    serialization_errors = "from the plugin",
+                    "still logged"
+                );
+            });
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("output should be valid JSON");
+
+            assert_eq!(
+                raw.matches(r#""serialization_errors":"#).count(),
+                1,
+                "the key must not be duplicated; got: {raw}"
+            );
+            assert_eq!(parsed["serialization_errors"], "from the plugin");
+            assert_eq!(parsed["keys"], "{[1, 2]: true}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_attributes() {
+        let buff = LogBuffer::default();
+        let format = Json::default();
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_simple_span,
+        );
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_attributes_nested_spans() {
+        let buff = LogBuffer::default();
+        let format = Json::default();
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_nested_spans,
+        );
+
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_without_span_list() {
+        let buff = LogBuffer::default();
+        let json_format = JsonFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), json_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_nested_spans,
+        );
+
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_text_logging_without_span_list() {
+        let buff = LogBuffer::default();
+        let text_format = TextFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ansi_escape_codes: false,
+            ..Default::default()
+        };
+        let format = Text::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new().with(fmt_layer),
+            generate_nested_spans,
+        );
+
+        insta::assert_snapshot!(buff.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_text_logging_with_custom_events() {
+        let buff = LogBuffer::default();
+        let text_format = TextFormat {
+            ansi_escape_codes: false,
+            ..Default::default()
+        };
+        let format = Text::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            || {
+                let test_span = info_span!(
+                    "test",
+                    first = "one",
+                    apollo_private.should_not_display = "this should be skipped"
+                );
+                test_span.set_span_dyn_attribute("another".into(), 2.into());
+                test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+                let _enter = test_span.enter();
+                let attributes = vec![
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body.size"),
+                        opentelemetry::Value::String("125".to_string().into()),
+                    ),
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body"),
+                        opentelemetry::Value::String(r#"{"foo": "bar"}"#.to_string().into()),
+                    ),
+                ];
+                log_event(
+                    EventLevel::Info,
+                    "my_custom_event",
+                    attributes,
+                    "my message",
+                );
+
+                error!(http.method = "GET", "Hello from test");
+            },
+        );
+
+        insta::assert_snapshot!(buff.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_with_custom_events() {
+        let buff = LogBuffer::default();
+        let text_format = JsonFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            || {
+                let test_span = info_span!(
+                    "test",
+                    first = "one",
+                    apollo_private.should_not_display = "this should be skipped"
+                );
+                test_span.set_span_dyn_attribute("another".into(), 2.into());
+                test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+                let _enter = test_span.enter();
+                let attributes = vec![
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body.size"),
+                        opentelemetry::Value::String("125".to_string().into()),
+                    ),
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body"),
+                        opentelemetry::Value::String(r#"{"foo": "bar"}"#.to_string().into()),
+                    ),
+                ];
+                log_event(
+                    EventLevel::Info,
+                    "my_custom_event",
+                    attributes,
+                    "my message",
+                );
+
+                error!(http.method = "GET", "Hello from test");
+            },
+        );
+
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_with_custom_events_with_instrumented() {
+        let buff = LogBuffer::default();
+        let text_format = JsonFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        let event_config: events::Events = serde_yaml::from_str(EVENT_CONFIGURATION).unwrap();
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            move || {
+                let test_span = info_span!(
+                    "test",
+                    first = "one",
+                    apollo_private.should_not_display = "this should be skipped"
+                );
+                test_span.set_span_dyn_attribute("another".into(), 2.into());
+                test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+                let _enter = test_span.enter();
+
+                let attributes = vec![
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body.size"),
+                        opentelemetry::Value::I64(125),
+                    ),
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body"),
+                        opentelemetry::Value::String(r#"{"foo": "bar"}"#.to_string().into()),
+                    ),
+                ];
+                log_event(
+                    EventLevel::Info,
+                    "my_custom_event",
+                    attributes,
+                    "my message",
+                );
+
+                error!(http.method = "GET", "Hello from test");
+
+                let mut router_events = event_config.new_router_events();
+                let router_req = router::Request::fake_builder()
+                    .header(CONTENT_LENGTH, "0")
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .build()
+                    .unwrap();
+                router_events.on_request(&router_req);
+
+                let router_resp = router::Response::fake_builder()
+                    .header("custom-header", "val1")
+                    .header(CONTENT_LENGTH, "25")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json_bytes::json!({"data": "res"}))
+                    .build()
+                    .expect("expecting valid response");
+                router_events.on_response(&router_resp);
+
+                let mut supergraph_events = event_config.new_supergraph_events();
+                let supergraph_req = supergraph::Request::fake_builder()
+                    .query("query { foo }")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .build()
+                    .unwrap();
+                supergraph_events.on_request(&supergraph_req);
+
+                let supergraph_resp = supergraph::Response::fake_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"data": "res"}).to_string())
+                    .build()
+                    .expect("expecting valid response");
+                supergraph_events.on_response(&supergraph_resp);
+
+                let mut subgraph_events = event_config.new_subgraph_events();
+                let mut subgraph_req = http::Request::new(
+                    graphql::Request::fake_builder()
+                        .query("query { foo }")
+                        .build(),
+                );
+                subgraph_req
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+
+                let subgraph_req = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph")
+                    .subgraph_request(subgraph_req)
+                    .build();
+                subgraph_events.on_request(&subgraph_req);
+
+                let subgraph_resp = subgraph::Response::fake2_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}]}))
+                    .subgraph_name("subgraph")
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp);
+
+                let mut subgraph_events = event_config.new_subgraph_events();
+                let mut subgraph_req = http::Request::new(
+                    graphql::Request::fake_builder()
+                        .query("query { foo }")
+                        .build(),
+                );
+                subgraph_req
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+
+                let subgraph_req = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph_bis")
+                    .subgraph_request(subgraph_req)
+                    .build();
+                subgraph_events.on_request(&subgraph_req);
+
+                let subgraph_resp = subgraph::Response::fake2_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}], "other": {"foo": "bar"}}))
+                    .subgraph_name("subgraph_bis")
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp);
+
+                let context = crate::Context::default();
+                let mut http_request = http::Request::builder().body("".into()).unwrap();
+                http_request
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+                let transport_request = TransportRequest::Http(Box::new(HttpRequest {
+                    inner: http_request,
+                    debug: Default::default(),
+                }));
+                let connector = Arc::new(Connector {
+                    id: ConnectId::new(
+                        "connector_subgraph".into(),
+                        Some(SourceName::cast("source")),
+                        name!(Query),
+                        name!(users),
+                        None,
+                        0,
+                    ),
+                    transport: Some(HttpJsonTransport {
+                        connect_template: StringTemplate::from_str("/test").unwrap(),
+                        ..Default::default()
+                    }),
+                    selection: JSONSelection::empty(),
+                    config: None,
+                    max_requests: None,
+                    entity_resolver: None,
+                    spec: ConnectSpec::V0_1,
+                    schema_subtypes_map: Default::default(),
+                    batch_settings: None,
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                    request_variable_keys: Default::default(),
+                    response_variable_keys: Default::default(),
+                    error_settings: Default::default(),
+                    output_type: None,
+                    label: "label".into(),
+                });
+                let response_key = ResponseKey::RootField {
+                    name: "hello".to_string(),
+                    inputs: Default::default(),
+                    selection: Arc::new(JSONSelection::parse("$.data").unwrap()),
+                };
+                let connector_request = Request {
+                    context: context.clone(),
+                    connector: connector.clone(),
+                    transport_request,
+                    key: response_key.clone(),
+                    mapping_problems: vec![
+                        Problem {
+                            count: 1,
+                            message: "error message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                        Problem {
+                            count: 2,
+                            message: "warn message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                        Problem {
+                            count: 3,
+                            message: "info message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                    ],
+                    supergraph_request: Default::default(),
+                    operation: Default::default(),
+                };
+                let mut connector_events = event_config.new_connector_events();
+                connector_events.on_request(&connector_request);
+
+                let connector_response = Response {
+                    context: context.clone(),
+                    subgraph_name: String::new(),
+                    transport_outcome: TransportOutcome::Response(HttpResponse {
+                        inner: http::Response::builder()
+                            .status(200)
+                            .header("x-log-response", HeaderValue::from_static("log"))
+                            .body(body::empty())
+                            .expect("expecting valid response")
+                            .into_parts()
+                            .0,
+                    }),
+                    mapped_response: MappedResponse::Data {
+                        data: serde_json::json!({})
+                            .try_into()
+                            .expect("expecting valid JSON"),
+                        key: response_key,
+                        problems: vec![
+                            Problem {
+                                count: 1,
+                                message: "error message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                            Problem {
+                                count: 2,
+                                message: "warn message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                            Problem {
+                                count: 3,
+                                message: "info message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                        ],
+                        declared_errors: vec![],
+                    },
+                    answered_by_router: false,
+                };
+                connector_events.on_response(&connector_response);
+            },
+        );
+
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_expand_json_string_values() {
+        let buff = LogBuffer::default();
+        let text_format = JsonFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            expand_json_string_values: true,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            || {
+                let span = info_span!("test_expand_json");
+                let _enter = span.enter();
+
+                // Single JSON object string value
+                let attributes_single = vec![KeyValue::new(
+                    opentelemetry::Key::from_static_str("errors"),
+                    opentelemetry::Value::String(
+                        r#"{"message":"Invalid type","extensions":{"code":"INVALID_TYPE"}}"#
+                            .to_string()
+                            .into(),
+                    ),
+                )];
+                log_event(
+                    EventLevel::Error,
+                    "response_errors_single",
+                    attributes_single,
+                    "test",
+                );
+
+                // Array of JSON object strings (the `response_errors: "$[*]"` case)
+                let attributes_array = vec![KeyValue::new(
+                    opentelemetry::Key::from_static_str("errors"),
+                    opentelemetry::Value::Array(opentelemetry::Array::String(vec![
+                        r#"{"message":"Invalid type","extensions":{"code":"INVALID_TYPE"}}"#
+                            .to_string()
+                            .into(),
+                        r#"{"message":"Validation failed","extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}"#
+                            .to_string()
+                            .into(),
+                    ])),
+                )];
+                log_event(
+                    EventLevel::Error,
+                    "response_errors_array",
+                    attributes_array,
+                    "test",
+                );
+            },
+        );
+
+        let output = buff.to_string();
+        // Single object: the value should be a native JSON object, not a quoted string
+        assert!(
+            output.contains(r#""errors":{"message":"Invalid type""#),
+            "expected native JSON object in output, got: {output}"
+        );
+        // Array case: elements should be native JSON objects, not escaped strings
+        assert!(
+            output.contains(r#""errors":[{"message":"Invalid type""#),
+            "expected array of native JSON objects in output, got: {output}"
+        );
+        assert!(
+            !output.contains(r#""{\"message\""#),
+            "output must not contain escaped JSON strings when expand_json_string_values=true, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_deduplicates_attributes() {
+        let buff = LogBuffer::default();
+        let text_format = JsonFormat {
+            display_span_list: false,
+            display_current_span: false,
+            display_resource: false,
+            ..Default::default()
+        };
+        let format = Json::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(
+            RateLimitFormatter::new(format, &RateLimit::default()),
+            &buff,
+        );
+
+        let event_config: events::Events = serde_yaml::from_str(
+            r#"
+subgraph:
+  request: info
+  response: warn
+  error: error
+  event.with.duplicate.attribute:
+    message: "this event has a duplicate attribute"
+    level: error
+    on: response
+    attributes:
+      subgraph.name: true
+      static:
+        static: foo # This shows up twice without attribute deduplication
+        "#,
+        )
+        .unwrap();
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            move || {
+                let test_span = info_span!("test");
+                let _enter = test_span.enter();
+
+                let mut router_events = event_config.new_router_events();
+                let mut supergraph_events = event_config.new_supergraph_events();
+                let mut subgraph_events = event_config.new_subgraph_events();
+
+                // In: Router -> Supergraph -> Subgraphs
+                let router_req = router::Request::fake_builder().build().unwrap();
+                router_events.on_request(&router_req);
+
+                let supergraph_req = supergraph::Request::fake_builder()
+                    .query("query { foo }")
+                    .build()
+                    .unwrap();
+                supergraph_events.on_request(&supergraph_req);
+
+                let subgraph_req_1 = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph")
+                    .subgraph_request(http::Request::new(
+                        graphql::Request::fake_builder()
+                            .query("query { foo }")
+                            .build(),
+                    ))
+                    .build();
+                subgraph_events.on_request(&subgraph_req_1);
+
+                let subgraph_req_2 = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph_bis")
+                    .subgraph_request(http::Request::new(
+                        graphql::Request::fake_builder()
+                            .query("query { foo }")
+                            .build(),
+                    ))
+                    .build();
+                subgraph_events.on_request(&subgraph_req_2);
+
+                // Out: Subgraphs -> Supergraph -> Router
+                let subgraph_resp_1 = subgraph::Response::fake2_builder()
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}]}))
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp_1);
+
+                let subgraph_resp_2 = subgraph::Response::fake2_builder()
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}], "other": {"foo": "bar"}}))
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp_2);
+
+                let supergraph_resp = supergraph::Response::fake_builder()
+                    .data(serde_json::json!({"data": "res"}).to_string())
+                    .build()
+                    .expect("expecting valid response");
+                supergraph_events.on_response(&supergraph_resp);
+
+                let router_resp = router::Response::fake_builder()
+                    .data(serde_json_bytes::json!({"data": "res"}))
+                    .build()
+                    .expect("expecting valid response");
+                router_events.on_response(&router_resp);
+            },
+        );
+
+        insta::with_settings!({ filters => json_snapshot_filters() }, {
+            insta::assert_snapshot!(buff.to_string());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_text_logging_with_custom_events_with_instrumented() {
+        let buff = LogBuffer::default();
+        let text_format = TextFormat {
+            display_span_list: true,
+            display_current_span: false,
+            display_resource: false,
+            ansi_escape_codes: false,
+            ..Default::default()
+        };
+        let format = Text::new(Resource::builder_empty().build(), text_format);
+        let fmt_layer = log_layers(format, &buff);
+
+        let event_config: events::Events = serde_yaml::from_str(EVENT_CONFIGURATION).unwrap();
+
+        ::tracing::subscriber::with_default(
+            fmt::Subscriber::new()
+                .with(otel::layer().with_tracer(make_tracer()))
+                .with(fmt_layer),
+            move || {
+                let test_span = info_span!(
+                    "test",
+                    first = "one",
+                    apollo_private.should_not_display = "this should be skipped"
+                );
+                test_span.set_span_dyn_attribute("another".into(), 2.into());
+                test_span.set_span_dyn_attribute("custom_dyn".into(), "test".into());
+                let _enter = test_span.enter();
+
+                let attributes = vec![
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body.size"),
+                        opentelemetry::Value::String("125".to_string().into()),
+                    ),
+                    KeyValue::new(
+                        Key::from_static_str("http.response.body"),
+                        opentelemetry::Value::String(r#"{"foo": "bar"}"#.to_string().into()),
+                    ),
+                ];
+                log_event(
+                    EventLevel::Info,
+                    "my_custom_event",
+                    attributes,
+                    "my message",
+                );
+
+                error!(http.method = "GET", "Hello from test");
+
+                let mut router_events = event_config.new_router_events();
+                let router_req = router::Request::fake_builder()
+                    .header(CONTENT_LENGTH, "0")
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .build()
+                    .unwrap();
+                router_events.on_request(&router_req);
+                let ctx = crate::Context::new();
+                ctx.extensions().with_lock(|ext| {
+                    ext.insert(RouterResponseBodyExtensionType(
+                        r#"{"data": {"data": "res"}}"#.to_string(),
+                    ));
+                });
+                let router_resp = router::Response::fake_builder()
+                    .header("custom-header", "val1")
+                    .header(CONTENT_LENGTH, "25")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json_bytes::json!({"data": "res"}))
+                    .context(ctx)
+                    .build()
+                    .expect("expecting valid response");
+                router_events.on_response(&router_resp);
+
+                let mut supergraph_events = event_config.new_supergraph_events();
+                let supergraph_req = supergraph::Request::fake_builder()
+                    .query("query { foo }")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .build()
+                    .unwrap();
+                supergraph_events.on_request(&supergraph_req);
+
+                let supergraph_resp = supergraph::Response::fake_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"data": "res"}).to_string())
+                    .build()
+                    .expect("expecting valid response");
+                supergraph_events.on_response(&supergraph_resp);
+
+                let mut subgraph_events = event_config.new_subgraph_events();
+                let mut subgraph_req = http::Request::new(
+                    graphql::Request::fake_builder()
+                        .query("query { foo }")
+                        .build(),
+                );
+                subgraph_req
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+
+                let subgraph_req = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph")
+                    .subgraph_request(subgraph_req)
+                    .build();
+                subgraph_events.on_request(&subgraph_req);
+
+                let subgraph_resp = subgraph::Response::fake2_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}]}))
+                    .subgraph_name("subgraph")
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp);
+
+                let mut subgraph_events = event_config.new_subgraph_events();
+                let mut subgraph_req = http::Request::new(
+                    graphql::Request::fake_builder()
+                        .query("query { foo }")
+                        .build(),
+                );
+                subgraph_req
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+
+                let subgraph_req = subgraph::Request::fake_builder()
+                    .subgraph_name("subgraph_bis")
+                    .subgraph_request(subgraph_req)
+                    .build();
+                subgraph_events.on_request(&subgraph_req);
+
+                let subgraph_resp = subgraph::Response::fake2_builder()
+                    .header("custom-header", "val1")
+                    .header("x-log-request", HeaderValue::from_static("log"))
+                    .data(serde_json::json!({"products": [{"id": 1234, "name": "first_name"}, {"id": 567, "name": "second_name"}], "other": {"foo": "bar"}}))
+                    .subgraph_name("subgraph_bis")
+                    .build()
+                    .expect("expecting valid response");
+                subgraph_events.on_response(&subgraph_resp);
+
+                let context = crate::Context::default();
+                let mut http_request = http::Request::builder().body("".into()).unwrap();
+                http_request
+                    .headers_mut()
+                    .insert("x-log-request", HeaderValue::from_static("log"));
+                let transport_request = TransportRequest::Http(Box::new(HttpRequest {
+                    inner: http_request,
+                    debug: Default::default(),
+                }));
+                let connector = Arc::new(Connector {
+                    id: ConnectId::new(
+                        "connector_subgraph".into(),
+                        Some(SourceName::cast("source")),
+                        name!(Query),
+                        name!(users),
+                        None,
+                        0,
+                    ),
+                    transport: Some(HttpJsonTransport {
+                        connect_template: StringTemplate::from_str("/test").unwrap(),
+                        ..Default::default()
+                    }),
+                    selection: JSONSelection::empty(),
+                    config: None,
+                    max_requests: None,
+                    entity_resolver: None,
+                    spec: ConnectSpec::V0_1,
+                    schema_subtypes_map: Default::default(),
+                    batch_settings: None,
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                    request_variable_keys: Default::default(),
+                    response_variable_keys: Default::default(),
+                    error_settings: Default::default(),
+                    output_type: None,
+                    label: "label".into(),
+                });
+                let response_key = ResponseKey::RootField {
+                    name: "hello".to_string(),
+                    inputs: Default::default(),
+                    selection: Arc::new(JSONSelection::parse("$.data").unwrap()),
+                };
+                let connector_request = Request {
+                    context: context.clone(),
+                    connector: connector.clone(),
+                    transport_request,
+                    key: response_key.clone(),
+                    mapping_problems: vec![
+                        Problem {
+                            count: 1,
+                            message: "error message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                        Problem {
+                            count: 2,
+                            message: "warn message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                        Problem {
+                            count: 3,
+                            message: "info message".to_string(),
+                            path: "@.id".to_string(),
+                            location: ProblemLocation::Selection,
+                        },
+                    ],
+                    supergraph_request: Default::default(),
+                    operation: Default::default(),
+                };
+                let mut connector_events = event_config.new_connector_events();
+                connector_events.on_request(&connector_request);
+
+                let connector_response = Response {
+                    context: context.clone(),
+                    subgraph_name: String::new(),
+                    transport_outcome: TransportOutcome::Response(HttpResponse {
+                        inner: http::Response::builder()
+                            .status(200)
+                            .header("x-log-response", HeaderValue::from_static("log"))
+                            .body(body::empty())
+                            .expect("expecting valid response")
+                            .into_parts()
+                            .0,
+                    }),
+                    mapped_response: MappedResponse::Data {
+                        data: serde_json::json!({})
+                            .try_into()
+                            .expect("expecting valid JSON"),
+                        key: response_key,
+                        problems: vec![
+                            Problem {
+                                count: 1,
+                                message: "error message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                            Problem {
+                                count: 2,
+                                message: "warn message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                            Problem {
+                                count: 3,
+                                message: "info message".to_string(),
+                                path: "@.id".to_string(),
+                                location: ProblemLocation::Selection,
+                            },
+                        ],
+                        declared_errors: vec![],
+                    },
+                    answered_by_router: false,
+                };
+                connector_events.on_response(&connector_response);
+            },
+        );
+
+        insta::assert_snapshot!(buff.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_json_logging_supergraph_response_event_per_deferred_chunk() {
+        use tower::ServiceExt;
+        use tracing::Instrument;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::TestHarness;
+        use crate::plugin::test::MockSubgraph;
+        use crate::plugins::telemetry::config_new::conditions::Condition;
+        use crate::plugins::telemetry::config_new::supergraph::events::SupergraphEventResponse;
+        use crate::services::router::ClientRequestAccepts;
+        use crate::test_harness::MockedSubgraphs;
+
+        let subgraphs = MockedSubgraphs([
+            ("user", MockSubgraph::builder().with_json(
+                    serde_json::json!{{"query":"{currentUser{__typename id}}"}},
+                    serde_json::json!{{"data": {"currentUser": { "__typename": "User", "id": "0" }}}}
+                )
+                .with_json(
+                    serde_json::json!{{
+                        "query":"query($representations:[_Any!]!){_entities(representations:$representations){...on User{name}}}",
+                        "variables": {"representations":[{"__typename": "User", "id":"0"}]}
+                    }},
+                    serde_json::json!{{"data": {"_entities": [{ "name": "deferred name" }]}}}
+                ).build()),
+            ("orga", MockSubgraph::default())
+        ].into_iter().collect());
+
+        let service = TestHarness::builder()
+            .schema(include_str!("../../testdata/orga_supergraph.graphql"))
+            .extra_plugin(subgraphs)
+            .build_supergraph()
+            .await
+            .unwrap();
+
+        let context = crate::Context::new();
+        context.extensions().with_lock(|lock| {
+            lock.insert(ClientRequestAccepts {
+                multipart_defer: true,
+                ..Default::default()
+            });
+            // What the telemetry plugin inserts for `events.supergraph.response: info`.
+            lock.insert(SupergraphEventResponse {
+                level: EventLevel::Info,
+                condition: Arc::new(Condition::True),
+            });
+        });
+        let request = supergraph::Request::fake_builder()
+            .context(context)
+            .query("query { currentUser { id  ...@defer { name } } }")
+            .build()
+            .unwrap();
+
+        let buff = LogBuffer::default();
+        let format = Json::new(
+            Resource::builder_empty().build(),
+            JsonFormat {
+                display_span_list: false,
+                display_current_span: false,
+                display_resource: false,
+                ..Default::default()
+            },
+        );
+        let fmt_layer = log_layers(format, &buff);
+        let subscriber = fmt::Subscriber::new()
+            .with(otel::layer().with_tracer(make_tracer()))
+            .with(fmt_layer);
+
+        let chunks: Vec<String> = async move {
+            // Events attach their attributes to the current span, which must be created
+            // once the subscriber is installed.
+            async move {
+                let mut stream = service.oneshot(request).await.unwrap();
+                let mut chunks = Vec::new();
+                while let Some(chunk) = stream.next_response().await {
+                    chunks.push(serde_json::to_string(&chunk).unwrap());
+                }
+                chunks
+            }
+            .instrument(info_span!("test"))
+            .await
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let logs = buff.to_string();
+        let events: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains(r#""kind":"supergraph.response""#))
+            .collect();
+        assert_eq!(chunks.len(), 2, "expected a primary and a deferred chunk");
+        assert_eq!(events.len(), chunks.len());
+        for (event, chunk) in events.iter().zip(&chunks) {
+            assert_eq!(event.matches(r#""http.response.body""#).count(), 1);
+            let event: serde_json::Value = serde_json::from_str(event).unwrap();
+            assert_eq!(event["http.response.body"].as_str(), Some(chunk.as_str()));
+        }
+    }
+
+    // TODO add test using on_request/on_reponse/on_error
+}

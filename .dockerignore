@@ -1,0 +1,6 @@
+vendor/router/target
+vendor/fedutils-build-plugins
+tickets-mcp/node_modules
+tickets-mcp/dist
+.git
+.rover/bin

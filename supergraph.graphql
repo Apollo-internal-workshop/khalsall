@@ -1,0 +1,243 @@
+schema @link(url: "https://specs.apollo.dev/link/v1.0") @link(url: "https://specs.apollo.dev/join/v0.6", for: EXECUTION) @link(url: "https://specs.apollo.dev/tag/v0.3") @link(url: "https://specs.apollo.dev/authenticated/v0.1", for: SECURITY) @link(url: "https://specs.apollo.dev/requiresScopes/v0.1", for: SECURITY) @link(url: "https://specs.apollo.dev/connect/v0.5", for: EXECUTION) @join__directive(name: "link", graphs: [ORDERS, TICKETS], args: {url: "https://specs.apollo.dev/connect/v0.5", import: ["@connect", "@source"]}) @join__directive(name: "source", graphs: [ORDERS], args: {name: "api", http: {baseURL: "https://rest-api-j3nprurqka-uc.a.run.app/api"}}) @join__directive(name: "source", graphs: [TICKETS], args: {name: "tickets", http: {baseURL: "http://127.0.0.1:8081"}, mcp: {path: "/mcp"}}) {
+  query: Query
+  subscription: Subscription
+}
+
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean, overrideLabel: String, contextArguments: [join__ContextArgument!]) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+
+directive @join__directive(graphs: [join__Graph!], name: String!, args: join__DirectiveArguments) repeatable on SCHEMA | OBJECT | INTERFACE | FIELD_DEFINITION
+
+directive @tag(name: String!) repeatable on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION | SCHEMA
+
+directive @authenticated on FIELD_DEFINITION | OBJECT | INTERFACE | SCALAR | ENUM
+
+directive @requiresScopes(scopes: [[requiresScopes__Scope!]!]!) on FIELD_DEFINITION | OBJECT | INTERFACE | SCALAR | ENUM
+
+enum link__Purpose {
+  """
+  `SECURITY` features provide metadata necessary to securely resolve fields.
+  """
+  SECURITY
+  """
+  `EXECUTION` features provide metadata necessary for operation execution.
+  """
+  EXECUTION
+}
+
+scalar link__Import
+
+enum join__Graph {
+  CUSTOMERS @join__graph(name: "customers", url: "https://subgraph-customers-j3nprurqka-ue.a.run.app")
+  ORDERS @join__graph(name: "orders", url: "https://subgraph-orders-j3nprurqka-ue.a.run.app")
+  PRODUCTS @join__graph(name: "products", url: "https://subgraph-products-j3nprurqka-ue.a.run.app")
+  TICKETS @join__graph(name: "tickets", url: "http://tickets")
+}
+
+scalar join__FieldSet
+
+scalar join__DirectiveArguments
+
+scalar join__FieldValue
+
+input join__ContextArgument {
+  name: String!
+  type: String!
+  context: String!
+  selection: join__FieldValue!
+}
+
+scalar requiresScopes__Scope
+
+type Query @join__type(graph: CUSTOMERS) @join__type(graph: ORDERS) @join__type(graph: PRODUCTS) @join__type(graph: TICKETS) {
+  users: [User] @join__field(graph: CUSTOMERS)
+  user(id: ID!): User @join__field(graph: CUSTOMERS)
+  """
+  Get a specific order by id. Meant to be used for a detailed view of an order
+  """
+  order(id: ID!): Order @join__field(graph: ORDERS) @join__directive(name: "connect", graphs: [ORDERS], args: {source: "api", http: {GET: "/orders/{$args.id}"}, selection: "id\nbuyer: { id: $.customerId }\nitems: $.variantIds { id: $ }", entity: true}) @authenticated
+  """
+  Get all available products to shop for. Optionally provide some search filters
+  """
+  searchProducts(searchInput: ProductSearchInput! = {}): [Product]! @join__field(graph: PRODUCTS)
+  """Get all featured products to be listed"""
+  getFeaturedProducts(limit: Int): [Product]! @join__field(graph: PRODUCTS)
+  """Get products based on a single category"""
+  getProductsByCategory(category: ProductCategory!, limit: Int): [Product]! @join__field(graph: PRODUCTS)
+  """
+  Get all available variants of products to shop for. Optionally provide some search filters
+  """
+  searchProductVariants(searchInput: VariantSearchInput! = {}): [ProductVariant]! @join__field(graph: PRODUCTS)
+  """
+  Get a specific product by id. Useful for the product details page or checkout page
+  """
+  product(id: ID!): Product @join__field(graph: PRODUCTS)
+  """
+  Get a specific variant by id. Useful for the product details page or checkout page
+  """
+  productVariant(id: ID!): ProductVariant @join__field(graph: PRODUCTS)
+}
+
+"""An user account in our system"""
+type User @join__type(graph: CUSTOMERS, key: "id") @join__type(graph: ORDERS, key: "id", resolvable: false) @join__type(graph: PRODUCTS, key: "id", resolvable: false) @join__type(graph: TICKETS, key: "id", resolvable: false) {
+  id: ID! @join__field(graph: CUSTOMERS) @join__field(graph: ORDERS) @join__field(graph: PRODUCTS) @join__field(graph: TICKETS, external: true)
+  firstName: String @join__field(graph: CUSTOMERS) @tag(name: "private")
+  lastName: String @join__field(graph: CUSTOMERS) @tag(name: "private")
+  address: String @join__field(graph: CUSTOMERS) @tag(name: "private")
+  phone: String @join__field(graph: CUSTOMERS) @tag(name: "private")
+  email: String! @join__field(graph: CUSTOMERS) @join__field(graph: TICKETS, external: true) @tag(name: "private")
+  """
+  The user's active cart session. Once the cart items have been purchases, they transition to an Order
+  """
+  activeCart: Cart @join__field(graph: CUSTOMERS)
+  """The users previous purchases"""
+  orders(filters: OrderFilters): [Order] @join__field(graph: CUSTOMERS)
+  paymentMethods: [PaymentMethod] @join__field(graph: CUSTOMERS)
+  """Support tickets filed by this user, via the `search_tickets` tool."""
+  tickets: [Ticket] @join__field(graph: TICKETS, requires: "email") @join__directive(name: "connect", graphs: [TICKETS], args: {source: "tickets", mcp: {tool: "search_tickets", arguments: "email: $this.email"}, selection: "$.tickets {\n  id\n  email\n  subject\n  status\n  priority\n  orderId\n}"})
+}
+
+"""Search filters for when showing an users previous purchases"""
+input OrderFilters @join__type(graph: CUSTOMERS) {
+  orderId: ID!
+  priceHigh: Float
+  priceLow: Float
+  itemsInOrder: Int
+}
+
+"""An user's saved cart session. Only one cart can be active at a time"""
+type Cart @join__type(graph: CUSTOMERS, key: "owner { id }") {
+  """Owner of the cart session"""
+  owner: User!
+  """Items saved in the cart session"""
+  items: [ProductVariant]
+  subtotal: Float! @join__field(graph: CUSTOMERS, requires: "items { price }")
+}
+
+"""Returns information about a specific purchase"""
+type Order @join__type(graph: CUSTOMERS, key: "id", resolvable: false) @join__type(graph: ORDERS, key: "id") {
+  """
+  Each order has a unique id which is separate from the user or items they bought
+  """
+  id: ID!
+  """The user who made the purchase"""
+  buyer: User! @join__field(graph: ORDERS) @requiresScopes(scopes: [["order:buyer"]])
+  """
+  A list of all the items they purchased. This is the Variants, not the Products so we know exactly which
+  product and which size/color/feature was bought
+  """
+  items: [ProductVariant!]! @join__field(graph: ORDERS)
+}
+
+"""
+A variant of a product which is a unique combination of attributes like size and color
+Variants are the entities that are added to carts and purchased
+"""
+type ProductVariant @join__type(graph: CUSTOMERS, key: "id", resolvable: false) @join__type(graph: ORDERS, key: "id", resolvable: false) @join__type(graph: PRODUCTS, key: "id") {
+  id: ID!
+  """Price in decimals for this variant"""
+  price: Float! @join__field(graph: CUSTOMERS, external: true) @join__field(graph: PRODUCTS)
+  """Link back to the parent Product SKU"""
+  parent: Product @join__field(graph: PRODUCTS)
+  """Optional color option for this variant"""
+  colorway: String @join__field(graph: PRODUCTS)
+  """Optional size option for this variant"""
+  size: String @join__field(graph: PRODUCTS)
+  """Variant is available for purchase"""
+  inStock: Boolean! @join__field(graph: PRODUCTS)
+}
+
+type PaymentMethod @join__type(graph: CUSTOMERS) {
+  id: ID!
+  cardNumber: String!
+}
+
+"""Available categories that a product can be classified as"""
+enum ProductCategory @join__type(graph: PRODUCTS) {
+  CLOTHING @join__enumValue(graph: PRODUCTS)
+  TOPS @join__enumValue(graph: PRODUCTS)
+  BOTTOMS @join__enumValue(graph: PRODUCTS)
+  COLLECTIONS @join__enumValue(graph: PRODUCTS)
+  WOMEN @join__enumValue(graph: PRODUCTS)
+  MEN @join__enumValue(graph: PRODUCTS)
+  HOODIES @join__enumValue(graph: PRODUCTS)
+  SHORTS @join__enumValue(graph: PRODUCTS)
+  PERFORMANCE @join__enumValue(graph: PRODUCTS)
+  UNDERWEAR @join__enumValue(graph: PRODUCTS)
+  ECO @join__enumValue(graph: PRODUCTS)
+  PROMOTIONS @join__enumValue(graph: PRODUCTS)
+  PANTS @join__enumValue(graph: PRODUCTS)
+  RECOMMENDATIONS @join__enumValue(graph: PRODUCTS)
+  TEES @join__enumValue(graph: PRODUCTS)
+  YOGA @join__enumValue(graph: PRODUCTS)
+}
+
+"""Search filters for when returning Products"""
+input ProductSearchInput @join__type(graph: PRODUCTS) {
+  """Specify part of the title of the product"""
+  titleContains: String
+  """Limit the number of items returned"""
+  limit: Int
+  """Specify a set of categories that the product is a part of"""
+  categories: [ProductCategory]
+  featured: Boolean
+}
+
+"""Search filters for when returning Variants"""
+input VariantSearchInput @join__type(graph: PRODUCTS) {
+  sizeStartsWith: String
+}
+
+"""
+A specific product sold by our store. This contains all the high level details but is not the purchasable item.
+See Variant for more info.
+"""
+type Product @join__type(graph: PRODUCTS, key: "sku") @join__type(graph: PRODUCTS, key: "id") {
+  id: ID!
+  name: String!
+  sku: String!
+  description: String
+  images: [String]
+  price: Float!
+  attributes: [Attribute]
+  variants: [ProductVariant]
+  featured: Boolean!
+  shortDescription: String
+}
+
+type Attribute @join__type(graph: PRODUCTS) {
+  name: String!
+  values: [String]!
+}
+
+type Review @join__type(graph: PRODUCTS, key: "id") {
+  id: Int!
+  body: String!
+  product: Product!
+  user: User!
+}
+
+type Subscription @join__type(graph: PRODUCTS) {
+  reviewAdded: Review
+}
+
+"""A support ticket. Tickets are looked up by the requester's email."""
+type Ticket @join__type(graph: TICKETS, key: "id", resolvable: false) {
+  id: ID!
+  email: String!
+  subject: String!
+  status: String!
+  priority: String
+  orderId: ID
+}

@@ -1,0 +1,14 @@
+supergraph:
+  listen: 127.0.0.1:4300
+  introspection: true
+sandbox:
+  enabled: true
+homepage:
+  enabled: false
+include_subgraph_errors:
+  all: true
+connectors:
+  preview_connect_v0_5: true
+expose_query_plan: true
+health_check:
+  listen: 127.0.0.1:8300

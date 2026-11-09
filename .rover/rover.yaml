@@ -1,0 +1,5 @@
+plugins:
+  supergraph: "=3.0.0-preview.connectors-mcp"
+  router: "=3.0.0-preview.connectors-mcp"
+settings:
+  APOLLO_ROVER_ALLOW_AUTOMATIC_DOWNLOAD: false

@@ -1,0 +1,41 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.12", import: ["@key", "@external", "@requires"])
+  @link(url: "https://specs.apollo.dev/connect/v0.5", import: ["@connect", "@source"])
+  @source(name: "tickets", http: { baseURL: "http://127.0.0.1:8081" }, mcp: { path: "/mcp" })
+
+"""
+The Tickets MCP server only knows requesters by email. It extends User and
+needs the (possibly restricted) email to look up that user's tickets.
+"""
+type User @key(fields: "id", resolvable: false) {
+  id: ID! @external
+  email: String! @external
+
+  "Support tickets filed by this user, via the `search_tickets` tool."
+  tickets: [Ticket]
+    @requires(fields: "email")
+    @connect(
+      source: "tickets"
+      mcp: { tool: "search_tickets", arguments: "email: $this.email" }
+      selection: """
+      $.tickets {
+        id
+        email
+        subject
+        status
+        priority
+        orderId
+      }
+      """
+    )
+}
+
+"A support ticket. Tickets are looked up by the requester's email."
+type Ticket @key(fields: "id", resolvable: false) {
+  id: ID!
+  email: String!
+  subject: String!
+  status: String!
+  priority: String
+  orderId: ID
+}

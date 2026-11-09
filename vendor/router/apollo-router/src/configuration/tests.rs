@@ -1,0 +1,1837 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+use http::Uri;
+#[cfg(unix)]
+use insta::assert_json_snapshot;
+use regex::Regex;
+use rust_embed::RustEmbed;
+use schemars::generate::SchemaSettings;
+use serde_json::json;
+use walkdir::DirEntry;
+use walkdir::WalkDir;
+
+use super::apollo_configuration_parse::ExternalValues;
+use super::apollo_configuration_parse::Migration;
+use super::apollo_configuration_parse::STARTUP_MIGRATED_SETTING;
+use super::apollo_configuration_parse::parse_configuration;
+use super::apollo_configuration_parse::parse_without_inputs;
+use super::subgraph::SubgraphConfiguration;
+use super::*;
+use crate::configuration::cors::Policy;
+use crate::error::SchemaError;
+
+#[cfg(unix)]
+#[test]
+fn schema_generation() {
+    let schema = generate_config_schema();
+    insta::with_settings!({sort_maps => true}, {
+        assert_json_snapshot!(&schema);
+    });
+    let json_schema =
+        serde_json::to_string_pretty(&schema).expect("must be able to deserialize schema");
+    assert!(
+        json_schema.len() < 500 * 1024,
+        "schema must be less than 500kb"
+    );
+}
+
+/// The schema declares draft 2020-12 and is valid against that draft's meta-schema, which
+/// `meta::validate` selects from the schema's own `$schema`.
+#[test]
+fn schema_is_valid() {
+    let schema = generate_config_schema();
+    assert_eq!(
+        schema.get("$schema"),
+        Some(&json!("https://json-schema.org/draft/2020-12/schema"))
+    );
+    jsonschema::meta::validate(schema.as_value()).expect("generated schema must be valid");
+}
+
+#[test]
+fn routing_url_in_schema() {
+    let schema = include_str!("../testdata/minimal_local_inventory_supergraph.graphql");
+    let schema = crate::spec::Schema::parse(schema, &Default::default()).unwrap();
+
+    let subgraphs: HashMap<&str, &Uri> = schema.subgraphs().map(|(k, v)| (k.as_str(), v)).collect();
+
+    // if no configuration override, use the URL from the supergraph
+    assert_eq!(
+        subgraphs.get("accounts").unwrap().to_string(),
+        "http://localhost:4001/graphql"
+    );
+    // if both configuration and schema specify a non empty URL, the configuration wins
+    // this should show a warning in logs
+    assert_eq!(
+        subgraphs.get("inventory").unwrap().to_string(),
+        "http://localhost:4002/graphql"
+    );
+    // if the configuration has a non empty routing URL, and the supergraph
+    // has an empty one, the configuration wins
+    assert_eq!(
+        subgraphs.get("products").unwrap().to_string(),
+        "http://localhost:4003/graphql"
+    );
+
+    assert_eq!(
+        subgraphs.get("reviews").unwrap().to_string(),
+        "http://localhost:4004/graphql"
+    );
+}
+
+#[test]
+fn missing_subgraph_url() {
+    let schema_error =
+        include_str!("../testdata/invalid_minimal_supergraph_missing_subgraph_url.graphql");
+    let schema_error = crate::spec::Schema::parse(schema_error, &Default::default())
+        .expect_err("Must have an error because we have one missing subgraph routing url");
+
+    if let SchemaError::MissingSubgraphUrl(subgraph) = schema_error {
+        assert_eq!(subgraph, "reviews");
+    } else {
+        panic!("expected missing subgraph URL for 'reviews', got: {schema_error:?}");
+    }
+}
+
+#[test]
+fn cors_defaults() {
+    let cors = Cors::builder().build();
+    let policies = cors.policies.unwrap();
+    assert_eq!(policies.len(), 1);
+    assert_eq!(
+        policies[0].origins,
+        Arc::from(["https://studio.apollographql.com".into()])
+    );
+    assert!(
+        !cors.allow_any_origin,
+        "Allow any origin should be disabled by default"
+    );
+    assert_eq!(
+        cors.methods,
+        Arc::from(["GET".into(), "POST".into(), "OPTIONS".into()])
+    );
+    assert!(cors.max_age.is_none());
+}
+
+#[test]
+fn cors_single_origin_config() {
+    let cors = Cors::builder()
+        .max_age(std::time::Duration::from_secs(3600))
+        .policies(vec![
+            Policy::builder()
+                .origins(vec!["https://trusted.com".into()])
+                .allow_credentials(true)
+                .allow_headers(vec!["content-type".into(), "authorization".into()])
+                .expose_headers(vec!["x-custom-header".into()])
+                .methods(vec!["GET".into(), "POST".into()])
+                .build(),
+        ])
+        .build();
+    let policies = cors.policies.unwrap();
+    assert_eq!(policies.len(), 1);
+    let oc = &policies[0];
+    assert_eq!(oc.origins, Arc::from(["https://trusted.com".into()]));
+    assert!(oc.allow_credentials.unwrap());
+    assert_eq!(
+        oc.allow_headers,
+        Arc::from(["content-type".into(), "authorization".into()])
+    );
+    assert_eq!(oc.expose_headers, Arc::from(["x-custom-header".into()]));
+    assert_eq!(oc.methods, Some(Arc::from(["GET".into(), "POST".into()])));
+}
+
+#[test]
+fn bad_graphql_path_configuration_without_slash() {
+    let error = Configuration::fake_builder()
+        .supergraph(Supergraph::fake_builder().path("test").build())
+        .build()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        String::from(
+            "invalid 'server.graphql_path' configuration: 'test' is invalid, it must be an absolute path and start with '/', you should try with '/test'"
+        )
+    );
+}
+
+#[test]
+fn bad_graphql_path_configuration_with_wildcard_as_prefix() {
+    let error = Configuration::fake_builder()
+        .supergraph(Supergraph::fake_builder().path("/*/test").build())
+        .build()
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        String::from(
+            "invalid 'server.graphql_path' configuration: '/*/test' is invalid, if you need to set a path like '/*/graphql' then specify it as a path parameter with a name, for example '/:my_project_key/graphql'"
+        )
+    );
+}
+
+#[test]
+fn unknown_fields() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  path: /
+subgraphs:
+  account: true
+  "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error")
+    .to_string();
+    insta::assert_snapshot!(error);
+}
+
+#[test]
+fn unknown_fields_at_root() {
+    let error = parse_configuration(
+        r#"
+unknown:
+  foo: true
+  "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error")
+    .to_string();
+    insta::assert_snapshot!(error);
+}
+
+#[test]
+fn empty_config() {
+    parse_configuration(
+        r#"
+  "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect("should have been ok with an empty config");
+}
+
+#[test]
+fn line_precise_config_errors() {
+    let error = parse_configuration(
+        r#"
+plugins:
+  non_existant:
+    foo: "bar"
+
+telemetry:
+  another_non_existant: 3
+  "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn line_precise_config_errors_with_errors_after_first_field() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  # The socket address and port to listen on
+  # Defaults to 127.0.0.1:4000
+  listen: 127.0.0.1:4000
+  bad: "donotwork"
+  another_one: true
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn line_precise_config_errors_bad_type() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  # The socket address and port to listen on
+  # Defaults to 127.0.0.1:4000
+  listen: true
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn line_precise_config_errors_with_inline_sequence() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  # The socket address and port to listen on
+  # Defaults to 127.0.0.1:4000
+  listen: 127.0.0.1:4000
+cors:
+  allow_headers: [ Content-Type, 5 ]
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn line_precise_config_errors_with_sequence() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  # The socket address and port to listen on
+  # Defaults to 127.0.0.1:4000
+  listen: 127.0.0.1:4000
+cors:
+  allow_headers:
+    - Content-Type
+    - 5
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn it_does_not_allow_invalid_cors_headers() {
+    let cfg = parse_configuration(
+        r#"
+cors:
+  allow_credentials: true
+  allow_headers: [ "*" ]
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect("should not have resulted in an error");
+    let error = cfg
+        .cors
+        .into_layer()
+        .expect_err("should have resulted in an error");
+    assert_eq!(
+        error,
+        "Invalid CORS configuration: Cannot combine `Access-Control-Allow-Credentials: true` with `Access-Control-Allow-Headers: *` in policy"
+    );
+}
+
+#[test]
+fn it_does_not_allow_invalid_cors_methods() {
+    let cfg = parse_configuration(
+        r#"
+cors:
+  allow_credentials: true
+  methods: [ GET, "*" ]
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect("should not have resulted in an error");
+    let error = cfg
+        .cors
+        .into_layer()
+        .expect_err("should have resulted in an error");
+    assert_eq!(
+        error,
+        "Invalid CORS configuration: Cannot combine `Access-Control-Allow-Credentials: true` with `Access-Control-Allow-Methods: *` in policy"
+    );
+}
+
+#[test]
+fn cors_does_not_allow_invalid_cors_origins() {
+    let cfg = parse_configuration(
+        r#"
+cors:
+  allow_credentials: true
+  allow_any_origin: true
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect("should not have resulted in an error");
+    let error = cfg
+        .cors
+        .into_layer()
+        .expect_err("should have resulted in an error");
+    assert_eq!(
+        error,
+        "Invalid CORS configuration: Cannot combine `Access-Control-Allow-Credentials: true` with `allow_any_origin: true`"
+    );
+}
+
+#[test]
+fn cors_doesnt_allow_origins_wildcard() {
+    let cfg = parse_configuration(
+        r#"
+cors:
+  policies:
+    - origins: ["*"]
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect("should not have resulted in an error");
+    let error = cfg
+        .cors
+        .into_layer()
+        .expect_err("should have resulted in an error");
+    assert_eq!(
+        error,
+        "Invalid CORS configuration: use `allow_any_origin: true` to set `Access-Control-Allow-Origin: *`"
+    );
+}
+
+#[test]
+fn validate_project_config_files() {
+    // Every document is parsed with the same external values, so the parser is built once.
+    let expansion = Expansion::default_builder()
+        .mocked_env_vars(super::test_discovery::discovery_env_vars())
+        .build()
+        .unwrap();
+    let mut parser = ExternalValues::from(expansion).into_parser().unwrap();
+    // Documents are checked as written, so none relies on startup migration.
+    let errors: Vec<String> = super::test_discovery::discover_project_configs()
+        .iter()
+        .filter_map(|doc| {
+            parser
+                .parse_with_migration(&doc.yaml, Migration::None)
+                .err()
+                .map(|error| format!("{} configuration error: \n{error}", doc.path.display()))
+        })
+        .collect();
+    assert!(errors.is_empty(), "{}", errors.join("\n\n"));
+}
+
+#[test]
+fn it_does_not_leak_env_variable_values() {
+    let expansion = Expansion::default_builder()
+        .mocked_env_var("TEST_CONFIG_NUMERIC_ENV_UNIQUE", "5")
+        .build()
+        .unwrap();
+    let error = parse_configuration(
+        r#"
+supergraph:
+  introspection: ${env.TEST_CONFIG_NUMERIC_ENV_UNIQUE:-true}
+        "#,
+        expansion,
+        Migration::None,
+    )
+    .expect_err("Must have an error because we expect a boolean");
+    insta::assert_snapshot!(error.to_string());
+}
+
+/// A mistyped secret fails schema validation. The error must point at the setting in the file
+/// without printing the value, whether it is a scalar or a list. The previous loader printed
+/// both the YAML line and the rejected value.
+#[test]
+fn schema_validation_errors_do_not_print_secret_values() {
+    for (password, secrets) in [
+        ("987654321", &["987654321"][..]),
+        (
+            "[first-secret-part, second-secret-part]",
+            &["first-secret-part", "second-secret-part"][..],
+        ),
+    ] {
+        let text = format!(
+            "# Redis for the query plan cache\nsupergraph:\n  query_planning:\n    cache:\n      redis:\n        urls: [\"redis://localhost\"]\n        password: {password}\n"
+        );
+
+        let error = Configuration::from_str(&text)
+            .expect_err("a Redis password must be a string")
+            .to_string();
+
+        for secret in secrets {
+            assert!(
+                !error.contains(secret),
+                "the error must not print the secret: {error}"
+            );
+        }
+        assert!(
+            error.contains("password: [REDACTED]"),
+            "the snippet should quote the setting with its value redacted: {error}"
+        );
+        // The comment makes the Redis settings start on line 6 of the file.
+        assert!(
+            error.contains("[6:9]"),
+            "the error should refer to the setting's line in the file: {error}"
+        );
+    }
+}
+
+/// A secret supplied through expansion is not printed when its expanded value is invalid.
+#[test]
+fn schema_validation_errors_do_not_print_expanded_secret_values() {
+    let expansion = Expansion::builder()
+        .supported_mode("env")
+        .mocked_env_var("TEST_CONFIG_REDIS_PASSWORD", "expanded-secret-value") // gitleaks:allow
+        .build();
+    let error = parse_configuration(
+        "supergraph:\n  query_planning:\n    cache:\n      redis:\n        urls: [\"redis://localhost\"]\n        password: ${env.TEST_CONFIG_REDIS_PASSWORD}\n        unexpected: true\n",
+        expansion,
+        Migration::None,
+    )
+    .expect_err("the Redis settings contain an unknown field")
+    .to_string();
+
+    assert!(!error.contains("expanded-secret-value"), "{error}");
+    assert!(error.contains("unexpected"), "{error}");
+}
+
+/// Connector `$config` values declare no type, so an expanded value resolves as the same text
+/// written directly in YAML would.
+#[test]
+fn expanded_connector_config_values_resolve_like_yaml() {
+    let expansion = Expansion::builder()
+        .supported_mode("env")
+        .mocked_env_var("FIVE", "5")
+        .mocked_env_var("FALSE", "false")
+        .mocked_env_var("NULL", "~")
+        .mocked_env_var("EMPTY", "")
+        .mocked_env_var("PADDED", "0042")
+        .mocked_env_var("TEXT", "hello")
+        .build();
+    let config = parse_configuration(
+        "connectors:\n  sources:\n    products.api:\n      $config:\n        timeout: ${env.FIVE}\n        enabled: ${env.FALSE}\n        region: ${env.NULL}\n        token: ${env.EMPTY}\n        code: ${env.PADDED}\n        name: ${env.TEXT}\n        label: count-${env.FIVE}\n",
+        expansion,
+        Migration::None,
+    )
+    .expect("the connector config is valid");
+
+    let document = config.validated_yaml.expect("the retained document");
+    assert_eq!(
+        document["connectors"]["sources"]["products.api"]["$config"],
+        json!({
+            "timeout": 5,
+            "enabled": false,
+            "region": null,
+            "token": null,
+            "code": "0042",
+            "name": "hello",
+            "label": "count-5",
+        })
+    );
+}
+
+/// gRPC metadata values are header values, so an expanded value that looks like a number or a
+/// boolean must stay a string rather than resolve as YAML.
+#[test]
+fn expanded_otlp_grpc_metadata_values_stay_strings() {
+    let expansion = Expansion::builder()
+        .supported_mode("env")
+        .mocked_env_var("API_KEY", "12345")
+        .mocked_env_var("FLAG", "true")
+        .build();
+    let config = parse_configuration(
+        "telemetry:\n  exporters:\n    tracing:\n      otlp:\n        enabled: true\n        protocol: grpc\n        grpc:\n          metadata:\n            x-api-key: ${env.API_KEY}\n            x-flags:\n              - ${env.FLAG}\n",
+        expansion,
+        Migration::None,
+    )
+    .expect("the metadata values are strings");
+
+    let document = config.validated_yaml.expect("the retained document");
+    assert_eq!(
+        document["telemetry"]["exporters"]["tracing"]["otlp"]["grpc"]["metadata"],
+        json!({ "x-api-key": "12345", "x-flags": ["true"] })
+    );
+}
+
+/// An expansion reference anchored in a non-secret field and aliased into `password`.
+const ANCHORED_EXPANSION: &str = "apq:\n  router:\n    cache:\n      redis:\n        urls: [\"redis://localhost\"]\n        timeout: &pw ${env.TEST_CONFIG_REDIS_PASSWORD}\n        password: *pw\n";
+
+fn parse_anchored_expansion(text: &str) -> String {
+    let expansion = Expansion::builder()
+        .supported_mode("env")
+        .mocked_env_var("TEST_CONFIG_REDIS_PASSWORD", "aliased-secret-value") // gitleaks:allow
+        .build();
+    parse_configuration(text, expansion, Migration::WithinMajor)
+        .expect_err("the Redis timeout is invalid")
+        .to_string()
+}
+
+/// Pins a known limitation: apollo-configuration redacts `password`, but the error about the
+/// anchoring `timeout` quotes the value its expansion reference resolved to. When
+/// apollo-configuration redacts values reached through an anchor, this should assert that the
+/// value is hidden.
+#[test]
+fn errors_about_an_anchored_expansion_quote_the_value_aliased_into_a_secret_field() {
+    let error = parse_anchored_expansion(ANCHORED_EXPANSION);
+
+    assert!(error.contains("expected a duration"), "{error}");
+    assert!(
+        error.contains("password: [REDACTED]"),
+        "the secret field itself must stay redacted: {error}"
+    );
+    assert!(
+        error.contains("aliased-secret-value"),
+        "expected the known limitation; update this test if anchored values are redacted: {error}"
+    );
+}
+
+/// With a removed setting, startup migrates the document first and loads the migrated copy,
+/// which fails on the timeout. Pins the same known limitation as above: the copy has no YAML
+/// aliases, so the error quotes the value the anchored reference resolved to, whether the variable
+/// or the reference's default supplies it. The secret field itself stays redacted.
+#[test]
+fn migrated_anchored_expansions_quote_the_value_aliased_into_a_secret_field() {
+    for (secret, value) in [
+        (Some("synthetic-secret"), "synthetic-secret"),
+        (None, "fallback-secret-value"),
+    ] {
+        let mut expansion = Expansion::builder().supported_mode("env");
+        if let Some(secret) = secret {
+            expansion = expansion.mocked_env_var("TEST_CONFIG_REDIS_PASSWORD", secret);
+        }
+        let error = parse_configuration(
+            &format!(
+                "{STARTUP_MIGRATED_SETTING}apq:\n  router:\n    cache:\n      redis:\n        urls: [\"redis://localhost\"]\n        timeout: &pw ${{env.TEST_CONFIG_REDIS_PASSWORD:-fallback-secret-value}}\n        password: *pw\n"
+            ),
+            expansion.build(),
+            Migration::WithinMajor,
+        )
+        .expect_err("the Redis timeout is invalid")
+        .to_string();
+
+        assert!(error.contains("invalid value"), "{error}");
+        assert!(error.contains("password: [REDACTED]"), "{error}");
+        assert!(
+            error.contains(value),
+            "expected the known limitation; update this test if anchors survive migration: {error}"
+        );
+    }
+}
+
+#[test]
+fn redacted_tls_key_errors_name_the_failure_without_the_input() {
+    let client_key = include_str!("../services/http/testdata/client.key");
+    let cases = [
+        (
+            "-----BEGIN secret-key-with-missing-footer-----\nc2VjcmV0\n".to_string(),
+            LoadKeyError::Malformed,
+        ),
+        (
+            "-----BEGIN PRIVATE KEY-----\nsecret-key!!!\n-----END PRIVATE KEY-----\n".to_string(),
+            LoadKeyError::Malformed,
+        ),
+        (
+            include_str!("../services/http/testdata/server.crt").to_string(),
+            LoadKeyError::NotAPrivateKey,
+        ),
+        (
+            "secret-key-without-any-pem-markers".to_string(),
+            LoadKeyError::Missing,
+        ),
+        (
+            format!("{client_key}{client_key}"),
+            LoadKeyError::MultipleItems,
+        ),
+    ];
+
+    for (key, expected) in cases {
+        assert_eq!(load_key(&key).unwrap_err(), expected, "{key}");
+
+        let error = serde_json::from_value::<TlsClientAuth>(json!({
+            "certificate_chain": "",
+            "key": key,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&expected.to_string()), "{error}");
+        assert!(!error.contains("secret-key"), "{error}");
+        assert!(!error.contains("c2VjcmV0"), "{error}");
+        assert!(!error.contains("BEGIN"), "{error}");
+    }
+}
+
+#[test]
+fn redacted_tls_key_preserves_pem_contents() {
+    let pem = include_str!("../services/http/testdata/client.key");
+    let config: TlsClientAuth = serde_json::from_value(json!({
+        "certificate_chain": "",
+        "key": pem,
+    }))
+    .unwrap();
+    assert_eq!(config.key.unredact(), &load_key(pem).unwrap());
+    let identical: TlsClientAuth = serde_json::from_value(json!({
+        "certificate_chain": "",
+        "key": pem,
+    }))
+    .unwrap();
+    assert_eq!(config, identical);
+    let rotated = TlsClientAuth {
+        certificate_chain: vec![],
+        key: load_key(include_str!("../services/http/testdata/server.key"))
+            .unwrap()
+            .into(),
+    };
+    assert_ne!(config, rotated);
+    assert_eq!(
+        format!("{config:?}"),
+        "TlsClientAuth { certificate_chain: [], key: [REDACTED] }"
+    );
+}
+
+#[test]
+fn redacted_redis_credentials_are_hidden_from_debug_output() {
+    let config: QueryPlanRedisCache = serde_json::from_value(json!({
+        "urls": ["redis://localhost:6379"],
+        "username": "redis-admin",
+        "password": "hunter2-super-secret", // gitleaks:allow
+    }))
+    .expect("valid redis config");
+
+    let debug = format!("{config:?}");
+    assert!(
+        !debug.contains("hunter2-super-secret"),
+        "password must not appear in Debug output: {debug}"
+    );
+    assert!(
+        !debug.contains("redis-admin"),
+        "username must not appear in Debug output: {debug}"
+    );
+
+    // Confirm the credentials survived parsing.
+    let password = config.password.as_ref().expect("password was set");
+    let username = config.username.as_ref().expect("username was set");
+    assert_eq!(password.unredact(), "hunter2-super-secret");
+    assert_eq!(username.unredact(), "redis-admin");
+}
+
+/// Expansion is coerced to the type the schema declares, so an expanded value in a list of
+/// strings is a string even when it looks like a number or a boolean. The previous loader
+/// rejected these values.
+#[test]
+fn expanded_values_in_a_string_sequence_are_strings() {
+    for allow_headers in [
+        r#"[ Content-Type, "${env.TEST_CONFIG_NUMERIC_ENV_UNIQUE}" ]"#,
+        "\n    - Content-Type\n    - \"${env.TEST_CONFIG_UNSET_ENV_UNIQUE:-true}\"",
+    ] {
+        let expansion = Expansion::default_builder()
+            .mocked_env_var("TEST_CONFIG_NUMERIC_ENV_UNIQUE", "5")
+            .build()
+            .unwrap();
+        let text = format!("cors:\n  allow_headers: {allow_headers}\n");
+
+        let config = parse_configuration(&text, expansion, Migration::None)
+            .unwrap_or_else(|error| panic!("{text}: {error}"));
+
+        let expected = if allow_headers.contains("NUMERIC") {
+            "5"
+        } else {
+            "true"
+        };
+        assert_eq!(
+            config.cors.allow_headers,
+            Arc::from(["Content-Type".into(), expected.into()]),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn line_precise_config_errors_with_errors_after_first_field_env_expansion() {
+    #[allow(clippy::literal_string_with_formatting_args)]
+    let error = parse_configuration(
+        r#"
+supergraph:
+  # The socket address and port to listen on
+  # Defaults to 127.0.0.1:4000
+  listen: 127.0.0.1:4000
+  ${TEST_CONFIG_NUMERIC_ENV_UNIQUE:-true}: 5
+  another_one: foo
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("should have resulted in an error");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn expansion_failure_missing_variable() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  introspection: ${env.TEST_CONFIG_UNKNOWN_WITH_NO_DEFAULT}
+        "#,
+        Expansion::default().unwrap(),
+        Migration::None,
+    )
+    .expect_err("must have an error because the env variable is unknown");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn expansion_failure_unknown_mode() {
+    let error = parse_configuration(
+        r#"
+supergraph:
+  introspection: ${unknown.TEST_CONFIG_UNKNOWN_WITH_NO_DEFAULT}
+        "#,
+        Expansion::builder()
+            .prefix("TEST_CONFIG")
+            .supported_mode("env")
+            .build(),
+        Migration::None,
+    )
+    .expect_err("must have an error because the mode is unknown");
+    insta::assert_snapshot!(error.to_string());
+}
+
+#[test]
+fn expansion_prefixing() {
+    parse_configuration(
+        r#"
+supergraph:
+  introspection: ${env.NEEDS_PREFIX}
+        "#,
+        Expansion::builder()
+            .mocked_env_var("TEST_CONFIG_NEEDS_PREFIX", "true")
+            .prefix("TEST_CONFIG")
+            .supported_mode("env")
+            .build(),
+        Migration::None,
+    )
+    .expect("must have expanded successfully");
+}
+
+#[test]
+fn expansion_from_file() {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("src");
+    path.push("configuration");
+    path.push("testdata");
+    path.push("true.txt");
+    let config = parse_configuration(
+        &format!(
+            r#"
+supergraph:
+  introspection: ${{file.{}}}
+        "#,
+            path.to_string_lossy()
+        ),
+        Expansion::builder().supported_mode("file").build(),
+        Migration::None,
+    )
+    .expect("must have expanded successfully");
+
+    assert!(config.supergraph.introspection);
+}
+
+#[derive(RustEmbed)]
+#[folder = "src/configuration/testdata/migrations"]
+struct Asset;
+
+#[test]
+fn upgrade_old_configuration() {
+    for file_name in Asset::iter() {
+        if file_name.ends_with(".yaml") {
+            let source = Asset::get(&file_name).expect("test file must exist");
+            let input = std::str::from_utf8(&source.data)
+                .expect("expected utf8")
+                .to_string();
+            let new_config = crate::configuration::upgrade::upgrade_configuration(
+                &serde_yaml::from_str(&input).expect("config must be valid yaml"),
+                true,
+                upgrade::UpgradeMode::Major,
+            )
+            .expect("configuration could not be updated");
+            let new_config =
+                serde_yaml::to_string(&new_config).expect("must be able to serialize config");
+
+            let result = parse_without_inputs(&new_config, Migration::None);
+
+            match result {
+                Ok(_) => {
+                    insta::with_settings!({snapshot_suffix => file_name}, {
+                        insta::assert_snapshot!(new_config)
+                    });
+                }
+                Err(e) => {
+                    panic!(
+                        "migrated configuration had validation errors:\n{e}\n\noriginal configuration:\n{input}\n\nmigrated configuration:\n{new_config}"
+                    )
+                }
+            }
+        }
+    }
+}
+
+// Regression: old flat-list headers config must be accepted at startup (Migration::WithinMajor)
+// without requiring the operator to manually add the `operations:` wrapper key.
+#[test]
+fn headers_operations_migration_applied_at_startup() {
+    let old_config = r#"
+headers:
+  all:
+    request:
+      - propagate:
+          named: x-request-id
+      - propagate:
+          named: authorization
+"#;
+    parse_without_inputs(old_config, Migration::WithinMajor)
+        .expect("old headers config should be accepted at startup via automatic migration");
+}
+
+#[test]
+fn headers_operations_rejected_without_migration() {
+    let old_config = r#"
+headers:
+  all:
+    request:
+      - propagate:
+          named: x-request-id
+      - propagate:
+          named: authorization
+"#;
+    parse_without_inputs(old_config, Migration::None)
+        .expect_err("old headers config should be rejected when migration is not applied");
+}
+
+/// Sample YAML files that have minor migrations from the 2.x release cycle
+#[derive(RustEmbed)]
+#[folder = "src/configuration/testdata/migrations/minor"]
+struct AssetMinor;
+
+#[test]
+fn upgrade_old_minor_configuration() {
+    for file_name in AssetMinor::iter() {
+        if file_name.ends_with(".yaml") {
+            let source = AssetMinor::get(&file_name).expect("test file must exist");
+            let input = std::str::from_utf8(&source.data)
+                .expect("expected utf8")
+                .to_string();
+            let new_config = crate::configuration::upgrade::upgrade_configuration(
+                &serde_yaml::from_str(&input).expect("config must be valid yaml"),
+                true,
+                upgrade::UpgradeMode::Minor(2),
+            )
+            .expect("configuration could not be updated");
+            let new_config =
+                serde_yaml::to_string(&new_config).expect("must be able to serialize config");
+
+            let result = parse_without_inputs(&new_config, Migration::None);
+
+            if let Err(err) = result {
+                panic!("minor upgrade should not raise errors, but it did for {file_name}: {err:?}")
+            }
+        }
+    }
+}
+
+// NOTE: if this test fails, you might need to annotate your configuration field(s) with the
+// schemars macro
+#[test]
+fn all_properties_are_documented() {
+    // Not using `generate_config_schema` here because of custom configuration.
+    // By inlining all sub-schemas we don't have to resolve references.
+    let generator = SchemaSettings::draft07()
+        .with(|s| {
+            s.inline_subschemas = true;
+        })
+        .into_generator();
+
+    let schema = generator.into_root_schema_for::<Configuration>();
+    let schema = serde_json::to_value(schema).expect("must be able to convert the schema to json");
+
+    let mut errors = Vec::new();
+    visit_schema("", &schema, &mut errors);
+    if !errors.is_empty() {
+        panic!(
+            "There were errors in the configuration schema: {}",
+            errors.join("\n")
+        )
+    }
+}
+
+#[test]
+fn default_config_has_defaults() {
+    insta::assert_yaml_snapshot!(Configuration::default().validated_yaml);
+}
+
+#[test]
+fn default_config_matches_parsing_an_empty_document() {
+    let default = Configuration::default();
+    let parsed = Configuration::from_str("").unwrap();
+
+    assert!(
+        default == parsed,
+        "equality compares the retained documents"
+    );
+    assert_eq!(default.raw_yaml, parsed.raw_yaml);
+    let names = |config: &Configuration| -> Vec<String> {
+        config
+            .apollo_plugins
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    };
+    assert_eq!(names(&default), ["health_check", "limits"]);
+    assert_eq!(names(&default), names(&parsed));
+    assert_eq!(default.plugins.iter().count(), 0);
+}
+
+#[test]
+fn from_str_reads_environment_variables_on_every_parse() {
+    const NAME: &str = "TEST_CONFIGURATION_FROM_STR_HEALTH_PATH"; // unique to this test
+    let text = format!("health_check:\n  path: ${{env.{NAME}}}\n");
+    for path in ["/first", "/second"] {
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var(NAME, path) };
+        let config = Configuration::from_str(&text).unwrap();
+        assert_eq!(config.health_check.path, path);
+    }
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(NAME) };
+}
+
+#[test]
+fn empty_config_validates() {
+    parse_without_inputs("", Migration::None).expect("should be valid configuration");
+}
+
+fn visit_schema(path: &str, schema: &Value, errors: &mut Vec<String>) {
+    match schema {
+        Value::Array(arr) => {
+            for element in arr {
+                visit_schema(path, element, errors)
+            }
+        }
+        Value::Object(o) => {
+            for (k, v) in o {
+                if k.as_str() == "properties" {
+                    let properties = v.as_object().expect("properties must be an object");
+                    if properties.len() == 1 {
+                        // This is probably an enum property
+                        continue;
+                    }
+                    for (k, v) in properties {
+                        let path = format!("{path}.{k}");
+                        if v.as_object().and_then(|o| o.get("description")).is_none() {
+                            // Enum type does not get a description
+                            if k != "type" {
+                                errors.push(format!("{path} was missing a description"));
+                            }
+                        }
+                        visit_schema(&path, v, errors)
+                    }
+                } else {
+                    let path = format!("{path}.{k}");
+                    visit_schema(&path, v, errors)
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn test_configuration_validate_and_sanitize() {
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/g*").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/g{supergraph_route}");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/graphql/g*").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(
+        &conf.supergraph.sanitized_path(),
+        "/graphql/g{supergraph_route}"
+    );
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/{*rest}").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/{*rest}");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/test").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/test");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/graphql/").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/graphql");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/graphql///").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/graphql");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/api/graphql/").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/api/graphql",);
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("/").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/");
+
+    let conf = Configuration::builder()
+        .supergraph(Supergraph::builder().path("///").build())
+        .build()
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(&conf.supergraph.sanitized_path(), "/");
+
+    assert!(
+        Configuration::builder()
+            .supergraph(Supergraph::builder().path("/*/whatever").build())
+            .build()
+            .is_err()
+    );
+}
+
+#[test]
+fn load_tls() {
+    let mut cert_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    cert_path.push("src");
+    cert_path.push("configuration");
+    cert_path.push("testdata");
+    cert_path.push("server.crt");
+    let cert_path = cert_path.to_string_lossy();
+
+    let mut key_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    key_path.push("src");
+    key_path.push("configuration");
+    key_path.push("testdata");
+    key_path.push("server.key");
+    let key_path = key_path.to_string_lossy();
+
+    let cfg = parse_configuration(
+        &format!(
+            r#"
+tls:
+  supergraph:
+    certificate: ${{file.{cert_path}}}
+    certificate_chain: ${{file.{cert_path}}}
+    key: ${{file.{key_path}}}
+"#,
+        ),
+        Expansion::builder().supported_mode("file").build(),
+        Migration::None,
+    )
+    .expect("should not have resulted in an error");
+    cfg.tls.supergraph.unwrap().tls_config().unwrap();
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct TestSubgraphOverride {
+    value: Option<u8>,
+    subgraph: SubgraphConfiguration<PluginConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(default)]
+struct PluginConfig {
+    a: bool,
+    b: u8,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self { a: true, b: 0 }
+    }
+}
+
+#[test]
+fn test_subgraph_override() {
+    let settings = SchemaSettings::draft2019_09().with(|s| {
+        s.inline_subschemas = true;
+    });
+    let generator = settings.into_generator();
+    let schema = generator.into_root_schema_for::<TestSubgraphOverride>();
+    insta::assert_json_snapshot!(schema);
+}
+
+#[test]
+fn test_subgraph_override_json() {
+    let first = json!({
+        "subgraph": {
+            "all": {
+                "a": false
+            },
+            "subgraphs": {
+                "products": {
+                    "a": true
+                }
+            }
+        }
+    });
+
+    let data: TestSubgraphOverride = serde_json::from_value(first).unwrap();
+    assert_eq!(data.value, None);
+    assert!(!data.subgraph.all.a);
+    assert!(data.subgraph.subgraphs.get("products").unwrap().a);
+
+    let second = json!({
+        "subgraph": {
+            "all": {
+                "a": false
+            },
+            "subgraphs": {
+                "products": {
+                    "b": 1
+                }
+            }
+        }
+    });
+
+    let data: TestSubgraphOverride = serde_json::from_value(second).unwrap();
+    assert!(!data.subgraph.all.a);
+    // since products did not set the `a` field, it should take the override value from `all`
+    assert!(!data.subgraph.subgraphs.get("products").unwrap().a);
+
+    // the default value from `all` should work even if it is parsed after
+    let third = json!({
+        "subgraph": {
+            "subgraphs": {
+                "products": {
+                    "b": 1
+                }
+            },
+            "all": {
+                "a": false
+            }
+        }
+    });
+
+    let data: TestSubgraphOverride = serde_json::from_value(third).unwrap();
+    assert!(!data.subgraph.all.a);
+    // since products did not set the `a` field, it should take the override value from `all`
+    assert!(!data.subgraph.subgraphs.get("products").unwrap().a);
+}
+
+#[test]
+fn test_deserialize_derive_default() {
+    // There are two types of serde defaulting:
+    //
+    // * container
+    // * field
+    //
+    // Container level defaulting will use an instance of the default implementation and take missing fields from it.
+    // Field level defaulting uses either the default implementation or optionally user supplied function to initialize missing fields.
+    //
+    // When using field level defaulting it is essential that the Default implementation of a struct exactly match the serde annotations.
+    //
+    // This test checks to ensure that field level defaulting is not used in conjunction with a Default implementation
+
+    // Walk every source file and check that #[derive(Default)] is not used.
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("src");
+    fn it(path: &Path) -> impl Iterator<Item = DirEntry> + use<> {
+        WalkDir::new(path).into_iter().filter_map(|e| e.ok())
+    }
+
+    // Check for derive where Deserialize is used
+    let deserialize_regex =
+        Regex::new(r"^\s*#[\s\n]*\[derive\s*\((.*,)?\s*Deserialize\s*(,.*)?\)\s*\]\s*$").unwrap();
+    let default_regex =
+        Regex::new(r"^\s*#[\s\n]*\[derive\s*\((.*,)?\s*Default\s*(,.*)?\)\s*\]\s*$").unwrap();
+
+    let mut errors = Vec::new();
+    for source_file in it(&path).filter(|e| e.file_name().to_string_lossy().ends_with(".rs")) {
+        // Read the source file into a vec of lines
+        let source = fs::read_to_string(source_file.path()).expect("failed to read file");
+        let lines: Vec<&str> = source.lines().collect();
+        for (line_number, line) in lines.iter().enumerate() {
+            if deserialize_regex.is_match(line) {
+                // Get the struct name
+                if let Some(struct_name) = find_struct_name(&lines, line_number) {
+                    let manual_implementation = format!("impl Default for {struct_name} ");
+
+                    let has_field_level_defaults =
+                        has_field_level_serde_defaults(&lines, line_number);
+                    let has_manual_default_impl =
+                        lines.iter().any(|f| f.contains(&manual_implementation));
+                    let has_derive_default_impl = default_regex.is_match(line);
+
+                    if (has_manual_default_impl || has_derive_default_impl)
+                        && has_field_level_defaults
+                    {
+                        errors.push(format!(
+                                    "{}:{} struct {} has field level #[serde(default=\"...\")] and also implements Default. Either use #[derive(serde_derive_default::Default)] at the container OR move the defaults into the Default implementation and use #[serde(default)] at the container level",
+                                    source_file
+                                        .path()
+                                        .strip_prefix(path.parent().unwrap().parent().unwrap())
+                                        .unwrap()
+                                        .to_string_lossy(),
+                                    line_number + 1,
+                                    struct_name));
+                    }
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        panic!("Serde errors found:\n{}", errors.join("\n"));
+    }
+}
+
+/// Parses `yaml`, which must fail because of the unknown `key`, and checks that the error names it.
+fn assert_rejects_unknown_key(yaml: &str, key: &str) {
+    let error = Configuration::from_str(yaml)
+        .expect_err("the section contains an unknown key")
+        .to_string();
+    assert!(error.contains(key), "{error}");
+}
+
+#[test]
+fn authorization_rejects_unknown_keys() {
+    assert_rejects_unknown_key(
+        "authorization:\n  require_authentcation: true\n",
+        "require_authentcation",
+    );
+}
+
+#[test]
+fn fleet_detector_rejects_unknown_keys() {
+    assert_rejects_unknown_key("fleet_detector:\n  enabeld: false\n", "enabeld");
+}
+
+#[test]
+fn enhanced_client_awareness_rejects_unknown_keys() {
+    assert_rejects_unknown_key("enhanced_client_awareness:\n  enabeld: false\n", "enabeld");
+}
+
+#[test]
+fn progressive_override_rejects_unknown_keys() {
+    assert_rejects_unknown_key("progressive_override:\n  enabeld: false\n", "enabeld");
+}
+
+/// Nested plugin config types use the configuration attribute, so their sections reject unknown
+/// keys too. Each case is a section that accepted, and ignored, unknown keys before.
+#[test]
+fn nested_plugin_sections_reject_unknown_keys() {
+    for (yaml, key) in [
+        (
+            "authorization:\n  directives:\n    errors:\n      lgo: false\n",
+            "lgo",
+        ),
+        (
+            "authorization:\n  directives:\n    enabeld: false\n",
+            "enabeld",
+        ),
+        (
+            "coprocessor:\n  url: http://127.0.0.1:8081\n  router:\n    reqest: {}\n",
+            "reqest",
+        ),
+        (
+            "coprocessor:\n  url: http://127.0.0.1:8081\n  supergraph:\n    reqest: {}\n",
+            "reqest",
+        ),
+        (
+            "coprocessor:\n  url: http://127.0.0.1:8081\n  execution:\n    reqest: {}\n",
+            "reqest",
+        ),
+        (
+            "coprocessor:\n  url: http://127.0.0.1:8081\n  connector:\n    alll: {}\n",
+            "alll",
+        ),
+        (
+            "telemetry:\n  exporters:\n    tracing:\n      otlp:\n        enabled: false\n        batch_processor:\n          max_queue_sise: 10\n",
+            "max_queue_sise",
+        ),
+        (
+            "telemetry:\n  apollo:\n    metrics:\n      otlp:\n        batch_processor:\n          scheduled_dealy: 5s\n",
+            "scheduled_dealy",
+        ),
+        (
+            "telemetry:\n  apollo:\n    metrics:\n      usage_reports:\n        batch_processor:\n          scheduled_dealy: 5s\n",
+            "scheduled_dealy",
+        ),
+        (
+            "telemetry:\n  instrumentation:\n    events:\n      router:\n        my.event:\n          message: sent\n          on: request\n          level: info\n          levle: warn\n",
+            "levle",
+        ),
+        (
+            "telemetry:\n  instrumentation:\n    events:\n      router:\n        request:\n          level: info\n          condition:\n            exists:\n              request_header: x-trace\n          conditon: {}\n",
+            "conditon",
+        ),
+    ] {
+        assert_rejects_unknown_key(yaml, key);
+    }
+}
+
+#[test]
+fn settingless_plugin_sections_accept_empty_and_omitted_sections() {
+    for yaml in [
+        "",
+        "fleet_detector: {}\n",
+        "enhanced_client_awareness: {}\n",
+        "progressive_override: {}\n",
+    ] {
+        Configuration::from_str(yaml).unwrap_or_else(|error| panic!("{yaml:?}: {error}"));
+    }
+}
+
+#[test]
+fn it_defaults_health_check_configuration() {
+    let conf = Configuration::default();
+    let addr: ListenAddr = SocketAddr::from_str("127.0.0.1:8088").unwrap().into();
+
+    assert_eq!(conf.health_check.listen, addr);
+    assert_eq!(&conf.health_check.path, "/health");
+
+    // Defaults to enabled: true
+    assert!(conf.health_check.enabled);
+}
+
+#[test]
+fn it_sets_custom_health_check_path() {
+    let conf = Configuration::builder()
+        .health_check(HealthCheck::new(
+            None,
+            None,
+            Some("/healthz".to_string()),
+            Default::default(),
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(&conf.health_check.path, "/healthz");
+}
+
+#[test]
+fn it_adds_slash_to_custom_health_check_path_if_missing() {
+    let conf = Configuration::builder()
+        // NB the missing `/`
+        .health_check(HealthCheck::new(
+            None,
+            None,
+            Some("healthz".to_string()),
+            Default::default(),
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(&conf.health_check.path, "/healthz");
+}
+
+#[test]
+fn it_processes_batching_subgraph_all_enabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": true
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(config.batch_include("anything"));
+}
+
+#[test]
+fn it_processes_batching_subgraph_all_disabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": false
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(!config.batch_include("anything"));
+}
+
+#[test]
+fn it_processes_batching_subgraph_accounts_enabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": false
+            },
+            "subgraphs": {
+                "accounts": {
+                    "enabled": true
+                }
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(!config.batch_include("anything"));
+    assert!(config.batch_include("accounts"));
+}
+
+#[test]
+fn it_processes_batching_subgraph_accounts_disabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": false
+            },
+            "subgraphs": {
+                "accounts": {
+                    "enabled": false
+                }
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(!config.batch_include("anything"));
+    assert!(!config.batch_include("accounts"));
+}
+
+#[test]
+fn it_processes_batching_subgraph_accounts_override_disabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": true
+            },
+            "subgraphs": {
+                "accounts": {
+                    "enabled": false
+                }
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(config.batch_include("anything"));
+    assert!(!config.batch_include("accounts"));
+}
+
+#[test]
+fn it_processes_batching_subgraph_accounts_override_enabled_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "subgraph": {
+            "all": {
+                "enabled": false
+            },
+            "subgraphs": {
+                "accounts": {
+                    "enabled": true
+                }
+            }
+        }
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(!config.batch_include("anything"));
+    assert!(config.batch_include("accounts"));
+}
+
+#[test]
+fn it_processes_batching_mode_defaults_correctly() {
+    let json_config = json!({
+        "enabled": true,
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert!(matches!(config.mode, BatchingMode::BatchHttpLink));
+}
+
+#[test]
+fn it_processes_unspecified_maximum_batch_limit_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert_eq!(config.maximum_size, None);
+}
+
+#[test]
+fn it_processes_specified_maximum_batch_limit_correctly() {
+    let json_config = json!({
+        "enabled": true,
+        "mode": "batch_http_link",
+        "maximum_size": 10
+    });
+
+    let config: Batching = serde_json::from_value(json_config).unwrap();
+
+    assert_eq!(config.maximum_size, Some(10));
+}
+
+#[test]
+fn it_includes_default_header_read_timeout_when_server_config_omitted() {
+    let json_config = json!({});
+
+    let config: Configuration = serde_json::from_value(json_config).unwrap();
+
+    assert_eq!(
+        config.server.http.header_read_timeout,
+        Duration::from_secs(10)
+    );
+}
+
+#[test]
+fn it_includes_default_tls_handshake_timeout_when_server_config_omitted() {
+    let json_config = json!({});
+
+    let config: Configuration = serde_json::from_value(json_config).unwrap();
+
+    assert_eq!(
+        config.server.http.tls_handshake_timeout,
+        Duration::from_secs(10)
+    );
+}
+
+#[test]
+fn it_processes_specified_server_config_correctly() {
+    let json_config = json!({
+        "server": {
+            "http": {
+                "header_read_timeout": "30s",
+                "tls_handshake_timeout": "30s"
+            }
+        }
+    });
+
+    let config: Configuration = serde_json::from_value(json_config).unwrap();
+
+    assert_eq!(
+        config.server.http.header_read_timeout,
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        config.server.http.tls_handshake_timeout,
+        Duration::from_secs(30)
+    );
+}
+
+fn has_field_level_serde_defaults(lines: &[&str], line_number: usize) -> bool {
+    let serde_field_default = Regex::new(
+        r#"^\s*#[\s\n]*\[serde\s*\((.*,)?\s*default\s*=\s*"[a-zA-Z0-9_:]+"\s*(,.*)?\)\s*\]\s*$"#,
+    )
+    .unwrap();
+    lines
+        .iter()
+        .skip(line_number + 1)
+        .take(500)
+        .take_while(|line| !line.contains('}'))
+        .any(|line| serde_field_default.is_match(line))
+}
+
+fn find_struct_name(lines: &[&str], line_number: usize) -> Option<String> {
+    let struct_enum_union_regex =
+        Regex::new(r"^.*(struct|enum|union)\s([a-zA-Z0-9_]+).*$").unwrap();
+
+    lines
+        .iter()
+        .skip(line_number + 1)
+        .take(5)
+        .filter_map(|line| {
+            struct_enum_union_regex.captures(line).and_then(|c| {
+                if c.get(1).unwrap().as_str() == "struct" {
+                    Some(c.get(2).unwrap().as_str().to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .next()
+}
+
+#[rstest::rstest]
+#[case::all_enabled("some_subgraph_name", true, &[], true)]
+#[case::all_enabled_unknown("unknown", true, &[], true)]
+#[case::subgraph_enabled("some_subgraph_name", false, &[("some_subgraph_name", true)], true)]
+#[case::subgraph_disabled("disabled", false, &[("disabled", false)], false)]
+#[case::subgraph_unknown_falls_back_to_all("unknown", false, &[("some_subgraph_name", true)], false)]
+#[case::default_hoists_nothing("anything", false, &[], false)]
+#[case::all_with_subgraph_override("overridden", true, &[("overridden", false)], false)]
+fn hoist_orphan_errors_get(
+    #[case] query_subgraph: &str,
+    #[case] all_enabled: bool,
+    #[case] subgraph_entries: &[(&str, bool)],
+    #[case] expected: bool,
+) {
+    let config = super::subgraph::SubgraphConfiguration {
+        all: super::HoistOrphanErrors {
+            enabled: all_enabled,
+        },
+        subgraphs: subgraph_entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), super::HoistOrphanErrors { enabled: *v }))
+            .collect(),
+    };
+    assert_eq!(config.get(query_subgraph).enabled, expected);
+}
+
+#[test]
+fn hoist_orphan_errors_deserializes_with_subgraphs() {
+    let config: Configuration = serde_json::from_value(json!({
+        "experimental_hoist_orphan_errors": {
+            "subgraphs": {
+                "some_subgraph_name": {
+                    "enabled": true
+                },
+                "other": {
+                    "enabled": false
+                }
+            }
+        }
+    }))
+    .expect("valid config");
+    assert!(
+        config
+            .experimental_hoist_orphan_errors
+            .get("some_subgraph_name")
+            .enabled
+    );
+    assert!(!config.experimental_hoist_orphan_errors.get("other").enabled);
+    assert!(
+        !config
+            .experimental_hoist_orphan_errors
+            .get("unknown")
+            .enabled
+    );
+}
+
+#[test]
+fn hoist_orphan_errors_deserializes_with_all() {
+    let config: Configuration = serde_json::from_value(json!({
+        "experimental_hoist_orphan_errors": {
+            "all": {
+                "enabled": true
+            }
+        }
+    }))
+    .expect("valid config");
+    assert!(
+        config
+            .experimental_hoist_orphan_errors
+            .get("anything")
+            .enabled
+    );
+}
+
+#[test]
+fn hoist_orphan_errors_all_with_subgraph_override() {
+    let config: Configuration = serde_json::from_value(json!({
+        "experimental_hoist_orphan_errors": {
+            "all": {
+                "enabled": true
+            },
+            "subgraphs": {
+                "noisy_one": {
+                    "enabled": false
+                }
+            }
+        }
+    }))
+    .expect("valid config");
+    assert!(
+        config
+            .experimental_hoist_orphan_errors
+            .get("anything")
+            .enabled
+    );
+    assert!(
+        !config
+            .experimental_hoist_orphan_errors
+            .get("noisy_one")
+            .enabled
+    );
+}
+
+mod reload {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn defaults() {
+        // An empty config should produce the documented defaults.
+        let config = Configuration::from_str("").expect("empty config must be valid");
+        assert_eq!(config.reload.max_retries, Some(5));
+        assert_eq!(config.reload.retry_delay, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn max_retries_null_means_unlimited() {
+        // `null` must deserialize as `None` (unlimited retries), not as Some(0).
+        // This has bitten us before — Option<u32> with a serde default sometimes
+        // ignores an explicit `null` in YAML if the default function is not wired up
+        // correctly.
+        let config = Configuration::from_str("reload:\n  max_retries: null\n")
+            .expect("config with null max_retries must be valid");
+        assert_eq!(
+            config.reload.max_retries, None,
+            "max_retries: null should deserialize to None (unlimited retries)"
+        );
+    }
+
+    #[test]
+    fn max_retries_zero_disables_retries() {
+        let config = Configuration::from_str("reload:\n  max_retries: 0\n")
+            .expect("config with max_retries: 0 must be valid");
+        assert_eq!(config.reload.max_retries, Some(0));
+    }
+
+    #[test]
+    fn custom_retry_delay() {
+        let config = Configuration::from_str("reload:\n  retry_delay: 30s\n")
+            .expect("config with custom retry_delay must be valid");
+        assert_eq!(config.reload.retry_delay, Duration::from_secs(30));
+    }
+}

@@ -1,0 +1,1662 @@
+use http_body::Body;
+use serde_json::from_str;
+use sha2::Digest;
+
+use super::events::DisplayRouterResponse;
+use crate::Context;
+use crate::context::CHUNK_CONTAINS_GRAPHQL_ERROR;
+use crate::context::CONTAINS_GRAPHQL_ERROR;
+use crate::context::OPERATION_NAME;
+use crate::plugins::telemetry::config::AttributeValue;
+use crate::plugins::telemetry::config::TraceIdFormat;
+use crate::plugins::telemetry::config_new::Selector;
+use crate::plugins::telemetry::config_new::Stage;
+use crate::plugins::telemetry::config_new::ToOtelValue;
+use crate::plugins::telemetry::config_new::get_baggage;
+use crate::plugins::telemetry::config_new::instruments::InstrumentValue;
+use crate::plugins::telemetry::config_new::instruments::Standard;
+use crate::plugins::telemetry::config_new::router::events::RouterResponseBodyExtensionType;
+use crate::plugins::telemetry::config_new::router_overhead::RouterOverheadTracker;
+use crate::plugins::telemetry::config_new::selectors::ActiveSubgraphRequests;
+use crate::plugins::telemetry::config_new::selectors::DurationUnit;
+use crate::plugins::telemetry::config_new::selectors::ErrorRepr;
+use crate::plugins::telemetry::config_new::selectors::OperationName;
+use crate::plugins::telemetry::config_new::selectors::ResponseStatus;
+use crate::plugins::telemetry::config_new::selectors::SelectorJsonPath;
+use crate::plugins::telemetry::config_new::trace_id;
+use crate::query_planner::APOLLO_OPERATION_ID;
+use crate::services::router;
+
+#[apollo_configuration::configuration]
+#[serde(untagged)]
+pub(crate) enum RouterValue {
+    Standard(Standard),
+    Custom(RouterSelector),
+}
+
+impl From<&RouterValue> for InstrumentValue<RouterSelector> {
+    fn from(value: &RouterValue) -> Self {
+        match value {
+            RouterValue::Standard(standard) => InstrumentValue::Standard(standard.clone()),
+            RouterValue::Custom(selector) => InstrumentValue::Custom(selector.clone()),
+        }
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+#[serde(untagged)]
+pub(crate) enum RouterSelector {
+    /// A value from baggage.
+    Baggage {
+        /// The name of the baggage item.
+        #[config(required)]
+        baggage: String,
+        /// Optional default value.
+        default: Option<AttributeValue>,
+    },
+    /// A value from an environment variable.
+    Env {
+        /// The name of the environment variable
+        #[config(required)]
+        env: String,
+        /// Optional default value.
+        default: Option<String>,
+        /// Avoid unsafe std::env::set_var in tests
+        #[cfg(test)]
+        #[serde(skip)]
+        mocked_env_var: Option<String>,
+    },
+    /// Critical error if it happens
+    Error {
+        #[allow(dead_code)]
+        #[config(required)]
+        error: ErrorRepr,
+    },
+    /// Boolean set to true if the response body contains graphql error
+    OnGraphQLError {
+        #[config(required)]
+        on_graphql_error: bool,
+    },
+    /// The operation name from the query.
+    OperationName {
+        /// The operation name from the query.
+        #[config(required)]
+        operation_name: OperationName,
+        /// Optional default value.
+        default: Option<String>,
+    },
+    /// A header from the request
+    RequestHeader {
+        /// The name of the request header.
+        #[config(required)]
+        request_header: String,
+        /// Optional redaction pattern.
+        redact: Option<crate::services::header_masking::RedactMode>,
+        /// Optional default value.
+        default: Option<AttributeValue>,
+    },
+    /// A value from context.
+    RequestContext {
+        /// The request context key.
+        #[config(required)]
+        request_context: String,
+        /// Optional default value.
+        default: Option<AttributeValue>,
+    },
+    /// The request method.
+    RequestMethod {
+        /// The request method enabled or not
+        #[config(required)]
+        request_method: bool,
+    },
+    /// The body of the response
+    ResponseBody {
+        /// The response body enabled or not
+        #[config(required)]
+        response_body: bool,
+    },
+    /// The body response errors
+    ResponseErrors {
+        /// The router response body json path of the chunks.
+        #[config(required)]
+        response_errors: SelectorJsonPath,
+    },
+    /// Count of response errors matching a JSONPath filter
+    ResponseErrorsCount {
+        /// JSONPath filter for response errors. Use "$[*]" to count all errors.
+        #[config(required)]
+        response_errors_count: SelectorJsonPath,
+    },
+    /// Extract a specific field from each error in the response
+    ResponseErrorsField {
+        /// JSONPath to extract from each error. E.g., "$.message" or "$.extensions.code"
+        #[config(required)]
+        response_errors_field: SelectorJsonPath,
+    },
+    /// A header from the response
+    ResponseHeader {
+        /// The name of the response header.
+        #[config(required)]
+        response_header: String,
+        /// Optional redaction pattern.
+        redact: Option<crate::services::header_masking::RedactMode>,
+        /// Optional default value.
+        default: Option<AttributeValue>,
+    },
+    /// A value from context.
+    ResponseContext {
+        /// The response context key.
+        #[config(required)]
+        response_context: String,
+        /// Optional default value.
+        default: Option<AttributeValue>,
+    },
+    /// A status from the response
+    ResponseStatus {
+        /// The http response status code.
+        #[config(required)]
+        response_status: ResponseStatus,
+    },
+    /// The size hint of the body.
+    /// If compression is enabled, this will be the uncompressed size.
+    /// Its not possible to get the compressed size in selector as the
+    /// body has not yet been compressed at the time on_response is called.
+    ResponseSizeHint {
+        /// Extract response size hint in bytes
+        #[config(required)]
+        response_size_hint: bool,
+    },
+    /// Router overhead duration (time not spent in subgraph requests)
+    RouterOverhead {
+        /// Extract router overhead duration in seconds
+        #[config(required)]
+        router_overhead: bool,
+    },
+    /// Total request duration from when the request was received
+    RequestDuration {
+        /// The unit for the duration (milliseconds, seconds, nanoseconds)
+        #[config(required)]
+        request_duration: DurationUnit,
+    },
+    /// Number of active subgraph requests at the time of overhead calculation
+    ActiveSubgraphRequests {
+        /// The mode for extracting active subgraph request information
+        #[config(required)]
+        active_subgraph_requests: ActiveSubgraphRequests,
+    },
+    StaticField {
+        /// A static value
+        #[config(required)]
+        r#static: AttributeValue,
+    },
+    /// Apollo Studio operation id
+    StudioOperationId {
+        /// Apollo Studio operation id
+        #[config(required)]
+        studio_operation_id: bool,
+    },
+    /// The trace ID of the request.
+    TraceId {
+        /// The format of the trace ID.
+        #[config(required)]
+        trace_id: TraceIdFormat,
+    },
+    /// The context ID of the request (unique per request).
+    ContextId {
+        /// The context ID
+        #[config(required)]
+        context_id: bool,
+    },
+}
+
+impl Selector for RouterSelector {
+    type Request = router::Request;
+    type Response = router::Response;
+    type EventResponse = ();
+
+    fn on_request(&self, request: &router::Request) -> Option<opentelemetry::Value> {
+        // Helper function to insert DisplayRouterResponse into request context extensions
+        fn insert_display_router_response(request: &router::Request) {
+            request.context.extensions().with_lock(|ext| {
+                ext.insert(DisplayRouterResponse);
+            });
+        }
+
+        match self {
+            RouterSelector::RequestMethod { request_method } if *request_method => {
+                Some(request.router_request.method().to_string().into())
+            }
+            RouterSelector::RequestContext {
+                request_context,
+                default,
+                ..
+            } => request
+                .context
+                .get_json_value(request_context)
+                .as_ref()
+                .and_then(|v| v.maybe_to_otel_value())
+                .or_else(|| default.maybe_to_otel_value()),
+            RouterSelector::RequestHeader {
+                request_header,
+                default,
+                redact,
+            } => {
+                let header_value = request
+                    .router_request
+                    .headers()
+                    .get(request_header)
+                    .and_then(|h| Some(h.to_str().ok()?.to_string()));
+
+                let value = crate::services::header_masking::redact_header_value(
+                    &request.context,
+                    crate::services::header_masking::Direction::Request,
+                    None,
+                    request_header,
+                    header_value,
+                    redact.as_ref(),
+                );
+
+                value
+                    .map(|v| v.into())
+                    .or_else(|| default.maybe_to_otel_value())
+            }
+            RouterSelector::Env {
+                env,
+                default,
+                #[cfg(test)]
+                mocked_env_var,
+                ..
+            } => {
+                #[cfg(test)]
+                let value = mocked_env_var.clone();
+                #[cfg(not(test))]
+                let value = None;
+                value
+                    .or_else(|| std::env::var(env).ok())
+                    .or_else(|| default.clone())
+                    .map(opentelemetry::Value::from)
+            }
+            RouterSelector::TraceId {
+                trace_id: trace_id_format,
+            } => trace_id().map(|id| trace_id_format.format(id).into()),
+            RouterSelector::Baggage {
+                baggage, default, ..
+            } => get_baggage(baggage).or_else(|| default.maybe_to_otel_value()),
+            RouterSelector::StaticField { r#static } => Some(r#static.clone().into()),
+            RouterSelector::ResponseBody { response_body } if *response_body => {
+                insert_display_router_response(request);
+                None
+            }
+            RouterSelector::ResponseErrors { .. }
+            | RouterSelector::ResponseErrorsCount { .. }
+            | RouterSelector::ResponseErrorsField { .. } => {
+                insert_display_router_response(request);
+                None
+            }
+            RouterSelector::ContextId { context_id } if *context_id => {
+                Some(opentelemetry::Value::from(request.context.id.clone()))
+            }
+            // Related to Response
+            _ => None,
+        }
+    }
+
+    fn on_response(&self, response: &router::Response) -> Option<opentelemetry::Value> {
+        match self {
+            RouterSelector::ResponseBody { response_body } if *response_body => {
+                response
+                    .context
+                    .extensions()
+                    .with_lock(|ext| {
+                        // Clone here in case anything else also needs access to the body
+                        ext.get::<RouterResponseBodyExtensionType>().cloned()
+                    })
+                    .map(|v| opentelemetry::Value::String(v.0.into()))
+            }
+            RouterSelector::ResponseErrors { response_errors } => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterResponseBodyExtensionType>().cloned())
+                .and_then(|v| {
+                    from_str::<serde_json::Value>(&v.0)
+                        .ok()
+                        .and_then(|body_json| {
+                            let errors = body_json.get("errors");
+
+                            let data: serde_json_bytes::Value =
+                                serde_json_bytes::to_value(errors).ok()?;
+
+                            let val = response_errors.find(&data);
+
+                            val.maybe_to_otel_value()
+                        })
+                }),
+            RouterSelector::ResponseErrorsCount {
+                response_errors_count,
+            } => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterResponseBodyExtensionType>().cloned())
+                .and_then(|v| {
+                    from_str::<serde_json::Value>(&v.0)
+                        .ok()
+                        .and_then(|body_json| {
+                            let errors = body_json.get("errors");
+
+                            let data: serde_json_bytes::Value =
+                                serde_json_bytes::to_value(errors).ok()?;
+
+                            let count = response_errors_count.select(&data).count();
+                            Some(opentelemetry::Value::I64(count as i64))
+                        })
+                }),
+            RouterSelector::ResponseErrorsField {
+                response_errors_field,
+            } => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterResponseBodyExtensionType>().cloned())
+                .and_then(|v| {
+                    from_str::<serde_json::Value>(&v.0)
+                        .ok()
+                        .and_then(|body_json| {
+                            let errors = body_json.get("errors")?.as_array()?;
+
+                            // Extract the specified field from each error
+                            let extracted: Vec<String> = errors
+                                .iter()
+                                .filter_map(|error| {
+                                    let error_bytes: serde_json_bytes::Value =
+                                        serde_json_bytes::to_value(error).ok()?;
+                                    let result = response_errors_field.find(&error_bytes);
+
+                                    // Convert the result to a string representation
+                                    if result.is_null() {
+                                        None
+                                    } else if let Some(s) = result.as_str() {
+                                        Some(s.to_string())
+                                    } else {
+                                        // For non-string values, serialize to JSON string
+                                        Some(result.to_string())
+                                    }
+                                })
+                                .collect();
+
+                            if extracted.is_empty() {
+                                None
+                            } else {
+                                Some(opentelemetry::Value::Array(
+                                    extracted
+                                        .into_iter()
+                                        .map(opentelemetry::StringValue::from)
+                                        .collect::<Vec<_>>()
+                                        .into(),
+                                ))
+                            }
+                        })
+                }),
+            RouterSelector::ResponseHeader {
+                response_header,
+                default,
+                redact,
+            } => {
+                let header_value = response
+                    .response
+                    .headers()
+                    .get(response_header)
+                    .and_then(|h| Some(h.to_str().ok()?.to_string()));
+
+                let value = crate::services::header_masking::redact_header_value(
+                    &response.context,
+                    crate::services::header_masking::Direction::Response,
+                    None,
+                    response_header,
+                    header_value,
+                    redact.as_ref(),
+                );
+
+                value
+                    .map(|v| v.into())
+                    .or_else(|| default.maybe_to_otel_value())
+            }
+            RouterSelector::ResponseStatus { response_status } => match response_status {
+                ResponseStatus::Code => Some(opentelemetry::Value::I64(
+                    response.response.status().as_u16() as i64,
+                )),
+                ResponseStatus::Reason => response
+                    .response
+                    .status()
+                    .canonical_reason()
+                    .map(|reason| reason.to_string().into()),
+            },
+            RouterSelector::ResponseSizeHint { response_size_hint } if *response_size_hint => {
+                response
+                    .response
+                    .size_hint()
+                    .exact()
+                    .map(|size| opentelemetry::Value::I64(size as i64))
+            }
+            RouterSelector::RouterOverhead { router_overhead } if *router_overhead => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterOverheadTracker>().cloned())
+                .map(|tracker| {
+                    let result = tracker.calculate_overhead();
+                    opentelemetry::Value::F64(result.overhead.as_secs_f64())
+                }),
+            RouterSelector::RequestDuration {
+                request_duration: unit,
+            } => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterOverheadTracker>().cloned())
+                .map(|tracker| unit.to_otel_value(tracker.total_duration())),
+            RouterSelector::ActiveSubgraphRequests {
+                active_subgraph_requests,
+            } => response
+                .context
+                .extensions()
+                .with_lock(|ext| ext.get::<RouterOverheadTracker>().cloned())
+                .map(|tracker| {
+                    let result = tracker.calculate_overhead();
+                    match active_subgraph_requests {
+                        ActiveSubgraphRequests::Count => {
+                            opentelemetry::Value::I64(result.active_subgraph_requests as i64)
+                        }
+                        ActiveSubgraphRequests::Bool => {
+                            opentelemetry::Value::Bool(result.active_subgraph_requests > 0)
+                        }
+                    }
+                }),
+            RouterSelector::ResponseContext {
+                response_context,
+                default,
+                ..
+            } => response
+                .context
+                .get_json_value(response_context)
+                .as_ref()
+                .and_then(|v| v.maybe_to_otel_value())
+                .or_else(|| default.maybe_to_otel_value()),
+            RouterSelector::OperationName {
+                operation_name,
+                default,
+                ..
+            } => {
+                let op_name = response.context.get(OPERATION_NAME).ok().flatten();
+                match operation_name {
+                    OperationName::String => op_name.or_else(|| default.clone()),
+                    OperationName::Hash => op_name.or_else(|| default.clone()).map(|op_name| {
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(op_name.as_bytes());
+                        let result = hasher.finalize();
+                        hex::encode(result)
+                    }),
+                }
+                .map(opentelemetry::Value::from)
+            }
+            RouterSelector::Baggage {
+                baggage, default, ..
+            } => get_baggage(baggage).or_else(|| default.maybe_to_otel_value()),
+            RouterSelector::OnGraphQLError { on_graphql_error } => {
+                let contains_error = response
+                    .context
+                    .get_json_value(CONTAINS_GRAPHQL_ERROR)
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or_default();
+                Some(opentelemetry::Value::Bool(
+                    contains_error == *on_graphql_error,
+                ))
+            }
+            RouterSelector::StaticField { r#static } => Some(r#static.clone().into()),
+            RouterSelector::StudioOperationId {
+                studio_operation_id,
+            } if *studio_operation_id => response
+                .context
+                .get::<_, String>(APOLLO_OPERATION_ID)
+                .ok()
+                .flatten()
+                .map(opentelemetry::Value::from),
+            RouterSelector::ContextId { context_id } if *context_id => {
+                Some(opentelemetry::Value::from(response.context.id.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn on_response_event(&self, _response: &(), ctx: &Context) -> Option<opentelemetry::Value> {
+        match self {
+            RouterSelector::OnGraphQLError { on_graphql_error } => {
+                let chunk_has_errors = ctx
+                    .get_json_value(CHUNK_CONTAINS_GRAPHQL_ERROR)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some(opentelemetry::Value::Bool(
+                    chunk_has_errors == *on_graphql_error,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn on_error(&self, error: &tower::BoxError, ctx: &Context) -> Option<opentelemetry::Value> {
+        match self {
+            RouterSelector::Error { .. } => Some(error.to_string().into()),
+            RouterSelector::StaticField { r#static } => Some(r#static.clone().into()),
+            RouterSelector::ContextId { context_id } if *context_id => {
+                Some(opentelemetry::Value::from(ctx.id.clone()))
+            }
+            RouterSelector::ResponseContext {
+                response_context,
+                default,
+                ..
+            } => ctx
+                .get_json_value(response_context)
+                .as_ref()
+                .and_then(|v| v.maybe_to_otel_value())
+                .or_else(|| default.maybe_to_otel_value()),
+            RouterSelector::OperationName {
+                operation_name,
+                default,
+                ..
+            } => {
+                let op_name = ctx.get(OPERATION_NAME).ok().flatten();
+                match operation_name {
+                    OperationName::String => op_name.or_else(|| default.clone()),
+                    OperationName::Hash => op_name.or_else(|| default.clone()).map(|op_name| {
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(op_name.as_bytes());
+                        let result = hasher.finalize();
+                        hex::encode(result)
+                    }),
+                }
+                .map(opentelemetry::Value::from)
+            }
+            _ => None,
+        }
+    }
+
+    fn on_drop(&self) -> Option<opentelemetry::Value> {
+        match self {
+            RouterSelector::StaticField { r#static } => Some(r#static.clone().into()),
+            _ => None,
+        }
+    }
+
+    fn is_active(&self, stage: Stage) -> bool {
+        match stage {
+            Stage::Request => {
+                matches!(
+                    self,
+                    RouterSelector::RequestHeader { .. }
+                        | RouterSelector::RequestContext { .. }
+                        | RouterSelector::RequestMethod { .. }
+                        | RouterSelector::TraceId { .. }
+                        | RouterSelector::StudioOperationId { .. }
+                        | RouterSelector::Baggage { .. }
+                        | RouterSelector::Env { .. }
+                        | RouterSelector::StaticField { .. }
+                        | RouterSelector::ContextId { .. }
+                )
+            }
+            Stage::Response | Stage::ResponseEvent => matches!(
+                self,
+                RouterSelector::TraceId { .. }
+                    | RouterSelector::StudioOperationId { .. }
+                    | RouterSelector::OperationName { .. }
+                    | RouterSelector::Baggage { .. }
+                    | RouterSelector::Env { .. }
+                    | RouterSelector::StaticField { .. }
+                    | RouterSelector::ResponseHeader { .. }
+                    | RouterSelector::ResponseContext { .. }
+                    | RouterSelector::ResponseStatus { .. }
+                    | RouterSelector::ResponseSizeHint { .. }
+                    | RouterSelector::RouterOverhead { .. }
+                    | RouterSelector::ActiveSubgraphRequests { .. }
+                    | RouterSelector::RequestDuration { .. }
+                    | RouterSelector::OnGraphQLError { .. }
+                    | RouterSelector::ContextId { .. }
+                    // TODO: on_response_event is not yet wired in the router's streaming pipeline,
+                    // so these selectors only work for non-streaming (on: response) events.
+                    // See PR #9365 for the supergraph equivalent. Streaming support is a follow-up.
+                    | RouterSelector::ResponseErrors { .. }
+                    | RouterSelector::ResponseErrorsCount { .. }
+                    | RouterSelector::ResponseErrorsField { .. }
+            ),
+            Stage::ResponseField => false,
+            Stage::Error => matches!(
+                self,
+                RouterSelector::TraceId { .. }
+                    | RouterSelector::StudioOperationId { .. }
+                    | RouterSelector::OperationName { .. }
+                    | RouterSelector::Baggage { .. }
+                    | RouterSelector::Env { .. }
+                    | RouterSelector::StaticField { .. }
+                    | RouterSelector::ResponseContext { .. }
+                    | RouterSelector::Error { .. }
+                    | RouterSelector::ContextId { .. }
+            ),
+            Stage::Drop => matches!(self, RouterSelector::StaticField { .. }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use http::StatusCode;
+    use opentelemetry::Context;
+    use opentelemetry::KeyValue;
+    use opentelemetry::baggage::BaggageExt;
+    use opentelemetry::trace::SpanContext;
+    use opentelemetry::trace::SpanId;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::trace::TraceFlags;
+    use opentelemetry::trace::TraceId;
+    use opentelemetry::trace::TraceState;
+    use serde_json::json;
+    use tower::BoxError;
+    use tracing::span;
+    use tracing::subscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use crate::context::OPERATION_NAME;
+    use crate::plugins::telemetry::TraceIdFormat;
+    use crate::plugins::telemetry::config_new::Selector;
+    use crate::plugins::telemetry::config_new::router::selectors::RouterSelector;
+    use crate::plugins::telemetry::config_new::router_overhead::RouterOverheadTracker;
+    use crate::plugins::telemetry::config_new::selectors::DurationUnit;
+    use crate::plugins::telemetry::config_new::selectors::OperationName;
+    use crate::plugins::telemetry::config_new::selectors::ResponseStatus;
+    use crate::plugins::telemetry::config_new::selectors::SelectorJsonPath;
+    use crate::plugins::telemetry::otel;
+    use crate::query_planner::APOLLO_OPERATION_ID;
+    use crate::services::RouterRequest;
+    use crate::services::RouterResponse;
+
+    #[test]
+    fn router_static_field() {
+        let selector = RouterSelector::StaticField {
+            r#static: "test_static".to_string().into(),
+        };
+        assert_eq!(
+            selector
+                .on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "test_static".into()
+        );
+        assert_eq!(selector.on_drop().unwrap(), "test_static".into());
+    }
+
+    #[test]
+    fn router_request_header() {
+        let selector = RouterSelector::RequestHeader {
+            request_header: "header_key".to_string(),
+            redact: None,
+            default: Some("defaulted".into()),
+        };
+        assert_eq!(
+            selector
+                .on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .header("header_key", "header_value")
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "header_value".into()
+        );
+
+        assert_eq!(
+            selector
+                .on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "defaulted".into()
+        );
+
+        assert_eq!(
+            selector.on_response(
+                &crate::services::RouterResponse::fake_builder()
+                    .context(crate::context::Context::default())
+                    .header("header_key", "header_value")
+                    .data(json!({}))
+                    .build()
+                    .unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn router_request_context() {
+        let selector = RouterSelector::RequestContext {
+            request_context: "context_key".to_string(),
+            default: Some("defaulted".into()),
+        };
+        let context = crate::context::Context::new();
+        let _ = context.insert("context_key".to_string(), "context_value".to_string());
+        assert_eq!(
+            selector
+                .on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .context(context.clone())
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "context_value".into()
+        );
+
+        assert_eq!(
+            selector
+                .on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "defaulted".into()
+        );
+        assert_eq!(
+            selector.on_response(
+                &crate::services::RouterResponse::fake_builder()
+                    .context(context)
+                    .build()
+                    .unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn router_response_context() {
+        let selector = RouterSelector::ResponseContext {
+            response_context: "context_key".to_string(),
+            default: Some("defaulted".into()),
+        };
+        let context = crate::context::Context::new();
+        let _ = context.insert("context_key".to_string(), "context_value".to_string());
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .context(context.clone())
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "context_value".into()
+        );
+
+        assert_eq!(
+            selector
+                .on_error(&BoxError::from(String::from("my error")), &context)
+                .unwrap(),
+            "context_value".into()
+        );
+
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "defaulted".into()
+        );
+        assert_eq!(
+            selector.on_request(
+                &crate::services::RouterRequest::fake_builder()
+                    .context(context)
+                    .build()
+                    .unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn router_response_header() {
+        let selector = RouterSelector::ResponseHeader {
+            response_header: "header_key".to_string(),
+            redact: None,
+            default: Some("defaulted".into()),
+        };
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .header("header_key", "header_value")
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "header_value".into()
+        );
+
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "defaulted".into()
+        );
+
+        assert_eq!(
+            selector.on_request(
+                &crate::services::RouterRequest::fake_builder()
+                    .header("header_key", "header_value")
+                    .build()
+                    .unwrap()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn router_request_header_masking_with_global_rules() {
+        use crate::configuration::header_masking_config::HeaderMaskingConfig;
+        use crate::services::header_masking::HeaderMaskingRules;
+        use crate::services::header_masking::MaskingRulesMap;
+
+        let selector = RouterSelector::RequestHeader {
+            request_header: "authorization".to_string(),
+            redact: None,
+            default: None,
+        };
+        let rules = Arc::new(HeaderMaskingRules::from_config(&HeaderMaskingConfig {
+            enabled: true,
+            sensitive_headers: vec!["authorization".to_string()],
+            replace_defaults: false,
+        }));
+        let map = Arc::new(MaskingRulesMap::new_test(rules, Default::default()));
+        let context = crate::context::Context::new();
+        context.extensions().with_lock(|lock| lock.insert(map));
+        let request = crate::services::RouterRequest::fake_builder()
+            .header("authorization", "Bearer secret") // gitleaks:allow
+            .context(context)
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_request(&request).unwrap(),
+            "***MASKED***".into()
+        );
+    }
+
+    #[test]
+    fn router_request_header_redact_allow_overrides_masking() {
+        use crate::configuration::header_masking_config::HeaderMaskingConfig;
+        use crate::services::header_masking::HeaderMaskingRules;
+        use crate::services::header_masking::MaskingRulesMap;
+
+        let selector = RouterSelector::RequestHeader {
+            request_header: "authorization".to_string(),
+            redact: Some(crate::services::header_masking::RedactMode::Allow),
+            default: None,
+        };
+        let rules = Arc::new(HeaderMaskingRules::from_config(&HeaderMaskingConfig {
+            enabled: true,
+            sensitive_headers: vec!["authorization".to_string()],
+            replace_defaults: false,
+        }));
+        let map = Arc::new(MaskingRulesMap::new_test(rules, Default::default()));
+        let context = crate::context::Context::new();
+        context.extensions().with_lock(|lock| lock.insert(map));
+        let request = crate::services::RouterRequest::fake_builder()
+            .header("authorization", "Bearer secret") // gitleaks:allow
+            .context(context)
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_request(&request).unwrap(),
+            "Bearer secret".into()
+        ); // gitleaks:allow
+    }
+
+    #[test]
+    fn router_request_header_redact_explicit_mask() {
+        let selector = RouterSelector::RequestHeader {
+            request_header: "x-custom".to_string(),
+            redact: Some(crate::services::header_masking::RedactMode::Mask),
+            default: None,
+        };
+        let request = crate::services::RouterRequest::fake_builder()
+            .header("x-custom", "some-value")
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_request(&request).unwrap(),
+            "***MASKED***".into()
+        );
+    }
+
+    #[test]
+    fn router_request_header_masked_by_defaults_without_rules() {
+        let selector = RouterSelector::RequestHeader {
+            request_header: "authorization".to_string(),
+            redact: None,
+            default: None,
+        };
+        let request = crate::services::RouterRequest::fake_builder()
+            .header("authorization", "Bearer secret") // gitleaks:allow
+            .build()
+            .unwrap();
+        // Fail-secure: no rules in context → the built-in defaults still mask
+        // `authorization`.
+        assert_eq!(
+            selector.on_request(&request).unwrap(),
+            "***MASKED***".into()
+        );
+    }
+
+    #[test]
+    fn router_response_header_masking_with_global_rules() {
+        use crate::configuration::header_masking_config::HeaderMaskingConfig;
+        use crate::services::header_masking::HeaderMaskingRules;
+        use crate::services::header_masking::MaskingRulesMap;
+
+        let selector = RouterSelector::ResponseHeader {
+            response_header: "set-cookie".to_string(),
+            redact: None,
+            default: None,
+        };
+        let rules = Arc::new(HeaderMaskingRules::from_config(&HeaderMaskingConfig {
+            enabled: true,
+            sensitive_headers: vec!["set-cookie".to_string()],
+            replace_defaults: false,
+        }));
+        let map = Arc::new(MaskingRulesMap::new_test(rules, Default::default()));
+        let context = crate::context::Context::new();
+        context.extensions().with_lock(|lock| lock.insert(map));
+        let response = crate::services::RouterResponse::fake_builder()
+            .header("set-cookie", "session=abc123")
+            .context(context)
+            .data(serde_json_bytes::json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(&response).unwrap(),
+            "***MASKED***".into()
+        );
+    }
+
+    #[test]
+    fn router_response_header_redact_allow_overrides_masking() {
+        use crate::configuration::header_masking_config::HeaderMaskingConfig;
+        use crate::services::header_masking::HeaderMaskingRules;
+        use crate::services::header_masking::MaskingRulesMap;
+
+        let selector = RouterSelector::ResponseHeader {
+            response_header: "set-cookie".to_string(),
+            redact: Some(crate::services::header_masking::RedactMode::Allow),
+            default: None,
+        };
+        let rules = Arc::new(HeaderMaskingRules::from_config(&HeaderMaskingConfig {
+            enabled: true,
+            sensitive_headers: vec!["set-cookie".to_string()],
+            replace_defaults: false,
+        }));
+        let map = Arc::new(MaskingRulesMap::new_test(rules, Default::default()));
+        let context = crate::context::Context::new();
+        context.extensions().with_lock(|lock| lock.insert(map));
+        let response = crate::services::RouterResponse::fake_builder()
+            .header("set-cookie", "session=abc123")
+            .context(context)
+            .data(serde_json_bytes::json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(&response).unwrap(),
+            "session=abc123".into()
+        );
+    }
+
+    #[test]
+    fn router_baggage() {
+        let subscriber = tracing_subscriber::registry().with(otel::layer());
+        subscriber::with_default(subscriber, || {
+            let selector = RouterSelector::Baggage {
+                baggage: "baggage_key".to_string(),
+                default: Some("defaulted".into()),
+            };
+            let span_context = SpanContext::new(
+                TraceId::from(42),
+                SpanId::from(42),
+                // Make sure it's sampled if not, it won't create anything at the otel layer
+                TraceFlags::default().with_sampled(true),
+                false,
+                TraceState::default(),
+            );
+            let _context_guard = Context::new()
+                .with_remote_span_context(span_context)
+                .with_baggage(vec![KeyValue::new("baggage_key", "baggage_value")])
+                .attach();
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                "defaulted".into()
+            );
+
+            let span = span!(tracing::Level::INFO, "test");
+            let _guard = span.enter();
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                "baggage_value".into()
+            );
+        });
+    }
+
+    #[test]
+    fn router_trace_id() {
+        let subscriber = tracing_subscriber::registry().with(otel::layer());
+        subscriber::with_default(subscriber, || {
+            let selector = RouterSelector::TraceId {
+                trace_id: TraceIdFormat::Hexadecimal,
+            };
+            assert_eq!(
+                selector.on_request(
+                    &crate::services::RouterRequest::fake_builder()
+                        .build()
+                        .unwrap(),
+                ),
+                None
+            );
+
+            let span_context = SpanContext::new(
+                TraceId::from(42),
+                SpanId::from(42),
+                TraceFlags::default().with_sampled(true),
+                false,
+                TraceState::default(),
+            );
+            let _context = Context::current()
+                .with_remote_span_context(span_context)
+                .attach();
+            let span = span!(tracing::Level::INFO, "test");
+            let _guard = span.enter();
+
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                "0000000000000000000000000000002a".into()
+            );
+
+            let selector = RouterSelector::TraceId {
+                trace_id: TraceIdFormat::Datadog,
+            };
+
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                opentelemetry::Value::String("42".into())
+            );
+
+            let selector = RouterSelector::TraceId {
+                trace_id: TraceIdFormat::Uuid,
+            };
+
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                opentelemetry::Value::String("00000000-0000-0000-0000-00000000002a".into())
+            );
+
+            let selector = RouterSelector::TraceId {
+                trace_id: TraceIdFormat::Decimal,
+            };
+
+            assert_eq!(
+                selector
+                    .on_request(
+                        &crate::services::RouterRequest::fake_builder()
+                            .build()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                opentelemetry::Value::String("42".into())
+            );
+        });
+    }
+
+    #[test]
+    fn test_router_studio_trace_id() {
+        let selector = RouterSelector::StudioOperationId {
+            studio_operation_id: true,
+        };
+        let ctx = crate::Context::new();
+        let _ = ctx.insert(APOLLO_OPERATION_ID, "42".to_string()).unwrap();
+
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .context(ctx)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap(),
+            opentelemetry::Value::String("42".into())
+        );
+    }
+
+    #[test]
+    fn router_env() {
+        let mut selector = RouterSelector::Env {
+            env: "SELECTOR_ENV_VARIABLE".to_string(),
+            default: Some("defaulted".to_string()),
+            mocked_env_var: None,
+        };
+        assert_eq!(
+            selector.on_request(
+                &crate::services::RouterRequest::fake_builder()
+                    .build()
+                    .unwrap(),
+            ),
+            Some("defaulted".into())
+        );
+
+        if let RouterSelector::Env { mocked_env_var, .. } = &mut selector {
+            *mocked_env_var = Some("env_value".to_string())
+        }
+        assert_eq!(
+            selector.on_request(
+                &crate::services::RouterRequest::fake_builder()
+                    .build()
+                    .unwrap(),
+            ),
+            Some("env_value".into())
+        );
+    }
+
+    #[test]
+    fn router_operation_name_string() {
+        let selector = RouterSelector::OperationName {
+            operation_name: OperationName::String,
+            default: Some("defaulted".to_string()),
+        };
+        let context = crate::context::Context::new();
+        assert_eq!(
+            selector.on_response(
+                &crate::services::RouterResponse::fake_builder()
+                    .context(context.clone())
+                    .build()
+                    .unwrap(),
+            ),
+            Some("defaulted".into())
+        );
+        let _ = context.insert(OPERATION_NAME, "topProducts".to_string());
+        assert_eq!(
+            selector.on_response(
+                &crate::services::RouterResponse::fake_builder()
+                    .context(context.clone())
+                    .build()
+                    .unwrap(),
+            ),
+            Some("topProducts".into())
+        );
+        assert_eq!(
+            selector.on_error(&BoxError::from(String::from("my error")), &context),
+            Some("topProducts".into())
+        );
+    }
+
+    #[test]
+    fn router_response_status_code() {
+        let selector = RouterSelector::ResponseStatus {
+            response_status: ResponseStatus::Code,
+        };
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .status_code(StatusCode::NO_CONTENT)
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            opentelemetry::Value::I64(204)
+        );
+    }
+
+    #[test]
+    fn router_response_status_reason() {
+        let selector = RouterSelector::ResponseStatus {
+            response_status: ResponseStatus::Reason,
+        };
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .status_code(StatusCode::NO_CONTENT)
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            "No Content".into()
+        );
+    }
+
+    #[test]
+    fn router_response_size_hint() {
+        let selector = RouterSelector::ResponseSizeHint {
+            response_size_hint: true,
+        };
+        assert_eq!(
+            selector
+                .on_response(
+                    &crate::services::RouterResponse::fake_builder()
+                        .data("value")
+                        .build()
+                        .unwrap()
+                )
+                .unwrap(),
+            // The actual response body is {"data":"value"}
+            opentelemetry::Value::I64(16)
+        );
+    }
+
+    #[test]
+    fn router_response_body() {
+        let selector = RouterSelector::ResponseBody {
+            response_body: true,
+        };
+        let res = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::OK)
+            .data("some data")
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res).unwrap().as_str(),
+            r#"{"data":"some data"}"#
+        );
+    }
+
+    #[test]
+    fn router_response_body_errors() {
+        let selector = RouterSelector::ResponseErrors {
+            response_errors: SelectorJsonPath::from_str("$.[0]").unwrap(),
+        };
+        let res = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::BAD_REQUEST)
+            .data("some data")
+            .errors(vec![
+                crate::graphql::Error::builder()
+                    .message("Something went wrong")
+                    .locations(vec![crate::graphql::Location { line: 1, column: 1 }])
+                    .extension_code("GRAPHQL_VALIDATION_FAILED")
+                    .build(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res).unwrap().as_str(),
+            r#"{"message":"Something went wrong","locations":[{"line":1,"column":1}],"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}"#
+        );
+    }
+
+    #[test]
+    fn router_context_id() {
+        let selector = RouterSelector::ContextId { context_id: true };
+        let context = crate::context::Context::new();
+        let expected_id: opentelemetry::Value = context.id.clone().into();
+
+        // Test on_request
+        let request = RouterRequest::fake_builder()
+            .context(context.clone())
+            .build()
+            .unwrap();
+        assert_eq!(selector.on_request(&request).unwrap(), expected_id);
+
+        // Test on_response
+        let response = RouterResponse::fake_builder()
+            .context(context.clone())
+            .build()
+            .unwrap();
+        assert_eq!(selector.on_response(&response).unwrap(), expected_id);
+
+        // Test on_error
+        assert_eq!(
+            selector
+                .on_error(&BoxError::from(String::from("test error")), &context)
+                .unwrap(),
+            expected_id
+        );
+
+        // Test that context_id: false returns None
+        let selector_disabled = RouterSelector::ContextId { context_id: false };
+        let request = RouterRequest::fake_builder()
+            .context(context)
+            .build()
+            .unwrap();
+        assert!(selector_disabled.on_request(&request).is_none());
+    }
+
+    #[test]
+    fn router_request_duration() {
+        let context = crate::context::Context::new();
+        let tracker = RouterOverheadTracker::new();
+        context.extensions().with_lock(|ext| ext.insert(tracker));
+
+        let response = RouterResponse::fake_builder()
+            .context(context.clone())
+            .build()
+            .unwrap();
+
+        // Milliseconds → I64
+        let selector = RouterSelector::RequestDuration {
+            request_duration: DurationUnit::Milliseconds,
+        };
+        assert!(matches!(
+            selector.on_response(&response).unwrap(),
+            opentelemetry::Value::I64(_)
+        ));
+
+        // Seconds → F64
+        let selector = RouterSelector::RequestDuration {
+            request_duration: DurationUnit::Seconds,
+        };
+        assert!(matches!(
+            selector.on_response(&response).unwrap(),
+            opentelemetry::Value::F64(_)
+        ));
+
+        // Nanoseconds → I64
+        let selector = RouterSelector::RequestDuration {
+            request_duration: DurationUnit::Nanoseconds,
+        };
+        assert!(matches!(
+            selector.on_response(&response).unwrap(),
+            opentelemetry::Value::I64(_)
+        ));
+
+        // on_request returns None (response-only selector)
+        let selector = RouterSelector::RequestDuration {
+            request_duration: DurationUnit::Milliseconds,
+        };
+        let request = RouterRequest::fake_builder()
+            .context(context)
+            .build()
+            .unwrap();
+        assert!(selector.on_request(&request).is_none());
+    }
+
+    #[test]
+    fn router_response_errors_count() {
+        // Test counting all errors
+        let selector = RouterSelector::ResponseErrorsCount {
+            response_errors_count: SelectorJsonPath::from_str("$[*]").unwrap(),
+        };
+        let res = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::BAD_REQUEST)
+            .data("some data")
+            .errors(vec![
+                crate::graphql::Error::builder()
+                    .message("First error")
+                    .extension_code("ERROR_ONE")
+                    .build(),
+                crate::graphql::Error::builder()
+                    .message("Second error")
+                    .extension_code("ERROR_TWO")
+                    .build(),
+                crate::graphql::Error::builder()
+                    .message("Third error")
+                    .extension_code("NOT_FOUND")
+                    .build(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res),
+            Some(opentelemetry::Value::I64(3))
+        );
+
+        // Test counting filtered errors (exclude NOT_FOUND)
+        let selector_filtered = RouterSelector::ResponseErrorsCount {
+            response_errors_count: SelectorJsonPath::from_str(
+                "$[?(!(@.extensions.code == 'NOT_FOUND'))]",
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            selector_filtered.on_response(res),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        // Test with no errors
+        let res_no_errors = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::OK)
+            .data("some data")
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res_no_errors),
+            Some(opentelemetry::Value::I64(0))
+        );
+
+        // Test with single error (mimics timeout scenario)
+        let res_single_error = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::GATEWAY_TIMEOUT)
+            .errors(vec![
+                crate::graphql::Error::builder()
+                    .message("Your request has been timed out")
+                    .extension_code("GATEWAY_TIMEOUT")
+                    .build(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res_single_error),
+            Some(opentelemetry::Value::I64(1))
+        );
+    }
+
+    #[test]
+    fn router_response_errors_count_slice_clamps_to_array_length() {
+        // A slice bound larger than the number of errors must clamp to the array length
+        // rather than matching nothing.
+        let selector = RouterSelector::ResponseErrorsCount {
+            response_errors_count: SelectorJsonPath::from_str("$[:10]").unwrap(),
+        };
+        let res = &crate::services::RouterResponse::fake_builder()
+            .status_code(StatusCode::BAD_REQUEST)
+            .data("some data")
+            .errors(vec![
+                crate::graphql::Error::builder()
+                    .message("First error")
+                    .extension_code("ERROR_ONE")
+                    .build(),
+                crate::graphql::Error::builder()
+                    .message("Second error")
+                    .extension_code("ERROR_TWO")
+                    .build(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector.on_response(res),
+            Some(opentelemetry::Value::I64(2))
+        );
+
+        // Same for a negative start bound reaching past the beginning of the array.
+        let selector_from_end = RouterSelector::ResponseErrorsCount {
+            response_errors_count: SelectorJsonPath::from_str("$[-10:]").unwrap(),
+        };
+        assert_eq!(
+            selector_from_end.on_response(res),
+            Some(opentelemetry::Value::I64(2))
+        );
+    }
+
+    #[test]
+    fn router_on_graphql_error_on_response() {
+        use serde_json_bytes::Value;
+
+        use crate::context::CONTAINS_GRAPHQL_ERROR;
+
+        // on_graphql_error: true — true when errors present, false when not
+        let selector_true = RouterSelector::OnGraphQLError {
+            on_graphql_error: true,
+        };
+        let ctx_with_errors = crate::Context::default();
+        ctx_with_errors.insert_json_value(CONTAINS_GRAPHQL_ERROR, Value::Bool(true));
+        let response_with_errors = RouterResponse::fake_builder()
+            .context(ctx_with_errors)
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector_true.on_response(&response_with_errors),
+            Some(opentelemetry::Value::Bool(true))
+        );
+
+        let response_no_errors = RouterResponse::fake_builder().build().unwrap();
+        assert_eq!(
+            selector_true.on_response(&response_no_errors),
+            Some(opentelemetry::Value::Bool(false))
+        );
+
+        // on_graphql_error: false — inverted
+        let selector_false = RouterSelector::OnGraphQLError {
+            on_graphql_error: false,
+        };
+        assert_eq!(
+            selector_false.on_response(&response_no_errors),
+            Some(opentelemetry::Value::Bool(true))
+        );
+
+        let ctx_with_errors2 = crate::Context::default();
+        ctx_with_errors2.insert_json_value(CONTAINS_GRAPHQL_ERROR, Value::Bool(true));
+        let response_with_errors2 = RouterResponse::fake_builder()
+            .context(ctx_with_errors2)
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector_false.on_response(&response_with_errors2),
+            Some(opentelemetry::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn on_response_event_on_graphql_error_true() {
+        use serde_json_bytes::Value;
+
+        use crate::context::CHUNK_CONTAINS_GRAPHQL_ERROR;
+        use crate::plugins::telemetry::config_new::Selector;
+
+        let selector = RouterSelector::OnGraphQLError {
+            on_graphql_error: true,
+        };
+
+        // chunk with errors → returns true
+        let ctx = crate::Context::default();
+        ctx.insert_json_value(CHUNK_CONTAINS_GRAPHQL_ERROR, Value::Bool(true));
+        assert_eq!(
+            selector.on_response_event(&(), &ctx),
+            Some(opentelemetry::Value::Bool(true))
+        );
+
+        // chunk without errors → returns false
+        let ctx = crate::Context::default();
+        ctx.insert_json_value(CHUNK_CONTAINS_GRAPHQL_ERROR, Value::Bool(false));
+        assert_eq!(
+            selector.on_response_event(&(), &ctx),
+            Some(opentelemetry::Value::Bool(false))
+        );
+
+        // key absent → defaults to false (no errors)
+        let ctx = crate::Context::default();
+        assert_eq!(
+            selector.on_response_event(&(), &ctx),
+            Some(opentelemetry::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn on_response_event_on_graphql_error_false() {
+        use serde_json_bytes::Value;
+
+        use crate::context::CHUNK_CONTAINS_GRAPHQL_ERROR;
+        use crate::plugins::telemetry::config_new::Selector;
+
+        let selector = RouterSelector::OnGraphQLError {
+            on_graphql_error: false,
+        };
+
+        // chunk without errors → returns true (matches "no errors" condition)
+        let ctx = crate::Context::default();
+        ctx.insert_json_value(CHUNK_CONTAINS_GRAPHQL_ERROR, Value::Bool(false));
+        assert_eq!(
+            selector.on_response_event(&(), &ctx),
+            Some(opentelemetry::Value::Bool(true))
+        );
+
+        // chunk with errors → returns false (doesn't match "no errors" condition)
+        let ctx = crate::Context::default();
+        ctx.insert_json_value(CHUNK_CONTAINS_GRAPHQL_ERROR, Value::Bool(true));
+        assert_eq!(
+            selector.on_response_event(&(), &ctx),
+            Some(opentelemetry::Value::Bool(false))
+        );
+
+        // Edge case: JSONPath selects a single match whose value is itself an array.
+        // $[0].locations selects the locations array of the first error — this should
+        // count as 1 match (one error touched), not as the length of the locations array.
+        let selector_locations = RouterSelector::ResponseErrorsCount {
+            response_errors_count: SelectorJsonPath::from_str("$[0].locations").unwrap(),
+        };
+        let res_with_locations = &crate::services::RouterResponse::fake_builder()
+            .errors(vec![
+                crate::graphql::Error::builder()
+                    .message("Error with locations")
+                    .location(crate::graphql::Location { line: 1, column: 1 })
+                    .location(crate::graphql::Location { line: 2, column: 3 })
+                    .build(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(
+            selector_locations.on_response(res_with_locations),
+            Some(opentelemetry::Value::I64(1))
+        );
+    }
+}

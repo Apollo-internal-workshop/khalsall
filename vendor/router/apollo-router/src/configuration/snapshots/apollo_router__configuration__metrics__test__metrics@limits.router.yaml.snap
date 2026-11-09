@@ -1,0 +1,20 @@
+---
+source: apollo-router/src/configuration/metrics.rs
+expression: "&metrics.non_zero()"
+---
+- name: apollo.router.config.limits
+  data:
+    datapoints:
+      - value: 1
+        attributes:
+          opt.operation.max_aliases: true
+          opt.operation.max_depth: true
+          opt.operation.max_height: true
+          opt.operation.max_root_fields: true
+          opt.operation.warn_only: true
+          opt.parser.max_recursion: true
+          opt.parser.max_tokens: true
+          opt.request.http1_max_buf_size: true
+          opt.request.http1_max_headers: true
+          opt.request.http2_max_headers_list_bytes: true
+          opt.request.max_size: true

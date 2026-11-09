@@ -1,0 +1,421 @@
+use apollo_compiler::coord;
+use apollo_federation::composition::CompositionOptions;
+use apollo_federation::composition::compose;
+use apollo_federation::composition::upgrade_subgraphs_if_necessary;
+use apollo_federation::subgraph::typestate::Initial;
+use apollo_federation::subgraph::typestate::Subgraph;
+use insta::assert_snapshot;
+use test_log::test;
+
+// =============================================================================
+// Fed1 Schema Upgrade Tests
+// =============================================================================
+
+/// Fed1 schema with custom directive - description should be preserved after upgrade.
+#[test]
+fn fed1_preserves_custom_directive_descriptions() {
+    let subgraph = Subgraph::parse(
+        "subgraph",
+        "",
+        r#"
+            """ This is a description of the custom directive """
+            directive @customDirective(value: String!) on FIELD_DEFINITION | OBJECT
+
+            scalar _FieldSet
+
+            type Query {
+                hello: String
+            }
+
+            type A @key(fields: "id") {
+                id: ID!
+                name: String @customDirective(value: "test")
+            }
+        "#,
+    )
+    .expect("parses schema")
+    .expand_links()
+    .expect("expands schema");
+
+    let [upgraded]: [Subgraph<_>; 1] = upgrade_subgraphs_if_necessary(vec![subgraph])
+        .expect("upgrades schema")
+        .try_into()
+        .expect("Expected 1 element");
+
+    let custom_directive = coord!(@customDirective)
+        .lookup(upgraded.validated_schema().schema())
+        .expect("directive definition");
+    assert_snapshot!(custom_directive, @r#"
+        " This is a description of the custom directive "
+        directive @customDirective(value: String!) on FIELD_DEFINITION | OBJECT
+    "#);
+}
+
+/// Fed1 schema with federation directive description - description should now be preserved after upgrade.
+#[test]
+fn fed1_preserves_federation_directive_descriptions() {
+    let subgraph = Subgraph::parse(
+        "subgraph",
+        "",
+        r#"
+            """ This is a custom description of the key directive """
+            directive @key(fields: _FieldSet!) on OBJECT
+
+            scalar _FieldSet
+
+            type Query {
+                hello: String
+            }
+
+            type A @key(fields: "id") {
+                id: ID!
+            }
+        "#,
+    )
+    .expect("parses schema")
+    .expand_links()
+    .expect("expands schema");
+
+    let [upgraded]: [Subgraph<_>; 1] = upgrade_subgraphs_if_necessary(vec![subgraph])
+        .expect("upgrades schema")
+        .try_into()
+        .expect("Expected 1 element");
+
+    let key_directive = coord!(@key)
+        .lookup(upgraded.validated_schema().schema())
+        .expect("directive definition");
+    assert_snapshot!(key_directive, @r#"
+        " This is a custom description of the key directive "
+        directive @key(fields: federation__FieldSet!) on OBJECT
+    "#);
+}
+
+/// Fed1 schema with @tag on _FieldSet scalar - should upgrade successfully.
+#[test]
+fn fed1_fieldset_with_tag_upgrades_successfully() {
+    let subgraph = Subgraph::parse(
+        "subgraph",
+        "",
+        r#"
+            scalar _FieldSet @tag(name: "a")
+
+            directive @key(fields: _FieldSet!) on OBJECT | INTERFACE
+            directive @tag(name: String!) repeatable on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION
+
+            type Query {
+                start(id: ID!): S
+            }
+
+            type S @key(fields: "id") @tag(name: "b") {
+                id: ID!
+                name: String
+            }
+        "#,
+    )
+    .expect("parses schema")
+    .expand_links()
+    .expect("expands schema");
+
+    let [upgraded]: [Subgraph<_>; 1] = upgrade_subgraphs_if_necessary(vec![subgraph])
+        .expect("upgrades schema")
+        .try_into()
+        .expect("Upgrade subgraphs");
+
+    // Verify the upgraded schema has federation__FieldSet, not _FieldSet
+    let schema = upgraded.validated_schema().schema();
+    assert!(
+        schema.types.contains_key("federation__FieldSet"),
+        "Expected federation__FieldSet type in upgraded schema"
+    );
+}
+
+// =============================================================================
+// Fed2 Schema Passthrough Tests
+// =============================================================================
+
+/// Fed2 schema with custom directive - upgrade is a no-op, so description should be unchanged.
+#[test]
+fn fed2_preserves_custom_directive_descriptions() {
+    let subgraph = Subgraph::parse(
+        "subgraph",
+        "",
+        r#"
+            extend schema
+                @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+
+            """ A custom validation directive for Fed2 """
+            directive @validate(pattern: String!) on FIELD_DEFINITION | ARGUMENT_DEFINITION
+
+            type Query {
+                search(term: String! @validate(pattern: "^[a-zA-Z]+$")): [Result]
+            }
+
+            type Result @key(fields: "id") {
+                id: ID!
+            }
+        "#,
+    )
+    .expect("parses schema")
+    .expand_links()
+    .expect("expands schema");
+
+    let [validated]: [Subgraph<_>; 1] = upgrade_subgraphs_if_necessary(vec![subgraph])
+        .expect("validates schema")
+        .try_into()
+        .expect("Expected 1 element");
+
+    let validate_directive = coord!(@validate)
+        .lookup(validated.validated_schema().schema())
+        .expect("directive definition");
+    assert_snapshot!(validate_directive, @r#"
+        " A custom validation directive for Fed2 "
+        directive @validate(pattern: String!) on FIELD_DEFINITION | ARGUMENT_DEFINITION
+    "#);
+}
+
+/// Fed2 schema with custom description on federation directive - upgrade is a no-op so
+/// full definition and description should be unchanged
+#[test]
+fn fed2_uses_standard_federation_directive_definitions() {
+    let subgraph = Subgraph::parse(
+        "subgraph",
+        "",
+        r#"
+            extend schema
+                @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key", "@shareable"])
+
+            """ A custom description for the key directive in Fed2 """
+            directive @key(fields: federation__FieldSet!) on OBJECT
+
+            type Query {
+                hello: String
+            }
+
+            type A @key(fields: "id") {
+                id: ID!
+                name: String @shareable
+            }
+        "#,
+    )
+    .expect("parses schema")
+    .expand_links()
+    .expect("expands schema");
+
+    let [validated]: [Subgraph<_>; 1] = upgrade_subgraphs_if_necessary(vec![subgraph])
+        .expect("validates schema")
+        .try_into()
+        .expect("Expected 1 element");
+
+    let key_directive = coord!(@key)
+        .lookup(validated.validated_schema().schema())
+        .expect("directive definition");
+    assert_snapshot!(key_directive, @r#"
+        " A custom description for the key directive in Fed2 "
+        directive @key(fields: federation__FieldSet!) on OBJECT
+    "#);
+}
+
+/// Fed1 upgrade must not add @shareable to key fields. Two subgraphs share the
+/// same entity so the upgrader's `add_shareable` logic is exercised — it should
+/// recognize key fields as already shareable and skip them.
+///
+/// This tests an error scenario where schemas include `_entities` / `_service`
+/// on Query without defining the `_Entity` / `_Service` types. Previously,
+/// during expansion, `collect_deep_references` would error on `Query` because those
+/// types don't exist yet. Without the fix, the first error aborted the loop,
+/// leaving later types' @key directives unregistered in `referencers`.
+#[test]
+fn upgrade_does_not_add_shareable_to_key_fields_in_partial_schemas() {
+    // in order to trigger @shareable logic same element has to be defined in multiple schemas
+    let s1 = Subgraph::parse(
+        "s1",
+        "http://s1",
+        r#"
+            type Query {
+                product(id: ID!): Product
+                _entities(representations: [_Any!]!): [_Entity]!
+                _service: _Service!
+            }
+
+            type Product @key(fields: "id") {
+                id: ID!
+                name: String
+            }
+        "#,
+    )
+    .expect("parses")
+    .expand_links()
+    .expect("expands");
+
+    let s2 = Subgraph::parse(
+        "s2",
+        "http://s2",
+        r#"
+            type Query {
+                _entities(representations: [_Any!]!): [_Entity]!
+                _service: _Service!
+            }
+
+            type Product @key(fields: "id") {
+                id: ID!
+                price: Float
+            }
+        "#,
+    )
+    .expect("parses")
+    .expand_links()
+    .expect("expands");
+
+    let mut upgraded = upgrade_subgraphs_if_necessary(vec![s1, s2]).expect("upgrade succeeds");
+    upgraded.sort_by(|a, b| a.name.cmp(&b.name));
+
+    assert_snapshot!("s1", upgraded[0].schema_string());
+    assert_snapshot!("s2", upgraded[1].schema_string());
+}
+
+/// Fed v1 subgraph with `@requires` containing an inline fragment type condition that is only
+/// valid in the supergraph should upgrade and compose successfully.
+///
+/// Subgraph A defines two unrelated interfaces (`Animal` and `Pet`) and uses
+/// `@requires(fields: "data { ... on Pet { name } }")` where `data` returns `Animal`.
+/// In subgraph A alone, `Animal` and `Pet` have no type intersection.
+/// Subgraph B defines `Dog implements Animal & Pet`, making the type condition valid
+/// in the supergraph.
+#[test]
+fn fed1_requires_with_cross_subgraph_inline_fragment_type_condition() {
+    let subgraph_a = Subgraph::parse(
+        "subgraphA",
+        "",
+        r#"
+            type Query {
+                records: [Record]
+            }
+
+            interface Animal {
+                id: ID!
+            }
+
+            interface Pet {
+                name: String!
+            }
+
+            type Record @key(fields: "id") @extends {
+                id: ID! @external
+                data: Animal! @external
+                label: String! @requires(fields: "data { id ... on Pet { name } }")
+            }
+        "#,
+    )
+    .expect("parses subgraphA");
+
+    let subgraph_b = Subgraph::parse(
+        "subgraphB",
+        "",
+        r#"
+            type Query {
+                animals: [Animal]
+            }
+
+            interface Animal {
+                id: ID!
+            }
+
+            interface Pet {
+                name: String!
+            }
+
+            type Dog implements Animal & Pet {
+                id: ID!
+                name: String!
+                breed: String!
+            }
+
+            type Cat implements Animal {
+                id: ID!
+                color: String!
+            }
+
+            type Record @key(fields: "id") {
+                id: ID!
+                data: Animal!
+            }
+        "#,
+    )
+    .expect("parses subgraphB");
+
+    compose(vec![subgraph_a, subgraph_b], CompositionOptions::default())
+        .expect("composition succeeds");
+}
+
+// =============================================================================
+// Fed3 Upgrade Tests
+// =============================================================================
+
+fn join_link(subgraphs: Vec<Subgraph<Initial>>) -> String {
+    let supergraph =
+        compose(subgraphs, CompositionOptions::default()).expect("composition succeeds");
+    supergraph
+        .schema()
+        .schema()
+        .schema_definition
+        .directives
+        .iter()
+        .map(|directive| directive.to_string())
+        .find(|directive| directive.contains("specs.apollo.dev/join/"))
+        .expect("supergraph links the join spec")
+}
+
+fn fed2_subgraph() -> Subgraph<Initial> {
+    Subgraph::parse(
+        "fed2",
+        "http://fed2",
+        r#"
+            extend schema
+                @link(url: "https://specs.apollo.dev/federation/v2.8", import: ["@key"])
+
+            type Query {
+                t: T
+            }
+
+            type T @key(fields: "id") {
+                id: ID!
+                x: Int
+            }
+        "#,
+    )
+    .expect("parses subgraph")
+}
+
+/// A fed 2 subgraph composed alongside a fed 3 subgraph is upgraded to fed 3, and the supergraph
+/// uses the join spec version for fed 3.
+#[test]
+fn fed3_subgraph_upgrades_composition_to_fed3() {
+    let fed3 = Subgraph::parse(
+        "fed3",
+        "http://fed3",
+        r#"
+            extend schema
+                @link(url: "https://specs.apollo.dev/federation/v3.0", import: ["@key"])
+
+            type T @key(fields: "id") {
+                id: ID!
+                y: Int
+            }
+        "#,
+    )
+    .expect("parses subgraph");
+
+    assert_snapshot!(
+        join_link(vec![fed2_subgraph(), fed3]),
+        @r#"@link(url: "https://specs.apollo.dev/join/v0.6", for: EXECUTION)"#
+    );
+}
+
+/// Without a fed 3 subgraph, the composition stays on fed 2.
+#[test]
+fn fed2_subgraphs_compose_to_fed2() {
+    assert_snapshot!(
+        join_link(vec![fed2_subgraph()]),
+        @r#"@link(url: "https://specs.apollo.dev/join/v0.5", for: EXECUTION)"#
+    );
+}

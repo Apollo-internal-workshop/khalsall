@@ -1,0 +1,7 @@
+telemetry:
+  exporters:
+    metrics:
+      prometheus:
+        enabled: true
+        path: /metrics
+

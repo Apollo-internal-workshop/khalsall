@@ -1,0 +1,29 @@
+name: Build MCP-capable Router image
+
+# Manual and rarely needed: builds the router from vendor/router (branch
+# benjamn/connectors-mcp, the build that understands @connect(mcp:)) and pushes the shared image
+# gcr.io/summit-enterprise-workshop/router-mcp:latest. Deploys only reference that image; run this
+# only when vendor/router changes (or build and push it locally, see readme).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2.1.4
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push router image
+        run: |
+          gcloud builds submit . \
+            --project summit-enterprise-workshop \
+            --config router/cloudbuild-mcp.yaml \
+            --substitutions _IMAGE=gcr.io/summit-enterprise-workshop/router-mcp:latest

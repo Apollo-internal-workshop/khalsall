@@ -1,0 +1,15 @@
+telemetry:
+  exporters:
+    metrics:
+      prometheus:
+        enabled: true
+        path: /metrics
+
+
+headers:
+  all:
+    request:
+      operations:
+        - insert:
+            name: test
+            value: test

@@ -1,0 +1,9020 @@
+use apollo_compiler::parser::Parser;
+use insta::assert_json_snapshot;
+use serde_json_bytes::json;
+use test_log::test;
+use tower::ServiceExt;
+
+use super::*;
+use crate::compute_job::ComputeJobType;
+use crate::json_ext::ValueExt;
+use crate::plugins::authorization::CacheKeyMetadata;
+use crate::query_planner::query_planner_service::QueryPlannerService;
+use crate::services::QueryPlannerRequest;
+use crate::services::query_planner::PlanOptions;
+
+macro_rules! assert_eq_and_ordered {
+    ($a:expr, $b:expr $(,)?) => {
+        assert_eq!($a, $b,);
+        assert!(
+            $a.eq_and_ordered(&$b),
+            "assertion failed: objects are not ordered the same:\
+            \n  left: `{:?}`\n right: `{:?}`",
+            $a,
+            $b,
+        );
+    };
+}
+
+macro_rules! assert_eq_and_ordered_json {
+    ($a:expr, $b:expr $(,)?) => {
+        assert_eq!(
+            $a,
+            $b,
+            "assertion failed: objects are not the same:\
+            \n  left: `{}`\n right: `{}`",
+            serde_json::to_string(&$a).unwrap(),
+            serde_json::to_string(&$b).unwrap()
+        );
+        assert!(
+            $a.eq_and_ordered(&$b),
+            "assertion failed: objects are not ordered the same:\
+            \n  left: `{}`\n right: `{}`",
+            serde_json::to_string(&$a).unwrap(),
+            serde_json::to_string(&$b).unwrap(),
+        );
+    };
+}
+
+#[derive(Default)]
+#[must_use = "Must call .test() to run the test"]
+struct FormatTest {
+    schema: Option<&'static str>,
+    query_type_name: Option<&'static str>,
+    query: Option<&'static str>,
+    operation: Option<&'static str>,
+    variables: Option<serde_json_bytes::Value>,
+    response: Option<serde_json_bytes::Value>,
+    expected: Option<serde_json_bytes::Value>,
+    expected_errors: Option<serde_json_bytes::Value>,
+    expected_extensions: Option<serde_json_bytes::Value>,
+    federation_version: FederationVersion,
+}
+
+#[derive(Default)]
+enum FederationVersion {
+    #[default]
+    Fed1,
+    Fed2,
+}
+
+impl FormatTest {
+    fn builder() -> Self {
+        Self::default()
+    }
+
+    fn schema(mut self, schema: &'static str) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    fn query(mut self, query: &'static str) -> Self {
+        self.query = Some(query);
+        self
+    }
+
+    fn query_type_name(mut self, name: &'static str) -> Self {
+        self.query_type_name = Some(name);
+        self
+    }
+
+    fn operation(mut self, operation: &'static str) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    fn response(mut self, v: serde_json_bytes::Value) -> Self {
+        self.response = Some(v);
+        self
+    }
+
+    fn variables(mut self, v: serde_json_bytes::Value) -> Self {
+        self.variables = Some(v);
+        self
+    }
+
+    fn expected(mut self, v: serde_json_bytes::Value) -> Self {
+        self.expected = Some(v);
+        self
+    }
+
+    fn expected_errors(mut self, v: serde_json_bytes::Value) -> Self {
+        self.expected_errors = Some(v);
+        self
+    }
+
+    fn expected_extensions(mut self, v: serde_json_bytes::Value) -> Self {
+        self.expected_extensions = Some(v);
+        self
+    }
+
+    fn fed2(mut self) -> Self {
+        self.federation_version = FederationVersion::Fed2;
+        self
+    }
+
+    #[track_caller]
+    fn test(self) {
+        let schema = self.schema.expect("missing schema");
+        let query = self.query.expect("missing query");
+        let response = self.response.expect("missing response");
+        let query_type_name = self.query_type_name.unwrap_or("Query");
+
+        let schema = match self.federation_version {
+            FederationVersion::Fed1 => with_supergraph_boilerplate_fed1(schema, query_type_name),
+            FederationVersion::Fed2 => with_supergraph_boilerplate(schema, query_type_name),
+        };
+
+        let schema = Schema::parse(&schema, &Default::default()).expect("could not parse schema");
+
+        let api_schema = schema.api_schema();
+        let query =
+            Query::parse(query, None, &schema, &Default::default()).expect("could not parse query");
+        let mut response = Response::builder().data(response).build();
+
+        query.format_response(
+            &mut response,
+            self.variables
+                .unwrap_or_else(|| Value::Object(Object::default()))
+                .as_object()
+                .unwrap(),
+            api_schema,
+            BooleanValues { bits: 0 },
+            true,
+        );
+
+        if let Some(e) = self.expected {
+            assert_eq_and_ordered_json!(
+                serde_json_bytes::to_value(response.data.as_ref()).unwrap(),
+                e
+            );
+        }
+
+        if let Some(e) = self.expected_errors {
+            assert_eq_and_ordered_json!(serde_json_bytes::to_value(&response.errors).unwrap(), e);
+        }
+
+        if let Some(e) = self.expected_extensions {
+            assert_eq_and_ordered_json!(
+                serde_json_bytes::to_value(&response.extensions).unwrap(),
+                e
+            );
+        }
+    }
+}
+
+fn with_supergraph_boilerplate_fed1(content: &str, query_type_name: &str) -> String {
+    format!(
+        r#"
+    schema
+        @core(feature: "https://specs.apollo.dev/core/v0.1")
+        @core(feature: "https://specs.apollo.dev/join/v0.1")
+        @core(feature: "https://specs.apollo.dev/inaccessible/v0.1")
+         {{
+        query: {query_type_name}
+    }}
+    directive @core(feature: String!) repeatable on SCHEMA
+    directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+    directive @inaccessible on OBJECT| FIELD_DEFINITION | INTERFACE | UNION
+    enum join__Graph {{
+        TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+    }}
+
+    {content}
+    "#
+    )
+}
+
+fn with_supergraph_boilerplate(content: &str, query_type_name: &str) -> String {
+    format!(
+        r#"
+        schema
+        @link(url: "https://specs.apollo.dev/link/v1.0")
+        @link(url: "https://specs.apollo.dev/inaccessible/v0.2", for: SECURITY)
+        @link(url: "https://specs.apollo.dev/join/v0.2", for: EXECUTION)
+        {{
+            query: {query_type_name}
+        }}
+
+        directive @join__field(graph: join__Graph!, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+        directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+        directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+        directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+        directive @inaccessible on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION
+
+        scalar join__FieldSet
+        scalar link__Import
+        enum link__Purpose {{
+            SECURITY
+            EXECUTION
+        }}
+
+        enum join__Graph {{
+            TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+        }}
+
+        {content}
+    "#,
+    )
+}
+
+#[test]
+fn reformat_typename_of_query_not_named_query() {
+    FormatTest::builder()
+        .schema(
+            "type MyRootQuery {
+                foo: String
+            }",
+        )
+        .query_type_name("MyRootQuery")
+        .query("{ __typename }")
+        .response(json! {{}})
+        .expected(json! {{
+            "__typename": "MyRootQuery",
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_data_field() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+        foo: String
+        stuff: Bar
+        array: [Bar]
+        baz: String
+    }
+    type Bar {
+        bar: String
+        baz: String
+    }",
+        )
+        .query(
+            "query Test {
+        foo
+        stuff{bar __typename }
+        array{bar}
+        baz
+        alias:baz
+        alias_obj:stuff{bar}
+        alias_array:array{bar}
+    }",
+        )
+        .response(json! {{
+            "foo": "1",
+            "stuff": {"bar": "2", "__typename": "Bar"},
+            "array": [{"bar": "3", "baz": "4"}, {"bar": "5", "baz": "6"}],
+            "baz": "7",
+            "alias": "7",
+            "alias_obj": {"bar": "8"},
+            "alias_array": [{"bar": "9", "baz": "10"}, {"bar": "11", "baz": "12"}],
+            "other": "13",
+        }})
+        .expected(json! {{
+            "foo": "1",
+            "stuff": {
+                "bar": "2",
+                "__typename": "Bar",
+            },
+            "array": [
+                {"bar": "3"},
+                {"bar": "5"},
+            ],
+            "baz": "7",
+            "alias": "7",
+            "alias_obj": {
+                "bar": "8",
+            },
+            "alias_array": [
+                {"bar": "9"},
+                {"bar": "11"},
+            ],
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_data_inline_fragment() {
+    let schema = "type Query {
+        get: Test
+        getStuff: Stuff
+      }
+
+      type Stuff {
+          stuff: Bar
+      }
+      type Bar {
+          bar: String
+      }
+      type Thing {
+          id: String
+      }
+      union Test = Stuff | Thing";
+    let query = "{ get { ... on Stuff { stuff{bar}} ... on Thing { id }} }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"get": {"__typename": "Stuff", "id": "1", "stuff": {"bar": "2"}}}
+        })
+        .expected(json! {{
+            "get": {
+                "stuff": {
+                    "bar": "2",
+                },
+            }
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"get": {"__typename": "Thing", "id": "1", "stuff": {"bar": "2"}}}
+        })
+        .expected(json! {{
+            "get": {
+                "id": "1",
+            }
+        }})
+        .test();
+}
+
+#[test]
+fn typename_with_alias() {
+    let schema = "type Query {
+        getStuff: Stuff
+      }
+
+      type Stuff {
+          stuff: Bar
+      }
+      type Bar {
+          bar: String
+      }";
+    let query = "{ getStuff { stuff{bar} } __0_typename: __typename }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"getStuff": { "stuff": {"bar": "2"}}}
+        })
+        .expected(json! {{
+            "getStuff": {
+                "stuff": {
+                    "bar": "2",
+                },
+            },
+            "__0_typename": "Query"
+        }})
+        .test();
+}
+
+#[test]
+fn inline_fragment_on_top_level_operation() {
+    let schema = "type Query {
+        get: Test
+      }
+
+      type Stuff {
+          stuff: Bar
+      }
+      type Bar {
+          bar: String
+      }
+      type Thing {
+          id: String
+      }
+      union Test = Stuff | Thing";
+
+    // when using a fragment on an operation exported by a subgraph,
+    // we might not get a __typename field, we should instead be able
+    // to know the type in advance
+    FormatTest::builder()
+        .schema(schema)
+        .query("{ get { ... on Stuff { stuff{bar}} ... on Thing { id }} }")
+        .response(json! {
+            {"get": { "__typename": "Stuff", "stuff": {"bar": "2"}}}
+        })
+        .expected(json! {{
+             "get": {
+                "stuff": {"bar": "2"},
+            }
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_spread() {
+    let schema = "type Query {
+      thing: Thing
+    }
+
+    type Foo {
+        foo: String
+    }
+    type Bar {
+        bar: String
+    }
+    type Baz {
+        baz: String
+    }
+    union Thing = Foo
+    extend union Thing = Bar | Baz";
+    let query = "query { thing {...foo ...bar ...baz} } fragment foo on Foo {foo} fragment bar on Bar {bar} fragment baz on Baz {baz}";
+
+    // should only select fields from Foo
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"thing": {"__typename": "Foo", "foo": "1", "bar": "2", "baz": "3"}}
+        })
+        .expected(json! {
+            {"thing": {"foo": "1"}}
+        })
+        .test();
+
+    // should only select fields from Bar
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"thing": {"__typename": "Bar", "foo": "1", "bar": "2", "baz": "3"}}
+        })
+        .expected(json! {
+            {"thing": {"bar": "2"} }
+        })
+        .test();
+
+    // should only select fields from Baz
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"thing": {"__typename": "Baz", "foo": "1", "bar": "2", "baz": "3"}}
+        })
+        .expected(json! {
+            {"thing": {"baz": "3"} }
+        })
+        .test();
+}
+
+#[test]
+fn reformat_response_data_abstract_fragment_spread() {
+    let schema = "type Query {
+  dog: Dog
+}
+
+type Dog {
+  name: String!
+  nickname: String!
+  barkVolume: Int
+}
+
+type Cat {
+  name: String!
+  nickname: String!
+  meowVolume: Int
+}
+
+union CatOrDog = Cat | Dog";
+    let query = "query test { dog { ...petFragment } } fragment petFragment on CatOrDog { __isCatOrDog: __typename ... on Dog { name nickname barkVolume } ... on Cat { name nickname meowVolume } }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            { "dog": {"__isCatOrDog": "Dog", "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}
+        })
+        .expected(json! {
+            {"dog": {"__isCatOrDog": "Dog", "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}
+        })
+        .test();
+
+    let query = "query test { dog { ...petFragment } } fragment petFragment on CatOrDog { ... on Dog { name nickname barkVolume } ... on Cat { name nickname meowVolume } __isCatOrDog: __typename }";
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            { "dog": {"name": "Fido", "nickname": "Fi", "barkVolume": 7, "__isCatOrDog": "Dog" }}
+        })
+        .expected(json! {
+            {"dog": {"name": "Fido", "nickname": "Fi", "barkVolume": 7, "__isCatOrDog": "Dog" }}
+        })
+        .test();
+
+    let query = "query test { dog { ...petFragment } } fragment petFragment on CatOrDog { __typename ... on Dog { name nickname barkVolume } ... on Cat { name nickname meowVolume } }";
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"dog": { "__typename": "Dog", "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}
+        })
+        .expected(json! {
+            {"dog": { "__typename": "Dog", "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}
+        })
+        .test();
+}
+
+#[test]
+fn reformat_response_data_nested_abstract_fragment_spread() {
+    let schema = "type Query {
+  nestedDog: NestedDog
+}
+
+type NestedDog {
+  dog: Dog!
+}
+
+type Dog {
+  name: String!
+  nickname: String!
+  barkVolume: Int
+}
+
+type Cat {
+  name: String!
+  nickname: String!
+  meowVolume: Int
+}
+
+union CatOrDog = Cat | NestedDog";
+    let query = "query test { nestedDog { ...petFragment } } fragment petFragment on CatOrDog { __isCatOrDog: __typename ... on NestedDog { dog { name nickname barkVolume } } ... on Cat { name nickname meowVolume } }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            { "nestedDog": {"__isCatOrDog": "NestedDog", "dog": { "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}}
+        })
+        .expected(json! {
+            {"nestedDog": {"__isCatOrDog": "NestedDog", "dog": { "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}}
+        })
+        .test();
+
+    let query = "query test { nestedDog { ...petFragment } } fragment petFragment on CatOrDog { __typename ... on NestedDog { dog { name nickname barkVolume } } ... on Cat { name nickname meowVolume } }";
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {
+            {"nestedDog": { "__typename": "NestedDog", "dog": { "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}}
+        })
+        .expected(json! {
+            {"nestedDog": { "__typename": "NestedDog", "dog": { "name": "Fido", "nickname": "Fi", "barkVolume": 7 }}}
+        })
+        .test();
+}
+
+#[test]
+fn reformat_response_data_best_effort() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+        get: Thing
+    }
+    type Thing {
+        foo: String
+        stuff: Baz
+        array: [Element]
+        other: Bar
+    }
+
+    type Baz {
+        bar: String
+        baz: String
+    }
+
+    type Bar {
+        bar: String
+    }
+
+    union Element = Baz | Bar
+    ",
+        )
+        .query("{get {foo stuff{bar baz} array{... on Baz { bar baz } } other{bar}}}")
+        .response(json! {
+            {
+                "get": {
+                    "foo": "1",
+                    "stuff": {"baz": "2"},
+                    "array": [
+                        {"baz": "3"},
+                        "4",
+                        {"bar": "5"},
+                    ],
+                    "other": "6",
+                },
+                "should_be_removed": {
+                    "aaa": 2
+                },
+            }
+        })
+        .expected(json! {
+            {
+                "get": {
+                    "foo": "1",
+                    "stuff": {
+                        "bar": null,
+                        "baz": "2",
+                    },
+                    "array": [
+                        {},
+                        null,
+                        {}
+                    ],
+                    "other": null,
+                },
+            }
+        })
+        .test();
+}
+
+#[test]
+// just like the test above, except the query is one the planner would generate.
+fn reformat_response_data_best_effort_relevant_query() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+        get: Thing
+    }
+    type Thing {
+        foo: String
+        stuff: Baz
+        array: [Element]
+        other: Bar
+    }
+
+    type Baz {
+        bar: String
+        baz: String
+    }
+
+    type Bar {
+        bar: String
+    }
+
+    union Element = Baz | Bar
+    ",
+        )
+        .query("{get{foo stuff{bar baz}array{...on Baz{bar baz}}other{bar}}}")
+        // the planner generates this:
+        // {get{foo stuff{bar baz}array{__typename ...on Baz{bar baz}}other{bar}}}
+        .response(json! {
+            {
+                "get": {
+                    "foo": "1",
+                    "stuff": {"baz": "2"},
+                    "array": [
+                        {
+                            "__typename": "Baz",
+                            "baz": "3"
+                        },
+                        "4",
+                        {
+                            "__typename": "Baz",
+                            "baz": "5"
+                        },
+                    ],
+                    "other": "6",
+                },
+                "should_be_removed": {
+                    "aaa": 2
+                },
+            }
+        })
+        .expected(json! {
+            {
+                "get": {
+                    "foo": "1",
+                    "stuff": {
+                        "bar": null,
+                        "baz": "2",
+                    },
+                    "array": [
+                        {
+                            "bar":null,
+                            "baz":"3"
+                        },
+                        null,
+                        {
+                            "bar": null,
+                            "baz":"5"
+                        }
+                    ],
+                    "other": null,
+                },
+            }
+        })
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_scalar_simple() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Int]
+            }",
+        )
+        .query("{get {array}}")
+        .response(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_scalar_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Int]
+            }",
+        )
+        .query("{get {stuff: array}}")
+        .response(json! {{
+            "get": {
+                "stuff": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "stuff": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_scalar_duplicate_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            array: [Int]
+        }",
+        )
+        .query("{get {array stuff:array}}")
+        .response(json! {{
+            "get": {
+                "array": [1,2,3,4],
+                "stuff": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [1,2,3,4],
+                "stuff": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_scalar_duplicate_key() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Int]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_type_simple() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            array: [Element]
+        }
+
+        type Element {
+            stuff: String
+        }
+        ",
+        )
+        .query("{get {array{stuff}}}")
+        .response(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_type_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Element]
+            }
+
+            type Element {
+                stuff: String
+            }
+
+        ",
+        )
+        .query("{get { aliased: array {stuff}}}")
+        .response(json! {{
+            "get": {
+                "aliased": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "aliased": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_type_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Element]
+            }
+
+            type Element {
+                stuff: String
+            }
+            ",
+        )
+        .query("{get {array{stuff} array{stuff}}}")
+        .response(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_type_duplicate_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            array: [Element]
+        }
+
+        type Element {
+            stuff: String
+        }",
+        )
+        .query("{get {array{stuff} aliased: array{stuff}}}")
+        .response(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+                "aliased": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+                "aliased": [{"stuff": "FOO"}, {"stuff": "BAR"}],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_enum_simple() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Element]
+            }
+
+            enum Element {
+                FOO
+                BAR
+            }",
+        )
+        .query("{get {array}}")
+        .response(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_enum_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            array: [Element]
+        }
+
+        enum Element {
+            FOO
+            BAR
+        }",
+        )
+        .query("{get {stuff: array}}")
+        .response(json! {{
+            "get": {
+                "stuff": ["FOO", "BAR"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "stuff": ["FOO", "BAR"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_enum_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Element]
+            }
+
+            enum Element {
+                FOO
+                BAR
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_enum_duplicate_alias() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            array: [Element]
+        }
+
+        enum Element {
+            FOO
+            BAR
+        }",
+        )
+        .query("{get {array stuff: array}}")
+        .response(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+                "stuff": ["FOO", "BAR"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": ["FOO", "BAR"],
+                "stuff": ["FOO", "BAR"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+// If this test fails, this means you got greedy about allocations,
+// beware of aliases!
+fn reformat_response_array_of_int_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Int]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_float_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Float]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [1,2,3,4],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_bool_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [Boolean]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": [true,false],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": [true,false],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_string_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [String]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": ["hello","world"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": ["hello","world"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_array_of_id_duplicate() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [ID]
+            }",
+        )
+        .query("{get {array array}}")
+        .response(json! {{
+            "get": {
+                "array": ["hello","world"],
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "array": ["hello","world"],
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_types() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                i: Int
+                s: String
+                f: Float
+                b: Boolean
+                e: E
+                u: U
+                id: ID
+                l: [Int]
+            }
+
+            enum E {
+              A
+              B
+            }
+            union U = ObjA | ObjB
+            type ObjA {
+                a: String
+            }
+            type ObjB {
+                a: String
+            }
+            ",
+        )
+        .query(
+            r#"{
+            get {
+                i
+                s
+                f
+                ... on Thing {
+                  b
+                  e
+                  u {
+                    ... on ObjA {
+                      a
+                    }
+                  }
+                  id
+                }
+                l
+            }
+        }"#,
+        )
+        .response(json! {{
+            "get": {
+                "i": "hello",
+                "s": 1.0,
+                "f": [1],
+                "b": 0,
+                "e": "X",
+                "u": 1,
+                "id": {
+                    "test": "test",
+                },
+                "l": "A"
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "i": null,
+                "s": null,
+                "f": null,
+                "b": null,
+                "e": null,
+                "u": null,
+                // FIXME(@goto-bus-stop): this should be null, but we do not
+                // validate ID values today
+                "id": {
+                    "test": "test",
+                },
+                "l": null
+            },
+        }})
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["get", "i"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["get", "s"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Float",
+                "path": ["get", "f"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Boolean",
+                "path": ["get", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        /* FIXME(@TylerBloom): This, per the spec, *is* expected. However, persently, the router
+         * does not produce these errors.
+            {
+                "message": "Expected a valid enum value for type E",
+                "path": ["get", "e"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid non-object value of type number for composite type U",
+                "path": ["get", "u"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid non-list value of type string for list type [Int]",
+                "path": ["get", "l"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            }
+        */
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_int() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                a: Int
+                b: Int
+                c: Int
+                d: Int
+                e: Int
+                f: Int
+                g: Int
+            }
+            "#,
+        )
+        .query(r#"{ a b c d e f g }"#)
+        .response(json!({
+            "a": 1,
+            "b": 1.0, // Should be accepted as Int 1
+            "c": 1.2, // Float should not be truncated
+            "d": "1234", // Optional to be coerced by spec: we do not do so
+            "e": true,
+            "f": [1],
+            "g": { "value": 1 },
+        }))
+        .expected(json!({
+            "a": 1,
+            // FIXME(@goto-bus-stop): we should accept this, and truncate it
+            // to Int value `1`, but do not do so today
+            "b": null,
+            "c": null,
+            "d": null,
+            "e": null,
+            "f": null,
+            "g": null,
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["d"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["e"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["f"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["g"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_int_range() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        name: String
+        someNumber: Int
+        someOtherNumber: Int!
+    }
+    ";
+
+    let query = "query  { me { id name someNumber  } }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json!({
+            "me": {
+                "id": "123",
+                "name": "Guy Guyson",
+                "someNumber": 51049694213_i64
+            },
+        }))
+        .expected(json!({
+            "me": {
+                "id": "123",
+                "name": "Guy Guyson",
+                "someNumber": null,
+            },
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["me", "someNumber"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            }
+        ]))
+        .test();
+
+    let query2 = "query  { me { id name someOtherNumber  } }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json!({
+            "me": {
+                "id": "123",
+                "name": "Guy Guyson",
+                "someOtherNumber": 51049694213_i64
+            },
+        }))
+        .expected(json!({
+            "me": null,
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["me", "someOtherNumber"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            },
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_float() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                a: Float
+                b: Float
+                c: Float
+                d: Float
+                e: Float
+                f: Float
+            }
+            "#,
+        )
+        .query(r#"{ a b c d e f }"#)
+        .response(json!({
+            // Note: NaNs and Infinitys are not supported by GraphQL Floats,
+            // and handily not representable in JSON, so we don't need to handle them.
+            "a": 1, // Int can be interpreted as Float
+            "b": 1.2,
+            "c": "2.2", // Optional to be coerced by spec: we do not do so
+            "d": true,
+            "e": [1.234],
+            "f": { "value": 12.34 },
+        }))
+        .expected(json!({
+            "a": 1, // Representing int-valued float without the decimals is okay in JSON
+            "b": 1.2,
+            "c": null,
+            "d": null,
+            "e": null,
+            "f": null,
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Float",
+                "path": ["c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Float",
+                "path": ["d"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Float",
+                "path": ["e"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Float",
+                "path": ["f"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_string() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                a: String
+                b: String
+                c: String
+                d: String
+                e: String
+                f: String
+            }
+            "#,
+        )
+        .query(r#"{ a b c d e f }"#)
+        .response(json!({
+            "a": "text",
+            "b": 1, // Optional to be coerced by spec: we do not do so
+            "c": false, // Optional to be coerced by spec: we do not do so
+            "d": 1234.5678, // Optional to be coerced by spec: we do not do so
+            "e": ["s"],
+            "f": { "text": "text" },
+        }))
+        .expected(json!({
+            "a": "text",
+            "b": null,
+            "c": null,
+            "d": null,
+            "e": null,
+            "f": null,
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["d"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["e"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type String",
+                "path": ["f"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        /* FIXME(@TylerBloom): This, per the spec, *is* expected. However, persently, the router
+         * does not produce these errors.
+        */
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_expected_id() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                a: ID
+                b: ID
+                c: ID
+                d: ID
+                e: ID
+                f: ID
+                g: ID
+            }
+            "#,
+        )
+        .query(r#"{ a b c d e f g }"#)
+        .response(json!({
+            "a": "1234",
+            "b": "ABCD",
+            "c": 1234,
+            "d": 1234.0, // Integer represented as a float should be coerced
+            "e": false,
+            "f": 1234.5678, // Float should not be truncated
+            "g": ["s"],
+        }))
+        .expected(json!({
+            // Note technically IDs should always be represented as a String in JSON,
+            // though the value returned from a field can be either Int or String.
+            // We do not coerce the acceptable types to strings today.
+            "a": "1234",
+            "b": "ABCD",
+            "c": 1234,
+            // FIXME(@goto-bus-stop): We should coerce this to string "1234" (without .0),
+            // but we don't do so today
+            "d": 1234.0,
+            // FIXME(@goto-bus-stop): We should null out all these values,
+            // but we don't validate IDs today
+            "e": false,
+            "f": 1234.5678,
+            "g": ["s"],
+        }))
+        .expected_errors(json!([
+            // FIXME(@goto-bus-stop): we should expect these errors:
+            // {
+            //     "message": "Invalid value found for field Query.e",
+            //     "path": ["e"],
+            //     "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            // },
+            // {
+            //     "message": "Invalid value found for field Query.f",
+            //     "path": ["f"],
+            //     "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            // },
+            // {
+            //     "message": "Invalid value found for field Query.g",
+            //     "path": ["g"],
+            //     "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            // },
+        ]))
+        .test();
+}
+
+#[test]
+fn reformat_response_coercion_propagation_into_list() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            type Thing {
+                a: [Int]
+            }
+            "#,
+        )
+        .query(r#"{ thing { a } }"#)
+        .response(json!({
+            "thing": {
+                "a": [1, 1.1, 1.2]
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "a": [1, null, null]
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "a", 1],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "a", 2],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Nullable scalar elements coerce to null in place — no
+        // `format_non_nullable_value` wrapper, so no valueCompletion entries.
+        .expected_extensions(json!({}))
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            type Thing {
+                a: [Int!]
+            }
+            "#,
+        )
+        .query(r#"{ thing { a } }"#)
+        .response(json!({
+            "thing": {
+                "a": [1, 1.1, 1.2]
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "a": null
+            }
+        }))
+        // NOTE: The array validation stops at its first invalid value and "bubbles" up the
+        // nullification from there
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "a", 1],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found inside the array of type [Int!]",
+                "path": ["thing", "a"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            }
+        ]))
+        // `format_non_nullable_value(Int!)` emits valueCompletion at the
+        // element leaf; the outer list `[Int!]` is nullable so no outer
+        // wrapper emits.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["thing", "a", 1]
+                },
+            ]
+        }))
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            type Thing {
+                a: [Int!]!
+            }
+            "#,
+        )
+        .query(r#"{ thing { a } }"#)
+        .response(json!({
+            "thing": {
+                "a": [1, 1.1, 1.2]
+            }
+        }))
+        .expected(json!({
+            "thing": null
+        }))
+        // NOTE: The array validation stops at its first invalid value and "bubbles" up the
+        // nullification from there
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "a", 1],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found inside the array of type [Int!]",
+                "path": ["thing", "a"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single originating leaf entry.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["thing", "a", 1]
+                },
+            ]
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_coercion_propagation_into_object() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            type Thing {
+                a: Int
+                b: Int
+                c: Int
+            }
+            "#,
+        )
+        .query(r#"{ thing { a, b, c } }"#)
+        .response(json!({
+            "thing": {
+                "a": 1,
+                "b": 1.1,
+                "c": 1.2
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "a": 1,
+                "b": null,
+                "c": null
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            type Thing {
+                a: Int!
+                b: Int!
+                c: Int!
+            }
+            "#,
+        )
+        .query(r#"{ thing { a, b, c } }"#)
+        .response(json!({
+            "thing": {
+                "a": 1,
+                "b": 1.1,
+                "c": 1.2
+            }
+        }))
+        .expected(json!({
+            "thing": null
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing!
+            }
+
+            type Thing {
+                a: Int!
+                b: Int!
+                c: Int!
+            }
+            "#,
+        )
+        .query(r#"{ thing { a, b, c } }"#)
+        .response(json!({
+            "thing": {
+                "a": 1,
+                "b": 1.1,
+                "c": 1.2
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+}
+
+// `format_list` bubble suppression for a non-null list `[Thing!]!` combined with
+// scalar-Err dedup at the leaf.
+//
+// Before any dedup, a single bad element produced six `response.errors`:
+//   1. `[items, 0, value]` — "Invalid value found for the type Int" (from `format_integer`)
+//   2. `[items, 0, value]` — "Null value found for non-nullable type Int" (from
+//      `format_non_nullable_value` at the leaf)
+//   3. `[items, 0]` — "Null value found for non-nullable type Thing" (from
+//      `format_non_nullable_value` at the element)
+//   4. `[items]` — "Invalid value found inside the array of type [Thing!]" (from
+//      `format_list`)
+//   5. `[items]` — "Null value found for non-nullable type [Thing!]" (from
+//      `format_non_nullable_value` at the list)
+//
+// After all dedup layers: #2's response.errors duplicate is suppressed by scalar-Err
+// dedup (only the valueCompletion sink fires at the leaf); #3 is suppressed by
+// `format_named_type` propagation (both sinks); #5 is suppressed by `format_list`
+// returning `Err` (both sinks). Net `response.errors`: #1 + #4. Net `valueCompletion`:
+// only the leaf entry from the Int! wrapper.
+#[test]
+fn reformat_response_coercion_propagation_into_nonnull_list() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                items: [Thing!]!
+            }
+
+            type Thing {
+                value: Int!
+            }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        .response(json!({
+            "items": [ { "value": 1.5 } ]
+        }))
+        // Root field `items` is non-null, so the bubble propagates all the way to `data`.
+        .expected(json!(null))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["items", 0, "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["items"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Expect valueCompletion only at the originating leaf entry
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["items", 0, "value"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Composite list `[Thing!]!` with an explicit-null element. The element-level
+// `format_non_nullable_value(Thing!)` is the originating frame here (inner
+// `format_named_type` returns Ok with output=null because input was null),
+// so it emits both sinks at `[items, 0]`. Outer `format_non_nullable_value`
+// for `[Thing!]!` skips (Object inner_named_type), no drop.
+#[test]
+fn reformat_response_composite_list_explicit_null_element() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { items: [Thing!]! }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        .response(json!({ "items": [null] }))
+        .expected(json!(null))
+        .expected_errors(json!([
+            // Element wrapper originating emit (Ok branch — inner returned
+            // Ok with null output, no descendant reported).
+            {
+                "message": "Null value found for non-nullable type Thing",
+                "path": ["items", 0],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            // format_list's own diagnostic.
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["items"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single originating valueCompletion entry at the element. The
+        // outer `[Thing!]!` wrapper skips (Object inner_named_type).
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Thing",
+                    "path": ["items", 0],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Composite list `[Thing!]!` whose element is missing a required non-null
+// sub-field. `emit_missing_field` is the originating emit site (writes
+// valueCompletion at the element parent path `[items, 0]` and response.errors
+// at the missing-field leaf `[items, 0, value]`); both wrapper frames (Thing!
+// and [Thing!]!) skip via Object inner_named_type. No drop.
+#[test]
+fn reformat_response_composite_list_missing_nonnull_field() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { items: [Thing!]! }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        // Element is an empty object — `value` (Int!) is missing.
+        .response(json!({ "items": [{}] }))
+        .expected(json!(null))
+        .expected_errors(json!([
+            // emit_missing_field response.errors at the leaf.
+            {
+                "message": "Missing field",
+                "path": ["items", 0, "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            // format_list's own diagnostic.
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["items"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // emit_missing_field valueCompletion at the element parent path.
+        // Both wrapper frames skip — no duplicate, no drop.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Cannot return null for non-nullable type Int",
+                    "path": ["items", 0],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Composite list `[Thing!]` (nullable outer, non-null inner) with a deep
+// element error. The bubble propagates element → Thing! wrapper → nullable
+// list (absorbs). The nullable outer list does NOT wrap in
+// `format_non_nullable_value`, so no outer emit to drop.
+#[test]
+fn reformat_response_composite_list_nullable_outer_absorbs() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { items: [Thing!] }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        .response(json!({ "items": [{ "value": 1.5 }] }))
+        // Nullable list absorbs — `items` becomes null.
+        .expected(json!({ "items": null }))
+        .expected_errors(json!([
+            // Scalar leaf coercion emit (no companion "Null value" entry —
+            // scalar-Err dedup).
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["items", 0, "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            // format_list's own diagnostic (inner type Thing! is non-null
+            // → format_list propagates and emits at the list path).
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["items"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single originating valueCompletion at the deep scalar leaf.
+        // Thing! wrapper skips (Object inner_named_type); the outer list
+        // is nullable so no `format_non_nullable_value` wraps it.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["items", 0, "value"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Composite list `[Thing!]` (nullable outer, non-null inner) with an
+// explicit-null element — `[null]`. The element-level
+// `format_non_nullable_value(Thing!)` is the originating frame (inner
+// `format_named_type` returns Ok with output=null because input was null),
+// so it emits both sinks at `[items, 0]`. `format_list` then propagates and
+// emits its own "Invalid value found inside the array" entry to
+// response.errors. The nullable outer list has no `format_non_nullable_value`
+// wrapper, so no outer emit either way.
+#[test]
+fn reformat_response_composite_list_nullable_outer_explicit_null_element() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { items: [Thing!] }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        .response(json!({ "items": [null] }))
+        // Nullable outer absorbs the bubble — `items` becomes null.
+        .expected(json!({ "items": null }))
+        .expected_errors(json!([
+            {
+                "message": "Null value found for non-nullable type Thing",
+                "path": ["items", 0],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["items"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single originating valueCompletion at the element. No outer-list
+        // wrapper to deduplicate against.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Thing",
+                    "path": ["items", 0],
+                },
+            ]
+        }))
+        .test();
+}
+
+// List with nullable inner `[Thing]!`. An element that fails an inner
+// non-null contract nullifies independently — the bubble terminates at the
+// nullable element slot, not at the list. No outer list emit either.
+#[test]
+fn reformat_response_composite_list_nullable_inner_per_element() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { items: [Thing]! }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ items { value } }"#)
+        .response(json!({
+            "items": [
+                { "value": 1 },
+                { "value": 1.5 },
+                { "value": 3 }
+            ]
+        }))
+        // Middle element nullifies in place; siblings preserved.
+        .expected(json!({
+            "items": [
+                { "value": 1 },
+                null,
+                { "value": 3 }
+            ]
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["items", 1, "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single valueCompletion at the originating scalar leaf. The
+        // nullable Thing slot absorbs, no list-level emit.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["items", 1, "value"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Nested composite list `[[Thing!]!]!` with a deep scalar coercion failure.
+// The bubble crosses inner-list, element-Thing!, outer-list, and finally the
+// root `format_non_nullable_value` wrapper. Each composite wrapper SKIPs
+// (Object inner_named_type), confirming no drop in the nested case.
+#[test]
+fn reformat_response_composite_nested_list_deep_failure() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query { grid: [[Thing!]!]! }
+            type Thing { value: Int! }
+            "#,
+        )
+        .query(r#"{ grid { value } }"#)
+        .response(json!({ "grid": [[ { "value": 1.5 } ]] }))
+        .expected(json!(null))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["grid", 0, 0, "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            // Only the innermost list emits its "Invalid value found inside the
+            // array" entry — the outer list's element type is itself a list, so
+            // `format_list` skips its own emit to avoid bubble compounding.
+            {
+                "message": "Invalid value found inside the array of type [Thing!]",
+                "path": ["grid", 0],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Single originating valueCompletion at the deep scalar leaf. Every
+        // composite wrapper above (Thing!, [Thing!]!, [[Thing!]!]!) skips —
+        // confirms the composite skip predicate doesn't drop the deep entry.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["grid", 0, 0, "value"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// `apply_root_selection_set` bubble suppression for a non-null root field.
+//
+// Mirrors the `apply_selection_set` case: a non-null root field whose child
+// errors no longer re-emits a "Null value found for non-nullable type X"
+// at the root field's path.  The leaf still emits once.
+#[test]
+fn reformat_response_root_nonnull_bubble_suppression() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing!
+            }
+
+            type Thing {
+                value: Int!
+            }
+            "#,
+        )
+        .query(r#"{ thing { value } }"#)
+        .response(json!({
+            "thing": { "value": 1.5 }
+        }))
+        // Root field `thing` is non-null → bubble propagates to `data`.
+        .expected(json!(null))
+        // Only the originating coercion error remains. Before any dedup, three
+        // extra entries would have landed.
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "value"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // Expect valueCompletion only at the originating non-null scalar leaf.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["thing", "value"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Two separate bubble paths under a nullable root: each must emit its own leaf error.
+//
+// The dedup change suppresses *re-emits along a single bubble path* (a non-null parent
+// re-stating what its child already reported).  It must NOT suppress independent
+// bubbles that originate from sibling subtrees.
+//
+// Layout:
+//
+//     Query.outer: Outer            # nullable — absorbs both bubbles
+//     Outer.alpha: Mid              # nullable — absorbs alpha's bubble
+//     Outer.beta:  Int!             # non-null — beta's bubble propagates past
+//     Mid.inner:   Int!             # non-null
+//
+// Bubble #1 — `outer.alpha.inner` is invalid:
+//   leaf emit at `[outer, alpha, inner]` → `Mid` propagates `Err` → `apply_selection_set`
+//   on `Outer.alpha` (nullable) swallows.  `alpha` lands as `null`.
+//
+// Bubble #2 — `outer.beta` is invalid:
+//   leaf emit at `[outer, beta]` → `Outer.beta` (non-null) propagates `Err` →
+//   `format_named_type` on `Outer` propagates → `apply_root_selection_set` on
+//   `Query.outer` (nullable) swallows.  `outer` lands as `null`.
+//
+// Both leaves emit; both bubbles terminate at distinct nullable ancestors; no
+// duplicated parent-path emits along either chain.
+#[test]
+fn reformat_response_two_independent_bubbles_each_report() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                outer: Outer
+            }
+
+            type Outer {
+                alpha: Mid
+                beta: Int!
+            }
+
+            type Mid {
+                inner: Int!
+            }
+            "#,
+        )
+        .query(r#"{ outer { alpha { inner } beta } }"#)
+        .response(json!({
+            "outer": {
+                "alpha": { "inner": 1.5 },
+                "beta": 2.5
+            }
+        }))
+        // `Query.outer` is nullable → both bubbles terminate inside `outer`,
+        // so `outer` itself is `null` (beta's bubble nullified the whole object).
+        .expected(json!({ "outer": null }))
+        // Two entries, one originating coercion error per bubble.  Scalar-Err
+        // dedup suppresses the "Null value found for non-nullable type Int"
+        // emits at each leaf; format_named_type-Err dedup suppresses the
+        // intermediate "Null value found for non-nullable type Mid/Outer"
+        // bubbles along each chain.
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["outer", "alpha", "inner"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["outer", "beta"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // valueCompletion: one entry per originating leaf, two total.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["outer", "alpha", "inner"],
+                },
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["outer", "beta"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// Nested errors along the same chain: an absorbed deep bubble plus a separate
+// invalid-value error at the outer level.  Both errors must be reported, with
+// the nullable middle layer absorbing the deep bubble silently.
+//
+// Three behaviors stacked along the response tree:
+//
+//     leaf   (`mid.leaf`, Int!)  — non-null with invalid value → errors at leaf path
+//     mid    (`mid`, Mid)        — nullable → absorbs the leaf's bubble (silent)
+//     outer  (`outer`, Int)      — own invalid value → errors at outer path
+//
+// Without dedup, `mid`'s absorbed bubble would also re-emit "Null value found for
+// non-nullable type Int" at `[mid]` (the old `format_non_nullable_value` path on
+// the nullified `mid.leaf`).  Post-dedup, the `Err` from `apply_selection_set`
+// propagates through `format_named_type`, `format_non_nullable_value`'s `?`
+// short-circuits, and the absorb at `mid` is silent.  Outer is independent —
+// `format_integer` emits at `[outer]` on its own coercion failure.
+#[test]
+fn reformat_response_outer_invalid_and_absorbed_inner_bubble_both_report() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                outer: Int
+                mid: Mid
+            }
+
+            type Mid {
+                leaf: Int!
+            }
+            "#,
+        )
+        .query(r#"{ outer mid { leaf } }"#)
+        .response(json!({
+            "outer": 1.5,
+            "mid": { "leaf": 2.5 }
+        }))
+        // `outer` nullifies in place (nullable Int with invalid value);
+        // `mid` nullifies via the absorbed leaf bubble.
+        .expected(json!({
+            "outer": null,
+            "mid": null,
+        }))
+        .expected_errors(json!([
+            // outer error: nullable Int, only the coercion-side emit (no
+            // "Null value for non-nullable" because outer is nullable).
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["outer"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            // leaf error: non-null Int!, only the originating coercion error.
+            // Scalar-Err dedup suppresses the leaf-level "Null value found"
+            // emit, and mid's nullable swallow is silent — the absorbed
+            // bubble adds nothing further.
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["mid", "leaf"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        // valueCompletion: only the originating non-null leaf at `[mid, leaf]`.
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type Int",
+                    "path": ["mid", "leaf"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// `__typename` selection on an abstract (union) type where the input has no
+// `__typename` to disambiguate the concrete object.
+//
+// Before this change, the `__typename` branch returned `Err(InvalidValue)`
+// with no emit; `format_named_type` then swallowed the `Err`, leaving
+// `output = null`, and `format_non_nullable_value` emitted
+// "Null value found for non-nullable type X" at the parent path.
+//
+// After the dedup change, `format_named_type` propagates the `Err` —
+// without an emit at the `__typename` branch, the nullification would be
+// silent.  The fix calls `emit_missing_field` so the diagnostic lands at
+// the `__typename` leaf path.
+#[test]
+fn reformat_response_unknown_typename_emits_at_typename_leaf() {
+    FormatTest::builder()
+        .schema(
+            r#"
+            type Query {
+                thing: Thing
+            }
+
+            union Thing = Foo | Bar
+
+            type Foo { a: Int }
+            type Bar { b: Int }
+            "#,
+        )
+        .query(r#"{ thing { __typename } }"#)
+        // Input has no `__typename`, and the field's `current_type` is the union
+        // `Thing` — `get_object("Thing")` is None and there's no input `__typename`
+        // to fall back on, so the `__typename` branch returns `Err`.
+        .response(json!({
+            "thing": {}
+        }))
+        // `thing` is nullable, so it nullifies in `data` without bubbling further.
+        .expected(json!({ "thing": null }))
+        // New: `emit_missing_field` reports the unresolvable `__typename` at the
+        // leaf path.  Field type `String!` (non-null) → emits to both sinks.
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "__typename"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Cannot return null for non-nullable type String",
+                    "path": ["thing"],
+                },
+            ]
+        }))
+        .test();
+}
+
+// There are four cases we need to account for: the type info is(n't) queried and type info
+// is(n't) returned.
+//
+// We can only follow the spec/client expection of response validation if we have the type info. If
+// we get it (regardless of asking for it), our validation can follow the spec and we can act like
+// a normal GQL server. If we ask and don't receive it, we need to return an error stating this
+// issue regardless of validation issues. Validation without type info will lead to an unexpected
+// result for the client.
+//
+// Lastly, this test points out an underlying assumption for what the router needs to do in order
+// to appear as a normal GQL server: we always query type info. This assumption lies at the
+// router-QP boundary and needs to be tested elsewhere. This test is just for ensuring we can
+// follow the spec as closely as possible.
+#[test]
+fn reformat_response_coercion_propagation_into_union() {
+    let nullable_schema = r#"
+        type Query {
+            thing: Thing
+        }
+
+        union Thing = Bar | Foo
+
+        type Foo {
+            a: Int
+            b: Int
+            c: Int
+        }
+
+        type Bar {
+            bar: String
+        }"#;
+
+    let non_nullable_schema = r#"
+        type Query {
+            thing: Thing
+        }
+
+        union Thing = Bar | Foo
+
+        type Foo {
+            a: Int!
+            b: Int!
+            c: Int!
+        }
+
+        type Bar {
+            bar: String
+        }"#;
+
+    let query_wo_type_info = r#"{ thing { ... on Foo { a, b, c } } }"#;
+    let query_with_type_info = r#"{ thing { __typename ... on Foo { a, b, c } } }"#;
+
+    let resp_wo_type_info = json!({
+        "thing": {
+            "a": 1,
+            "b": 1.1,
+            "c": 1.2
+        }
+    });
+    let resp_with_type_info = json!({
+        "thing": {
+            "__typename": "Foo",
+            "a": 1,
+            "b": 1.1,
+            "c": 1.2
+        }
+    });
+
+    // Case 1: __typename isn't queried and isn't returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_wo_type_info.clone())
+        .expected(json!({ "thing": { } }))
+        .expected_errors(json!([]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_wo_type_info.clone())
+        // NOTE: This is seemingly strange behavior but is consistent. Because we can't *always*
+        // resolve the type of `thing`, we can't determine if the result is valid or not.
+        .expected(json!({ "thing": { } }))
+        // NOTE: Same issue. We can not *always* know what type was intented, so we drop the data.
+        .expected_errors(json!([]))
+        .test();
+
+    // Case 2: __typename isn't queried but is returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_with_type_info.clone())
+        // NOTE: Since `__typename` is not requested, it is dropped from the actual response;
+        // however, we can still use it for the validation of `thing` as a `Foo`
+        .expected(json!({
+            "thing": {
+                "a": 1,
+                "b": null,
+                "c": null,
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({ "thing": null }))
+        // Only the originating coercion error: No extra "Null value found for non-nullable type"
+        // error.
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    // Case 3: __typename is queried but isn't returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_wo_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "__typename"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_wo_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "__typename"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    // Case 4: __typename is queried and is returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({
+            "thing": {
+                "__typename": "Foo",
+                "a": 1,
+                "b": null,
+                "c": null
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            }
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+}
+
+// This test covers similar cases to the union test. Without the type info of an interface, we can
+// get strange looking results from the prespective of the client. Without that info, we can not
+// properly identify the type of a return object. This leads to selection sets for any inlined
+// fragments to be coersed into empty object, not nullified sets or sets with null values.
+//
+// This behavior diverges from the spec. So, like the union tests, there are four cases we need to
+// account for: the type info is(n't) queried and type info is(n't) returned.
+//
+// Unlike the union tests, if a fragment is part of the query but type info is not
+// returned, the return fragment data is ignored, regardless of validity.
+#[test]
+fn reformat_response_coercion_propagation_into_interfaces() {
+    let nullable_schema = r#"
+        type Query {
+            thing: Thing
+        }
+
+        interface Thing {
+            a: Int
+        }
+
+        type Foo implements Thing {
+            a: Int
+            b: Int
+            c: Int
+        }
+
+        type Bar implements Thing {
+            a: Int
+            bar: String
+        }"#;
+
+    let non_nullable_schema = r#"
+        type Query {
+            thing: Thing
+        }
+
+        interface Thing {
+            a: Int!
+        }
+
+        type Foo implements Thing {
+            a: Int!
+            b: Int!
+            c: Int!
+        }
+
+        type Bar implements Thing {
+            a: Int!
+            bar: String!
+        }"#;
+
+    let query_wo_type_info = r#"{ thing { a ... on Foo { b, c } } }"#;
+    let query_with_type_info = r#"{ thing { __typename a ... on Foo { b, c } } }"#;
+
+    let resp_wo_type_info = json!({
+            "thing": {
+                "a": 1,
+                "b": 1.1,
+                "c": 1.2
+            }
+    });
+    let resp_with_type_info = json!({
+        "thing": {
+            "__typename": "Foo",
+            "a": 1,
+            "b": 1.1,
+            "c": 1.2
+        }
+    });
+
+    // Case 1: __typename isn't queried and isn't returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_wo_type_info.clone())
+        .expected(json!({
+            "thing": {
+                "a": 1,
+            }
+        }))
+        .expected_errors(json!([]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_wo_type_info.clone())
+        // NOTE: This is seemingly strange behavior but is consistent. Because we can't *always*
+        // resolve the type of `thing` with __typename, we can't determine if the result is valid
+        // or not. Thus, the nullification of the fragment doesn't "bubble up" to nullifying the
+        // either "thing".
+        .expected(json!({
+            "thing": {
+                "a": 1
+            }
+        }))
+        .expected_errors(json!([]))
+        .test();
+
+    // Case 2: __typename isn't queried but is returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({
+            "thing": {
+                "a": 1,
+                "b": null,
+                "c": null,
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_wo_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    // Case 3: __typename is queried but isn't returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_wo_type_info.clone())
+        // FIXME(@TylerBloom): This is not expected. This should behave the same with(out)
+        // `__typename` being queried.
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "__typename"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_wo_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "__typename"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+
+    // Case 4: __typename is queried and is returned
+    FormatTest::builder()
+        .schema(nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({
+            "thing": {
+                "__typename": "Foo",
+                "a": 1,
+                "b": null,
+                "c": null
+            }
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            }
+        ]))
+        .test();
+
+    FormatTest::builder()
+        .schema(non_nullable_schema)
+        .query(query_with_type_info)
+        .response(resp_with_type_info.clone())
+        .expected(json!({ "thing": null }))
+        .expected_errors(json!([
+            {
+                "message": "Invalid value found for the type Int",
+                "path": ["thing", "b"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+        ]))
+        .test();
+}
+
+#[test]
+fn solve_query_with_single_typename() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [String]
+            }",
+        )
+        .query("{ __typename }")
+        .response(json! {{}})
+        .expected(json! {{
+            "__typename": "Query"
+        }})
+        .test();
+}
+
+#[test]
+fn solve_query_with_aliased_typename() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [String]
+            }",
+        )
+        .query("{ aliased: __typename }")
+        .response(json! {{}})
+        .expected(json! {{
+            "aliased": "Query"
+        }})
+        .test();
+}
+
+#[test]
+fn solve_query_with_multiple_typenames() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                array: [String]
+            }",
+        )
+        .query("{ aliased: __typename __typename }")
+        .response(json! {{}})
+        .expected(json! {{
+            "aliased": "Query",
+            "__typename": "Query"
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_query_with_root_typename() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                foo: String
+            }",
+        )
+        .query("{get {foo __typename} __typename}")
+        .response(json! {{
+            "get": {
+                "foo": "1",
+                "__typename": "Thing"
+            }
+        }})
+        .expected(json! {{
+            "get": {
+                "foo": "1",
+                "__typename": "Thing"
+            },
+            "__typename": "Query",
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_interface_typename_not_queried() {
+    // With the introduction of @interfaceObject, a subgraph can send back a typename that
+    // correspond to an interface in the supergraph. As long as that typename is not requested,
+    // we want this to be fine and to prevent formatting of the response.
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                i: I
+            }
+            interface I {
+                x: String
+            }
+            type A implements I {
+                x: String
+            }",
+        )
+        .query("{i{x}}")
+        .response(json! {{
+            "i": {
+                "__typename": "I",
+                "x": "foo",
+            }
+        }})
+        .expected(json! {{
+            "i": {
+                "x": "foo",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_interface_typename_queried() {
+    // As mentioned in the previous test, the introduction of @interfaceObject makes it possible
+    // for a subgraph to send back a typename that correspond to an interface in the supergraph.
+    // If that typename is queried, then the query planner will ensure that such typename is
+    // replaced (overriden to a proper object type of the supergraph by a followup fetch). But
+    // as that later fetch can fail, we can have to format a response where the typename is
+    // requested and is still set to the interface. We must not return that value (it's invalid
+    // graphQL) and instead nullify the response in that case.
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                i: I
+            }
+            interface I {
+                x: String
+            }
+            type A implements I {
+                x: String
+            }",
+        )
+        .query("{i{__typename x}}")
+        .response(json! {{
+            "i": {
+                "__typename": "I",
+                "x": "foo",
+            }
+        }})
+        .expected(json! {{
+            "i": null,
+        }})
+        .test();
+}
+
+#[test]
+fn reformat_response_unknown_typename() {
+    // If in a response we get a typename for a completely unknown type name, then we should
+    // nullify the object as something is off, and in the worst case we could be inadvertently
+    // leaking some @inaccessible type (or the subgraph is simply drunk but nullifying is fine too
+    // then). This should happen whether the actual __typename is queried or not.
+    let schema = "
+      type Query {
+          i: I
+      }
+      interface I {
+          x: String
+      }
+      type A implements I {
+          x: String
+      }";
+
+    // Without __typename queried
+    FormatTest::builder()
+        .schema(schema)
+        .query("{i{x}}")
+        .response(json! {{
+            "i": {
+                "__typename": "X",
+                "x": "foo",
+            }
+        }})
+        .expected(json! {{ "i": null, }})
+        .test();
+
+    // With __typename queried
+    FormatTest::builder()
+        .schema(schema)
+        .query("{i{__typename x}}")
+        .response(json! {{
+            "i": {
+                "__typename": "X",
+                "x": "foo",
+            }
+        }})
+        .expected(json! {{ "i": null, }})
+        .test();
+}
+
+#[allow(clippy::result_large_err)]
+fn run_validation(
+    schema: String,
+    query: &str,
+    variables: serde_json_bytes::Value,
+    mode: Mode,
+) -> Result<(), Response> {
+    let variables = match variables {
+        Value::Object(object) => object,
+        _ => unreachable!("variables must be an object"),
+    };
+    let schema = Schema::parse(&schema, &Default::default()).expect("could not parse schema");
+    let request = Request::builder()
+        .variables(variables)
+        .query(query.to_string())
+        .build();
+    let query = Query::parse(
+        request
+            .query
+            .as_ref()
+            .expect("query has been added right above; qed"),
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+    query.validate_variables(&request, &schema, mode)
+}
+
+fn assert_validation(schema: &str, query: &str, variables: serde_json_bytes::Value) {
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        variables,
+        Mode::Enforce,
+    );
+    assert!(res.is_ok(), "validation should have succeeded: {:?}", res);
+}
+
+fn assert_validation_error(schema: &str, query: &str, variables: serde_json_bytes::Value) {
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        variables,
+        Mode::Enforce,
+    );
+    assert!(res.is_err(), "validation should have failed");
+}
+
+#[test]
+fn variable_validation_enforce_mode() {
+    let schema = r#"
+        type Query {
+            int(a: Int): String
+            float(a: Float): String
+            str(a: String): String
+            bool(a: Boolean): String
+            id(a: ID): String
+            intList(a: [Int]): String
+            intListList(a: [[Int]]): String
+            strList(a: [String]): String
+        }
+    "#;
+    // https://spec.graphql.org/June2018/#sec-Int
+    assert_validation(schema, "query($foo:Int){int(a:$foo)}", json!({}));
+    assert_validation_error(schema, "query($foo:Int!){int(a:$foo)}", json!({}));
+    assert_validation(schema, "query($foo:Int=1){int(a:$foo)}", json!({}));
+    assert_validation(schema, "query($foo:Int!=1){int(a:$foo)}", json!({}));
+    // When expected as an input type, only integer input values are accepted.
+    assert_validation(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":2}));
+    assert_validation(
+        schema,
+        "query($foo:Int){int(a:$foo)}",
+        json!({ "foo": i32::MAX }),
+    );
+    assert_validation(
+        schema,
+        "query($foo:Int){int(a:$foo)}",
+        json!({ "foo": i32::MIN }),
+    );
+    // All other input values, including strings with numeric content, must raise a query error indicating an incorrect type.
+    assert_validation_error(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":"2"}));
+    assert_validation_error(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":2.0}));
+    assert_validation_error(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":"str"}));
+    assert_validation_error(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":true}));
+    assert_validation_error(schema, "query($foo:Int){int(a:$foo)}", json!({"foo":{}}));
+    //  If the integer input value represents a value less than -231 or greater than or equal to 231, a query error should be raised.
+    assert_validation_error(
+        schema,
+        "query($foo:Int){int(a:$foo)}",
+        json!({ "foo": i32::MAX as i64 + 1 }),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:Int){int(a:$foo)}",
+        json!({ "foo": i32::MIN as i64 - 1 }),
+    );
+
+    // https://spec.graphql.org/draft/#sec-Float.Input-Coercion
+    assert_validation(schema, "query($foo:Float){float(a:$foo)}", json!({}));
+    assert_validation_error(schema, "query($foo:Float!){float(a:$foo)}", json!({}));
+
+    // When expected as an input type, both integer and float input values are accepted.
+    assert_validation(schema, "query($foo:Float){float(a:$foo)}", json!({"foo":2}));
+    assert_validation(
+        schema,
+        "query($foo:Float){float(a:$foo)}",
+        json!({"foo":2.0}),
+    );
+    // double precision floats are valid
+    assert_validation(
+        schema,
+        "query($foo:Float){float(a:$foo)}",
+        json!({"foo":1600341978193i64}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:Float){float(a:$foo)}",
+        json!({"foo":1600341978193f64}),
+    );
+    // All other input values, including strings with numeric content,
+    // must raise a request error indicating an incorrect type.
+    assert_validation_error(
+        schema,
+        "query($foo:Float){float(a:$foo)}",
+        json!({"foo":"2.0"}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:Float){float(a:$foo)}",
+        json!({"foo":"2"}),
+    );
+
+    // https://spec.graphql.org/June2018/#sec-String
+    assert_validation(schema, "query($foo:String){str(a:$foo)}", json!({}));
+    assert_validation_error(schema, "query($foo:String!){str(a:$foo)}", json!({}));
+
+    // When expected as an input type, only valid UTF‐8 string input values are accepted.
+    assert_validation(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo": "str"}),
+    );
+
+    // All other input values must raise a query error indicating an incorrect type.
+    assert_validation_error(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo":true}),
+    );
+    assert_validation_error(schema, "query($foo:String){str(a:$foo)}", json!({"foo": 0}));
+    assert_validation_error(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo": 42.0}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo": {}}),
+    );
+
+    // https://spec.graphql.org/June2018/#sec-Boolean
+    assert_validation(schema, "query($foo:Boolean){bool(a:$foo)}", json!({}));
+    assert_validation_error(schema, "query($foo:Boolean!){bool(a:$foo)}", json!({}));
+    // When expected as an input type, only boolean input values are accepted.
+    // All other input values must raise a query error indicating an incorrect type.
+    assert_validation(
+        schema,
+        "query($foo:Boolean!){bool(a:$foo)}",
+        json!({"foo":true}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:Boolean!){bool(a:$foo)}",
+        json!({"foo":"true"}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:Boolean!){bool(a:$foo)}",
+        json!({"foo": 0}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:Boolean!){bool(a:$foo)}",
+        json!({"foo": "no"}),
+    );
+
+    assert_validation(schema, "query($foo:Boolean=true){bool(a:$foo)}", json!({}));
+    assert_validation(schema, "query($foo:Boolean!=true){bool(a:$foo)}", json!({}));
+
+    // https://spec.graphql.org/June2018/#sec-ID
+    assert_validation(schema, "query($foo:ID){id(a:$foo)}", json!({}));
+    assert_validation_error(schema, "query($foo:ID!){id(a:$foo)}", json!({}));
+    // When expected as an input type, any string (such as "4") or integer (such as 4)
+    // input value should be coerced to ID as appropriate for the ID formats a given GraphQL server expects.
+    assert_validation(schema, "query($foo:ID){id(a:$foo)}", json!({"foo": 4}));
+    assert_validation(schema, "query($foo:ID){id(a:$foo)}", json!({"foo": "4"}));
+    assert_validation(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo": "str"}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:String){str(a:$foo)}",
+        json!({"foo": "4.0"}),
+    );
+    // Any other input value, including float input values (such as 4.0), must raise a query error indicating an incorrect type.
+    assert_validation_error(schema, "query($foo:ID){id(a:$foo)}", json!({"foo": 4.0}));
+    assert_validation_error(schema, "query($foo:ID){id(a:$foo)}", json!({"foo": true}));
+    assert_validation_error(schema, "query($foo:ID){id(a:$foo)}", json!({"foo": {}}));
+
+    // https://spec.graphql.org/June2018/#sec-Type-System.List
+    assert_validation(schema, "query($foo:[Int]){intList(a:$foo)}", json!({}));
+    assert_validation(schema, "query($foo:[Int!]){intList(a:$foo)}", json!({}));
+    assert_validation(
+        schema,
+        "query($foo:[Int!]){intList(a:$foo)}",
+        json!({ "foo": null }),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":1}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[String]){strList(a:$foo)}",
+        json!({"foo":"bar"}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[[Int]]){intListList(a:$foo)}",
+        json!({"foo":1}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[[Int]]){intListList(a:$foo)}",
+        json!({"foo":[[1], [2, 3]]}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":"str"}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":{}}),
+    );
+    assert_validation_error(schema, "query($foo:[Int]!){intList(a:$foo)}", json!({}));
+    assert_validation_error(
+        schema,
+        "query($foo:[Int!]){intList(a:$foo)}",
+        json!({"foo":[1, null]}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[Int]!){intList(a:$foo)}",
+        json!({"foo":[]}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":[1,2,3]}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":["f","o","o"]}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":["1","2","3"]}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[String]){strList(a:$foo)}",
+        json!({"foo":["1","2","3"]}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[String]){strList(a:$foo)}",
+        json!({"foo":[1,2,3]}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[Int!]){intList(a:$foo)}",
+        json!({"foo":[1,2,3]}),
+    );
+    assert_validation_error(
+        schema,
+        "query($foo:[Int!]){intList(a:$foo)}",
+        json!({"foo":[1,null,3]}),
+    );
+    assert_validation(
+        schema,
+        "query($foo:[Int]){intList(a:$foo)}",
+        json!({"foo":[1,null,3]}),
+    );
+
+    // https://spec.graphql.org/June2018/#sec-Input-Objects
+    assert_validation(
+        "input Foo{ y: String } type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({}),
+    );
+    assert_validation(
+        "input Foo{ y: String } type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":{}}),
+    );
+    assert_validation_error(
+        "input Foo{ y: String } type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":1}),
+    );
+    assert_validation_error(
+        "input Foo{ y: String } type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":"str"}),
+    );
+    assert_validation_error(
+        "input Foo{x:Int!} type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":{}}),
+    );
+    assert_validation(
+        "input Foo{x:Int!} type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":{"x":1}}),
+    );
+    assert_validation(
+        "scalar Foo type Query { x(foo: Foo): String }",
+        "query($foo:Foo!){x(foo: $foo)}",
+        json!({"foo":{}}),
+    );
+    assert_validation(
+        "scalar Foo type Query { x(foo: Foo): String }",
+        "query($foo:Foo!){x(foo: $foo)}",
+        json!({"foo":1}),
+    );
+    assert_validation_error(
+        "scalar Foo type Query { x(foo: Foo): String }",
+        "query($foo:Foo!){x(foo: $foo)}",
+        json!({}),
+    );
+    assert_validation(
+        "input Foo{bar:Bar!} input Bar{x:Int!} type Query { x(foo: Foo): String }",
+        "query($foo:Foo){x(foo: $foo)}",
+        json!({"foo":{"bar":{"x":1}}}),
+    );
+
+    assert_validation(
+        "enum Availability{AVAILABLE} type Product{availability:Availability! name:String} type Query{products(availability: Availability!): [Product]!}",
+        "query GetProductsByAvailability($availability: Availability!){products(availability: $availability) {name}}",
+        json!({"availability": "AVAILABLE"}),
+    );
+
+    assert_validation(
+        "input MessageInput {
+            content: String
+            author: String
+          }
+          type Receipt {
+              id: ID!
+          }
+          type Query{
+              send(message: MessageInput): Receipt}",
+        "query {
+            send(message: {
+                content: \"Hello\"
+                author: \"Me\"
+            }) {
+                id
+            }}",
+        json!({"availability": "AVAILABLE"}),
+    );
+
+    assert_validation(
+        "input MessageInput {
+            content: String
+            author: String
+          }
+          type Receipt {
+              id: ID!
+          }
+          type Query{
+              send(message: MessageInput): Receipt}",
+        "query($msg: MessageInput) {
+            send(message: $msg) {
+                id
+            }}",
+        json!({"msg":  {
+            "content": "Hello",
+            "author": "Me"
+        }}),
+    );
+
+    assert_validation_error(
+        "input MessageInput {
+            content: String
+            author: String
+          }
+          type Receipt {
+              id: ID!
+          }
+          type Query{
+              send(message: MessageInput): Receipt}",
+        "query($msg: MessageInput) {
+            send(message: $msg) {
+                id
+            }}",
+        json!({"msg":  {
+            "content": "Hello",
+            "author": "Me",
+            "unknownField": "unknown",
+        }}),
+    );
+
+    // Tests if nested inputs are correctly validated
+    assert_validation_error(
+        "input MessageInput {
+            content: String
+            author: String
+            canvas: [CanvasInput]
+          }
+        input CanvasInput {
+            input: Int
+          }
+          type Receipt {
+              id: ID!
+          }
+          type Query{
+              send(message: MessageInput): Receipt}",
+        "query($msg: MessageInput) {
+            send(message: $msg) {
+                id
+            }}",
+        json!({"msg":  {
+            "content": "Hello",
+            "author": "Me",
+            "canvas": [
+                {"input": 3},
+                {"input": 4},
+                {"input": 5, "unknownField": "unknown"}
+                ],
+        }}),
+    );
+
+    let schema = r#"
+        schema
+             @link(url: "https://specs.apollo.dev/link/v1.0")
+             @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+        {
+            query: Query
+            mutation: Mutation
+        }
+        directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+        directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+        directive @join__type( graph: join__Graph!  key: join__FieldSet extension: Boolean! = false resolvable: Boolean! = true isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+        scalar join__FieldSet
+        scalar link__Import
+
+        enum link__Purpose {
+            SECURITY
+            EXECUTION
+        }
+
+        enum join__Graph {
+            TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+        }
+
+        type Mutation{
+            foo(input: FooInput!): FooResponse!
+        }
+        type Query @join__type(graph: TEST){
+            data: String
+        }
+
+        input FooInput {
+          enumWithDefault: EnumWithDefault! = WEB
+        }
+        type FooResponse {
+            id: ID!
+        }
+
+        enum EnumWithDefault {
+          WEB
+          MOBILE
+        }
+        "#;
+
+    let res = run_validation(
+        schema.to_string(),
+        "mutation foo($input: FooInput!) {
+            foo (input: $input) {
+            __typename
+        }}",
+        json!({"input":{}}),
+        Mode::Enforce,
+    );
+    assert!(res.is_ok(), "validation should have succeeded: {res:?}");
+}
+
+#[test]
+fn variable_validation_oneof_input() {
+    let schema =
+        "input Choice @oneOf { a: Int, b: String } type Query { x(choice: Choice!): String }";
+    let query = "query($c: Choice!) { x(choice: $c) }";
+
+    // Exactly one non-null field: valid
+    assert_validation(schema, query, json!({"c": {"a": 1}}));
+    assert_validation(schema, query, json!({"c": {"b": "hello"}}));
+
+    // Multiple fields: invalid, error should mention field count
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        json!({"c": {"a": 1, "b": "hello"}}),
+        Mode::Enforce,
+    );
+    let err = res.expect_err("multiple fields on @oneOf should fail validation");
+    let msg = err.errors[0].message.as_str();
+    assert!(
+        msg.contains("exactly one") && !msg.contains("non-null"),
+        "multiple fields should report a field count error, got: {msg}"
+    );
+
+    // Empty object: invalid, error should mention field count
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        json!({"c": {}}),
+        Mode::Enforce,
+    );
+    let err = res.expect_err("empty @oneOf input should fail validation");
+    let msg = err.errors[0].message.as_str();
+    assert!(
+        msg.contains("exactly one") && !msg.contains("non-null"),
+        "empty object should report a field count error, got: {msg}"
+    );
+
+    // Single field with explicit null: invalid, error should mention null
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        json!({"c": {"a": null}}),
+        Mode::Enforce,
+    );
+    let err = res.expect_err("null value on @oneOf field should fail validation");
+    let msg = err.errors[0].message.as_str();
+    assert!(
+        msg.contains("non-null"),
+        "null field should report a non-null error, got: {msg}"
+    );
+
+    // Two fields where one is explicitly null: still two keys provided,
+    // so rejected as a field count error per the spec, not a null error.
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        json!({"c": {"a": 1, "b": null}}),
+        Mode::Enforce,
+    );
+    let err = res.expect_err("two fields with one null on @oneOf should fail validation");
+    let msg = err.errors[0].message.as_str();
+    assert!(
+        msg.contains("exactly one") && !msg.contains("non-null"),
+        "two keys (one null) should report a field count error, got: {msg}"
+    );
+
+    // Mixed inline literal + variable: apollo-compiler's static validation
+    // rejects this at parse time since two fields are present in the literal
+    // regardless of whether the variable has a runtime value.
+    let supergraph = with_supergraph_boilerplate(schema, "Query");
+    let parsed_schema =
+        Schema::parse(&supergraph, &Default::default()).expect("could not parse schema");
+    let parse_result = Query::parse(
+        "query($b: String) { x(choice: { a: 1, b: $b }) }",
+        None,
+        &parsed_schema,
+        &Default::default(),
+    );
+    assert!(
+        parse_result.is_err(),
+        "inline @oneOf with two fields should fail static validation"
+    );
+}
+
+#[test]
+fn variable_validation_oneof_null_with_unknown_field_in_measure_mode() {
+    let schema =
+        "input Choice @oneOf { a: Int, b: String } type Query { x(choice: Choice!): String }";
+    let query = "query($c: Choice!) { x(choice: $c) }";
+
+    // In measure mode, unknown fields are warned but not rejected. The @oneOf
+    // null check must inspect the recognized field, not just the first key in
+    // iteration order.
+    let res = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        query,
+        json!({"c": {"unknownField": "x", "a": null}}),
+        Mode::Measure,
+    );
+    let err = res
+        .expect_err("null recognized field on @oneOf should fail even with unknown fields present");
+    let msg = err.errors[0].message.as_str();
+    assert!(
+        msg.contains("non-null"),
+        "should report a non-null error for the recognized field, got: {msg}"
+    );
+}
+
+#[test]
+#[rstest::rstest]
+#[case::top_level_unexpected_field(
+    json!({"content": "Hello", "canvas": [], "unknownField": "unknown"}),
+    Ok(())
+)]
+#[case::nested_unexpected_field(
+    json!({"canvas": [{"input": 3}, {"input": 5, "unknownField": "unknown"}]}),
+    Ok(())
+)]
+#[case::top_level_missing_field(
+    json!({}),
+    Err("VALIDATION_INVALID_TYPE_VARIABLE")
+)]
+#[case::nested_missing_field(
+    json!({"canvas": [{"unknownField": 3}, {"input": 4}]}),
+    Err("VALIDATION_INVALID_TYPE_VARIABLE")
+)]
+fn variable_validation_measure_mode(
+    #[case] msg_variables: Value,
+    #[case] expected_result: Result<(), &str>,
+) {
+    let schema = "
+        input MessageInput {
+            content: String
+            canvas: [CanvasInput]!
+        }
+        input CanvasInput {
+            input: Int!
+        }
+        type Query {
+            send(message: MessageInput): ID
+        }";
+
+    // Tests validation of variable fields
+    let result = run_validation(
+        with_supergraph_boilerplate(schema, "Query"),
+        "query($msg: MessageInput) { send(message: $msg) }",
+        json!({"msg": msg_variables}),
+        Mode::Measure,
+    );
+
+    match (result, expected_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(response), Err(expected_code)) => {
+            assert!(
+                response.contains_error_code(expected_code),
+                "response = {response:?}"
+            );
+        }
+        (Err(response), Ok(())) => {
+            panic!("expected validation to pass: response = {response:?}");
+        }
+        (Ok(()), Err(code)) => {
+            panic!("expected validation to fail with code {code}");
+        }
+    }
+}
+
+#[test]
+fn filter_root_errors() {
+    let schema = "type Query {
+        getInt: Int
+        getNonNullString: String!
+    }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query("query MyOperation { getInt }")
+        .response(json! {{
+            "getInt": "not_an_int",
+            "other": "2",
+        }})
+        .operation("MyOperation")
+        .expected(json! {{
+            "getInt": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { getNonNullString }")
+        .response(json! {{
+            "getNonNullString": 1,
+        }})
+        .expected(Value::Null)
+        .test();
+}
+
+#[test]
+fn filter_object_errors() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        name: String
+    }";
+    let query = "query  { me { id name } }";
+
+    // name expected a string, got an int
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "name": null,
+            },
+        }})
+        .test();
+
+    // non null id expected a string, got an int
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": 1,
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non null id got a null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": null,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non null id was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": { },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non null id was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // a non null field not present in the query should not be an error
+    FormatTest::builder()
+        .schema(schema)
+        .query("query  { me { name } }")
+        .response(json! {{
+            "me": {
+                "name": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+            },
+        }})
+        .test();
+
+    // if a field appears multiple times, selection should be deduplicated
+    FormatTest::builder()
+        .schema(schema)
+        .query("query  { me { id id } }")
+        .response(json! {{
+            "me": {
+                "id": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    // duplicate id field
+    FormatTest::builder()
+        .schema(schema)
+        .query("query  { me { id ...on User { id } } }")
+        .response(json! {{
+            "me": {
+                "__typename": "User",
+                "id": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn filter_list_errors() {
+    let schema = "type Query {
+        list: TestList
+    }
+
+    type TestList {
+        l1: [String]
+        l2: [String!]
+        l3: [String]!
+        l4: [String!]!
+    }";
+
+    // l1: nullable list of nullable elements
+    // any error should stop at the list elements
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l1 } }")
+        .response(json! {{
+            "list": {
+                "l1": ["abc", 1, { "foo": "bar"}, ["aaa"], "def"],
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l1": ["abc", null, null, null, "def"],
+            },
+        }})
+        .test();
+
+    // l1 expected a list, got a string
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l1 } }")
+        .response(json! {{
+            "list": {
+                "l1": "abc",
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l1": null,
+            },
+        }})
+        .test();
+
+    // l2: nullable list of non nullable elements
+    // any element error should nullify the entire list
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l2 } }")
+        .response(json! {{
+            "list": {
+                "l2": ["abc", 1, { "foo": "bar"}, ["aaa"], "def"],
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l2": null,
+            },
+        }})
+        .expected_extensions(json! {{
+            "valueCompletion": [
+                {
+                    "message": "Null value found for non-nullable type String",
+                    "path": ["list", "l2", 1]
+                },
+            ]
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l2 } }")
+        .response(json! {{
+            "list": {
+                "l2": ["abc", "def"],
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l2": ["abc", "def"],
+            },
+        }})
+        .test();
+
+    // l3: nullable list of nullable elements
+    // any element error should stop at the list elements
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l3 } }")
+        .response(json! {{
+            "list": {
+                "l3": ["abc", 1, { "foo": "bar"}, ["aaa"], "def"],
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l3": ["abc", null, null, null, "def"],
+            },
+        }})
+        .test();
+
+    // non null l3 expected a list, got an int, parrent element should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l3 } }")
+        .response(json! {{
+            "list": {
+                "l3": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": null,
+        }})
+        .test();
+
+    // l4: non nullable list of non nullable elements
+    // any element error should nullify the entire list,
+    // which will nullify the parent element
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l4 } }")
+        .response(json! {{
+            "list": {
+                "l4": ["abc", 1, { "foo": "bar"}, ["aaa"], "def"],
+            },
+        }})
+        .expected(json! {{
+            "list": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l4 } }")
+        .response(json! {{
+            "list": {
+                "l4": ["abc", "def"],
+            },
+        }})
+        .expected(json! {{
+            "list": {
+                "l4": ["abc", "def"],
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { list { l4 } }")
+        .response(json! {{
+            "list": {
+                "l4": 1,
+            },
+        }})
+        .expected(json! {{
+            "list": null,
+        }})
+        .test();
+}
+
+#[test]
+fn filter_nested_object_errors() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        name: String
+        reviews1: [Review]
+        reviews2: [Review!]
+        reviews3: [Review!]!
+    }
+
+    type Review {
+        text1: String
+        text2: String!
+    }
+    ";
+
+    // nullable parent and child elements
+    // child errors should stop at the child's level
+    let query_review1_text1 = "query  { me { id reviews1 { text1 } } }";
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ {
+                    "text1": null,
+                } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { "text1": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 expected a string, got an int, so text1 is nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { "text1": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // text2 is non null so errors should nullify reviews1 element
+    let query_review1_text2 = "query  { me { id reviews1 { text2 } } }";
+    // text2 was absent, reviews1 element should be nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ null ],
+            },
+        }})
+        // `emit_missing_field` writes to BOTH sinks for non-null missing:
+        .expected_errors(json! {[
+            {
+                "message": "Missing field",
+                "path": ["me", "reviews1", 0, "text2"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            }
+        ]})
+        .expected_extensions(json! {{
+            "valueCompletion": [
+                {
+                    "message": "Cannot return null for non-nullable type String",
+                    "path": ["me", "reviews1", 0]
+                }
+            ]
+        }})
+        .test();
+
+    // text2 was null, reviews1 element should be nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { "text2": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ null ],
+            },
+        }})
+        .test();
+
+    // text2 expected a string, got an int, text2 is nullified, reviews1 element should be nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review1_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews1": [ { "text2": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews1": [ null ],
+            },
+        }})
+        .test();
+
+    // reviews2: [Review!]
+    // reviews2 elements are non null, so any error there should nullify the entire list
+    let query_review2_text1 = "query  { me { id reviews2 { text1 } } }";
+    // nullable text1 was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews2": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": [ {
+                    "text1": null,
+                } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews2": [ { "text1": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 expected a string, got an int
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews2": [ { "text1": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // text2 is non null
+    let query_review2_text2 = "query  { me { id reviews2 { text2 } } }";
+    // text2 was absent, so the reviews2 element is nullified, so reviews2 is nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                    "name": 1,
+                    "reviews2": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": null,
+            },
+        }})
+        .test();
+
+    // text2 was null, so the reviews2 element is nullified, so reviews2 is nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews2": [ { "text2": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": null,
+            },
+        }})
+        .test();
+
+    // text2 expected a string, got an int, so the reviews2 element is nullified, so reviews2 is nullified
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review2_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews2": [ { "text2": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews2": null,
+            },
+        }})
+        .test();
+
+    //reviews3: [Review!]!
+    // reviews3 is non null, and its elements are non null
+    let query_review3_text1 = "query  { me { id reviews3 { text1 } } }";
+
+    // nullable text1 was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                    "name": 1,
+                    "reviews3": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews3": [ {
+                    "text1": null,
+                } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews3": [ { "text1": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews3": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // nullable text1 expected a string, got an int
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text1)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews3": [ { "text1": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "reviews3": [ { "text1": null } ],
+            },
+        }})
+        .test();
+
+    // reviews3 is non null, and its elements are non null, text2 is non null
+    let query_review3_text2 = "query  { me { id reviews3 { text2 } } }";
+
+    // text2 was absent, nulls should propagate up to the operation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews3": [ { } ],
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+
+        }})
+        .test();
+
+    // text2 was null, nulls should propagate up to the operation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews3": [ { "text2": null } ],
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+
+        }})
+        .test();
+
+    // text2 expected a string, got an int, nulls should propagate up to the operation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_review3_text2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "name": 1,
+                "reviews3": [ { "text2": 1 } ],
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+
+        }})
+        .test();
+}
+
+#[test]
+fn filter_alias_errors() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        name: String
+    }";
+    let query = "query  { me { id identifiant:id } }";
+
+    // both aliases got valid values
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "identifiant": "b",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "identifiant": "b",
+            },
+        }})
+        .test();
+
+    // non null identifiant expected a string, got an int, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "identifiant": 1,
+            },
+        }})
+        .expected(json! {{
+           "me": null,
+        }})
+        .test();
+
+    // non null identifiant was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "identifiant": null,
+            },
+        }})
+        .expected(json! {{
+           "me": null,
+        }})
+        .test();
+
+    // non null identifiant was absent, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+            },
+        }})
+        .expected(json! {{
+           "me": null,
+        }})
+        .test();
+
+    let query2 = "query  { me { name name2:name } }";
+
+    // both aliases got valid values
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name": "a",
+                "name2": "b",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+                "name2": "b",
+            },
+        }})
+        .test();
+
+    // nullable name2 expected a string, got an int, name2 should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name": "a",
+                "name2": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+                "name2": null,
+            },
+        }})
+        .test();
+
+    // nullable name2 was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name": "a",
+                "name2": null,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+                "name2": null,
+            },
+        }})
+        .test();
+
+    // nullable name2 was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+                "name2": null,
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn filter_scalar_errors() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        a: A
+        b: A!
+    }
+
+    scalar A
+    ";
+
+    let query = "query  { me { id a } }";
+
+    // scalar a is present, no further validation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "a": "hello",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "a": "hello",
+            },
+        }})
+        .test();
+
+    // scalar a is present, no further validation=
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "a": {
+                    "field": 1234,
+                },
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "a": {
+                    "field": 1234,
+                },
+            },
+        }})
+        .test();
+
+    let query2 = "query  { me { id b } }";
+
+    // non null scalar b is present, no further validation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": "hello",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "b": "hello",
+            },
+        }})
+        .test();
+
+    // non null scalar b is present, no further validation
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": {
+                    "field": 1234,
+                },
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "b": {
+                    "field": 1234,
+                },
+            },
+        }})
+        .test();
+
+    // non null scalar b was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": null,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non null scalar b was absent, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "id": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+}
+
+#[test]
+fn filter_enum_errors() {
+    let schema = "type Query {
+        me: User
+    }
+
+    type User {
+        id: String!
+        a: A
+        b: A!
+    }
+
+    enum A {
+        X
+        Y
+        Z
+    }";
+
+    let query_a = "query  { me { id a } }";
+
+    // enum a got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_a)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "a": "X",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "a": "X",
+            },
+        }})
+        .test();
+
+    // nullable enum a expected "X", "Y" or "Z", got another string, a should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_a)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "a": "hello",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "a": null,
+            },
+        }})
+        .test();
+
+    // nullable enum a was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_a)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "a": null,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "a": null,
+            },
+        }})
+        .test();
+
+    let query_b = "query  { me { id b } }";
+
+    // non nullable enum b got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_b)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": "X",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "id": "a",
+                "b": "X",
+            },
+        }})
+        .test();
+
+    // non nullable enum b expected "X", "Y" or "Z", got another string, b and the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_b)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": "hello",
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non nullable enum b was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query_b)
+        .response(json! {{
+            "me": {
+                "id": "a",
+                "b": null,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+}
+
+#[test]
+fn filter_interface_errors() {
+    let schema = "type Query {
+        me: NamedEntity
+    }
+
+    interface NamedEntity {
+        name: String
+        name2: String!
+    }
+
+    type User implements NamedEntity {
+        name: String
+        name2: String!
+    }
+
+    type User2 implements NamedEntity {
+        name: String
+        name2: String!
+    }
+    ";
+
+    let query = "query  { me { name } }";
+
+    // nullable name field got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": "a",
+            },
+        }})
+        .test();
+
+    // nullable name field was absent
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": { },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": null,
+            },
+        }})
+        .test();
+
+    // nullable name field was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name": null,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": null,
+            },
+        }})
+        .test();
+
+    // nullable name field expected a string, got an int
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name": null,
+            },
+        }})
+        .test();
+
+    let query2 = "query  { me { name2 } }";
+
+    // non nullable name2 field got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name2": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name2": "a",
+            },
+        }})
+        .test();
+
+    // non nullable name2 field was absent, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": { },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non nullable name2 field was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name2": null,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non nullable name2 field expected a string, got an int, name2 and the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "me": {
+                "name2": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // we should be able to handle duplicate fields even across fragments and interfaces
+    FormatTest::builder()
+        .schema(schema)
+        .query("query { me { ... on User { name2 } name2 } }")
+        .response(json! {{
+            "me": {
+                "__typename": "User",
+                "name2": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name2": "a",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn filter_extended_interface_errors() {
+    let schema = "type Query {
+        me: NamedEntity
+    }
+
+    interface NamedEntity {
+        name: String
+    }
+
+    type User implements NamedEntity {
+        name: String
+    }
+
+    type User2 implements NamedEntity {
+        name: String
+    }
+
+    extend interface NamedEntity {
+        name2: String!
+    }
+
+    extend type User {
+        name2: String!
+    }
+
+    extend type User2 {
+        name2: String!
+    }
+    ";
+
+    let query = "query  { me { name2 } }";
+
+    // non nullable name2 got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name2": "a",
+            },
+        }})
+        .expected(json! {{
+            "me": {
+                "name2": "a",
+            },
+        }})
+        .test();
+
+    // non nullable name2 was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name2": null,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non nullable name2 was absent, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": { },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+
+    // non nullable name2 expected a string, got an int, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "me": {
+                "name2": 1,
+            },
+        }})
+        .expected(json! {{
+            "me": null,
+        }})
+        .test();
+}
+
+#[test]
+fn filter_errors_top_level_fragment() {
+    let schema = "type Query {
+        get: Thing
+      }
+
+      type Thing {
+          name: String
+          name2: String!
+      }";
+
+    // fragments can appear on top level queries
+    let query = "{ ...frag } fragment frag on Query { __typename get { name } }";
+
+    // nullable name got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {
+                "name": "a",
+                "other": "b"
+            }
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name": "a",
+            }
+        }})
+        .test();
+
+    // nullable name was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name": null, "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name": null,
+            }
+        }})
+        .test();
+
+    let query2 = "{ ...frag2 } fragment frag2 on Query { __typename get { name2 } }";
+    // non nullable name2 got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name2": "a", "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name2": "a",
+            }
+        }})
+        .test();
+
+    // non nullable name2 was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query2)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name2": null, "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": null
+        }})
+        .test();
+
+    let query3 = "{ ... on Query { __typename get { name } } }";
+    // nullable name got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query3)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name": "a", "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name": "a",
+            }
+        }})
+        .test();
+
+    // nullable name was null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query3)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name": null, "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name": null,
+            }
+        }})
+        .test();
+
+    let query4 = "{ ... on Query { __typename get { name2 } } }";
+    // non nullable name2 got a correct value
+    FormatTest::builder()
+        .schema(schema)
+        .query(query4)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name2": "a", "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": {
+                "name2": "a",
+            }
+        }})
+        .test();
+
+    // non nullable name2 was null, the operation should be null
+    FormatTest::builder()
+        .schema(schema)
+        .query(query4)
+        .response(json! {{
+            "__typename": "Query",
+            "get": {"name2": null, "other": "b"}
+        }})
+        .expected(json! {{
+            "__typename": "Query",
+            "get": null,
+        }})
+        .test();
+}
+
+#[test]
+fn merge_selections() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        review: Review
+    }
+
+    type Review {
+        id: String!
+        body: String
+    }";
+
+    // duplicate operation name
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+            }
+            get {
+                name
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // merge nested selection
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                review {
+                    id
+                }
+
+                ... on Product {
+                    review {
+                        body
+                    }
+                }
+            }
+            get {
+                name
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "__typename": "Review",
+                    "id": "b",
+                    "body": "hello",
+                }
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "id": "b",
+                    "body": "hello",
+                },
+                "name": null,
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn it_parses_default_floats() {
+    let schema = with_supergraph_boilerplate(
+        r#"
+        type Query {
+            name: String
+        }
+
+        input WithAllKindsOfFloats {
+            a_regular_float: Float = 1.2
+            an_integer_float: Float = 1234
+            a_float_that_doesnt_fit_an_int: Float = 9876543210
+        }
+        "#,
+        "Query",
+    );
+
+    let schema = Schema::parse(&schema, &Default::default()).unwrap();
+    let value = schema
+        .supergraph_schema()
+        .get_input_object("WithAllKindsOfFloats")
+        .unwrap()
+        .fields["a_float_that_doesnt_fit_an_int"]
+        .default_value
+        .as_ref()
+        .unwrap();
+    assert_eq!(value.to_f64().unwrap() as i64, 9876543210);
+}
+
+#[test]
+fn it_statically_includes() {
+    let schema = with_supergraph_boilerplate(
+        "type Query {
+        name: String
+        review: Review
+        product: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        review: Review
+    }
+
+    type Review {
+        id: String!
+        body: String
+    }",
+        "Query",
+    );
+    let schema = Schema::parse(&schema, &Default::default()).expect("could not parse schema");
+
+    let query = Query::parse(
+        "query  {
+            name @include(if: false)
+            review @include(if: false) {
+                body
+            }
+            product @include(if: true) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+    assert_eq!(query.operation.selection_set.len(), 1);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("product")),
+        _ => panic!("expected a field"),
+    }
+
+    let query = Query::parse(
+        "query  {
+            name @include(if: false)
+            review {
+                body
+            }
+            product @include(if: true) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 2);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("review")),
+        _ => panic!("expected a field"),
+    }
+    match query.operation.selection_set.get(1).unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("product")),
+        _ => panic!("expected a field"),
+    }
+
+    // Inline fragment
+    let query = Query::parse(
+        "query  {
+            name @include(if: false)
+            ... @include(if: false) {
+                review {
+                    body
+                }
+            }
+            product @include(if: true) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 1);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field {
+            name,
+            selection_set: Some(selection_set),
+            ..
+        } => {
+            assert_eq!(name, &ByteString::from("product"));
+            assert_eq!(selection_set.len(), 1);
+        }
+        _ => panic!("expected a field"),
+    }
+
+    // Fragment spread
+    let query = Query::parse(
+        "
+        fragment ProductName on Product {
+            name
+        }
+        query  {
+            name @include(if: false)
+            review {
+                body
+            }
+            product @include(if: true) {
+                ...ProductName @include(if: false)
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 2);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("review")),
+        _ => panic!("expected a field"),
+    }
+    match query.operation.selection_set.get(1).unwrap() {
+        Selection::Field {
+            name,
+            selection_set: Some(selection_set),
+            ..
+        } => {
+            assert_eq!(name, &ByteString::from("product"));
+            assert_eq!(selection_set.len(), 0);
+        }
+        _ => panic!("expected a field"),
+    }
+}
+
+#[test]
+fn it_statically_skips() {
+    let schema = with_supergraph_boilerplate(
+        "type Query {
+        name: String
+        review: Review
+        product: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        review: Review
+    }
+
+    type Review {
+        id: String!
+        body: String
+    }",
+        "Query",
+    );
+    let schema = Schema::parse(&schema, &Default::default()).expect("could not parse schema");
+
+    let query = Query::parse(
+        "query  {
+            name @skip(if: true)
+            review @skip(if: true) {
+                body
+            }
+            product @skip(if: false) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+    assert_eq!(query.operation.selection_set.len(), 1);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("product")),
+        _ => panic!("expected a field"),
+    }
+
+    let query = Query::parse(
+        "query  {
+            name @skip(if: true)
+            review {
+                body
+            }
+            product @skip(if: false) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 2);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("review")),
+        _ => panic!("expected a field"),
+    }
+    match query.operation.selection_set.get(1).unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("product")),
+        _ => panic!("expected a field"),
+    }
+
+    // Inline fragment
+    let query = Query::parse(
+        "query  {
+            name @skip(if: true)
+            ... @skip(if: true) {
+                review {
+                    body
+                }
+            }
+            product @skip(if: false) {
+                name
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 1);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field {
+            name,
+            selection_set: Some(selection_set),
+            ..
+        } => {
+            assert_eq!(name, &ByteString::from("product"));
+            assert_eq!(selection_set.len(), 1);
+        }
+        _ => panic!("expected a field"),
+    }
+
+    // Fragment spread
+    let query = Query::parse(
+        "
+        fragment ProductName on Product {
+            name
+        }
+        query  {
+            name @skip(if: true)
+            review {
+                body
+            }
+            product @skip(if: false) {
+                ...ProductName @skip(if: true)
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect("could not parse query");
+
+    assert_eq!(query.operation.selection_set.len(), 2);
+    match query.operation.selection_set.first().unwrap() {
+        Selection::Field { name, .. } => assert_eq!(name, &ByteString::from("review")),
+        _ => panic!("expected a field"),
+    }
+    match query.operation.selection_set.get(1).unwrap() {
+        Selection::Field {
+            name,
+            selection_set: Some(selection_set),
+            ..
+        } => {
+            assert_eq!(name, &ByteString::from("product"));
+            assert_eq!(selection_set.len(), 0);
+        }
+        _ => panic!("expected a field"),
+    }
+}
+
+#[test]
+fn it_should_fail_with_empty_selection_set() {
+    let schema = with_supergraph_boilerplate(
+        "type Query {
+        product: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+    }",
+        "Query",
+    );
+    let schema = Schema::parse(&schema, &Default::default()).expect("could not parse schema");
+
+    let _query_error = Query::parse(
+        "query  {
+            product {
+            }
+        }",
+        None,
+        &schema,
+        &Default::default(),
+    )
+    .expect_err("should not parse query");
+}
+
+#[test]
+fn skip() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        review: Review
+    }
+
+    type Review {
+        id: String!
+        body: String
+    }";
+
+    // with variables
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query($skip: Boolean = false)  {
+                get @skip(if: $skip) {
+                    id
+                    review {
+                        id
+                    }
+                }
+            }",
+        )
+        .variables(json! {{
+            "skip": true
+        }})
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .expected(json! {{}})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query {
+                get @skip(if: true) {
+                    id
+                    review {
+                        id
+                    }
+                }
+            }",
+        )
+        .variables(json! {{
+            "skip": true
+        }})
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .expected(json! {{}})
+        .test();
+
+    // duplicate operation name
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get {
+                    name @skip(if: true)
+                }
+                get @skip(if: false) {
+                    id
+                    review {
+                        id
+                    }
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .test();
+
+    // skipped non null
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id @skip(if: true)
+                name
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // inline fragment
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                ... on Product @skip(if: true) {
+                    name
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+        get {
+            id
+            ... on Product @skip(if: false) {
+                name
+            }
+        }
+    }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // directive on fragment spread
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                ...test @skip(if: false)
+            }
+        }
+
+        fragment test on Product {
+            nom: name
+            name @skip(if: true)
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get {
+                    id
+                    ...test @skip(if: true)
+                }
+            }
+
+            fragment test on Product {
+                nom: name
+                name @skip(if: true)
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    // variables
+    // duplicate operation name
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldSkip: Boolean!) {
+                get {
+                    id
+                    name @skip(if: $shouldSkip)
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldSkip": true
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldSkip: Boolean!) {
+                get {
+                    id
+                    name @skip(if: $shouldSkip)
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldSkip": false
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // default variable value
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldSkip: Boolean!) {
+                get {
+                    id
+                    name @skip(if: $shouldSkip)
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldSkip": false
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldSkip: Boolean! = true) {
+                get {
+                    id
+                    name @skip(if: $shouldSkip)
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldSkip": false
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldSkip: Boolean! = true) {
+                get {
+                    id
+                    name @skip(if: $shouldSkip)
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn check_fragment_on_interface() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    interface Product {
+        id: String!
+        name: String
+    }
+
+    type Vodka {
+        id: String!
+        name: String
+    }
+
+    type Beer implements Product {
+        id: String!
+        name: String
+    }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "fragment ProductBase on Product {
+            __typename
+            id
+            name
+          }
+          query  {
+              get {
+                ...ProductBase
+              }
+          }",
+        )
+        .response(json! {{
+            "get": {
+                "__typename": "Beer",
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "__typename": "Beer",
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "fragment ProductBase on Product {
+            id
+            name
+          }
+          query  {
+              get {
+                ...ProductBase
+              }
+          }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                    "name": "Asahi",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get {
+                  ... on Product {
+                    __typename
+                    id
+                    name
+                  }
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "__typename": "Beer",
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "__typename": "Beer",
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+              ... on Product {
+                id
+                name
+              }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Asahi",
+            },
+        }})
+        .test();
+
+    // Make sure we do not return data for type that doesn't implement interface
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "fragment ProductBase on Product {
+            __typename
+            id
+            name
+          }
+          query  {
+              get {
+                ...ProductBase
+              }
+          }",
+        )
+        .response(json! {{
+            "get": {
+                "__typename": "Vodka",
+                "id": "a",
+                "name": "Crystal",
+            },
+        }})
+        .expected(json! {{
+            "get": { }
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get {
+                  ... on Product {
+                    __typename
+                    id
+                    name
+                  }
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "__typename": "Vodka",
+                "id": "a",
+                "name": "Crystal",
+            },
+        }})
+        .expected(json! {{
+            "get": { }
+        }})
+        .test();
+}
+
+#[test]
+fn include() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        review: Review
+    }
+
+    type Review {
+        id: String!
+        body: String
+    }";
+
+    // duplicate operation name
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                name @include(if: false)
+            }
+            get @include(if: true) {
+                id
+                review {
+                    id
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "review": {
+                    "id": "b",
+                }
+            },
+        }})
+        .test();
+
+    // skipped non null
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id @include(if: false)
+                name
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // inline fragment
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                ... on Product @include(if: false) {
+                    name
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                ... on Product @include(if: true) {
+                    name
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // directive on fragment spread
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                id
+                ...test @include(if: true)
+            }
+        }
+
+        fragment test on Product {
+            nom: name
+            name @skip(if: true)
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get {
+                    id
+                    ...test @include(if: false)
+                }
+            }
+
+            fragment test on Product {
+                nom: name
+                name @include(if: false)
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "nom": "Chaise",
+                "name": "Chair",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    // variables
+    // duplicate operation name
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                id
+                name @include(if: $shouldInclude)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldInclude": false
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                id
+                name @include(if: $shouldInclude)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldInclude": true
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    // default variable value
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean! = false) {
+            get {
+                id
+                name @include(if: $shouldInclude)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{ }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean! = false) {
+            get {
+                id
+                name @include(if: $shouldInclude)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldInclude": true
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                name
+            }
+            ...test @include(if: $shouldInclude)
+        }
+
+        fragment test on Query {
+            get {
+                id
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "a",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldInclude": false
+        }})
+        .expected(json! {{
+            "get": {
+               "name": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                name
+            }
+            ...test @include(if: $shouldInclude)
+        }
+
+        fragment test on Query {
+            get {
+                id
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "a",
+            },
+        }})
+        .operation("Example")
+        .expected(json! {{
+            "get": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                name
+            }
+            ... @include(if: $shouldInclude) {
+                get {
+                    id
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "a",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "shouldInclude": false
+        }})
+        .expected(json! {{
+            "get": {
+               "name": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($shouldInclude: Boolean!) {
+            get {
+                name
+            }
+            ... @include(if: $shouldInclude) {
+                get {
+                    id
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "name": "a",
+            },
+        }})
+        .operation("Example")
+        .expected(json! {{
+            "get": null,
+        }})
+        .test();
+}
+
+#[test]
+fn skip_and_include() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+    }";
+
+    // combine skip and include
+    // both of them must accept the field
+    // ref: https://spec.graphql.org/October2021/#note-f3059
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                a:name @skip(if:true) @include(if: true)
+                b:name @skip(if:true) @include(if: false)
+                c:name @skip(if:false) @include(if: true)
+                d:name @skip(if:false) @include(if: false)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "a": "a",
+                "b": "b",
+                "c": "c",
+                "d": "d",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "c": "c",
+            },
+        }})
+        .test();
+
+    // same fragment name with complementary @skip/@include on each spread;
+    // a skipped spread must not prevent the active spread from executing
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($v: Boolean!) {
+            get {
+                id
+                ...test @skip(if: $v)
+                ...test @include(if: $v)
+            }
+        }
+
+        fragment test on Product {
+            name
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "v": true
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query Example($v: Boolean!) {
+            get {
+                id
+                ...test @skip(if: $v)
+                ...test @include(if: $v)
+            }
+        }
+
+        fragment test on Product {
+            name
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .operation("Example")
+        .variables(json! {{
+            "v": false
+        }})
+        .expected(json! {{
+            "get": {
+                "id": "a",
+                "name": "Chair",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn skip_and_include_multi_operation() {
+    let schema = "type Query {
+        get: Product
+    }
+
+    type Product {
+        id: String!
+        name: String
+        bar: String
+    }";
+
+    // combine skip and include
+    // both of them must accept the field
+    // ref: https://spec.graphql.org/October2021/#note-f3059
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                a:name @skip(if:false)
+            }
+            get {
+                a:name @skip(if:true)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "a": "a",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "a": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                a:name @skip(if:true)
+            }
+            get {
+                a:name @skip(if:false)
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "a": "a",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "a": "a",
+            },
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+                get @skip(if: false) @include(if: false) {
+                    a:name
+                    bar
+                }
+                get @skip(if: false) {
+                    a:name
+                    a:name
+                }
+            }",
+        )
+        .response(json! {{
+            "get": {
+                "a": "a",
+                "bar": "foo",
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "a": "a",
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn union_with_typename() {
+    let schema = "type Query {
+        get: ProductResult
+    }
+
+    type Product{
+        symbol: String!
+    }
+    type ProductError{
+        reason: String
+    }
+    union ProductResult = Product | ProductError
+    ";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query  {
+            get {
+                __typename
+                ... on Product {
+                  symbol
+                }
+                ... on ProductError {
+                  reason
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "get": {
+                "__typename": "Product",
+                    "symbol": "1"
+            },
+        }})
+        .expected(json! {{
+            "get": {
+                "__typename": "Product",
+                "symbol": "1"
+            },
+        }})
+        .test();
+}
+
+#[test]
+fn inaccessible_on_interface() {
+    let schema = "type Query
+    {
+        test_interface: Interface
+        test_union: U
+        test_enum: E
+    }
+
+    type Object implements Interface @inaccessible {
+        foo: String
+        other: String
+    }
+
+    type Object2 implements Interface {
+        foo: String
+        other: String @inaccessible
+    }
+
+    interface Interface {
+        foo: String
+    }
+
+    type A @inaccessible {
+        common: String
+        a: String
+    }
+
+    type B {
+        common: String
+        b: String
+    }
+
+    union U = A | B
+
+    enum E {
+        X @inaccessible
+        Y @inaccessible
+        Z
+    }
+    ";
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "query  {
+                test_interface {
+                    __typename
+                    foo
+                }
+
+                test_interface2: test_interface {
+                    __typename
+                    foo
+                }
+
+                test_union {
+                    ...on B {
+                        __typename
+                        common
+                    }
+                }
+
+                test_union2: test_union {
+                    ...on B {
+                        __typename
+                        common
+                    }
+                }
+
+                test_enum
+                test_enum2: test_enum
+            }",
+        )
+        .response(json! {{
+            "test_interface": {
+                "__typename": "Object",
+                "foo": "bar",
+                "other": "a"
+            },
+
+            "test_interface2": {
+                "__typename": "Object2",
+                "foo": "bar",
+                "other": "a"
+            },
+
+            "test_union": {
+                "__typename": "A",
+                "common": "hello",
+                "a": "A"
+            },
+
+            "test_union2": {
+                "__typename": "B",
+                "common": "hello",
+                "b": "B"
+            },
+
+            "test_enum": "X",
+            "test_enum2": "Z"
+        }})
+        .expected(json! {{
+            "test_interface": null,
+            "test_interface2": {
+                "__typename": "Object2",
+                "foo": "bar",
+            },
+            "test_union": null,
+            "test_union2": {
+                "__typename": "B",
+                "common": "hello",
+            },
+            "test_enum": null,
+            "test_enum2": "Z"
+        }})
+        .test();
+}
+
+#[test]
+fn fragment_on_interface_on_query() {
+    let schema = r#"schema
+        @link(url: "https://specs.apollo.dev/link/v1.0")
+        @link(url: "https://specs.apollo.dev/join/v0.2", for: EXECUTION)
+    {
+        query: MyQueryObject
+    }
+
+    directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+    directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+    directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+    scalar join__FieldSet
+    scalar link__Import
+    enum link__Purpose {
+        SECURITY
+        EXECUTION
+    }
+
+    enum join__Graph {
+        TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+    }
+
+    type MyQueryObject implements Interface @join__type(graph: TEST){
+        object: MyObject
+        other: String
+    }
+
+    type MyObject {
+        data: String
+        foo: String
+    }
+
+    interface Interface {
+        object: MyObject
+    }"#;
+
+    let query = "{
+        ...FragmentTest
+    }
+    fragment FragmentTest on Interface {
+        object {
+            data
+        }
+    }";
+
+    let schema = Schema::parse(schema, &Default::default()).expect("could not parse schema");
+    let api_schema = schema.api_schema();
+    let query =
+        Query::parse(query, None, &schema, &Default::default()).expect("could not parse query");
+    let mut response = Response::builder()
+        .data(json! {{
+            "object": {
+                "__typename": "MyObject",
+                "data": "a",
+                "foo": "bar"
+            }
+        }})
+        .build();
+
+    query.format_response(
+        &mut response,
+        &Object::new(),
+        api_schema,
+        BooleanValues { bits: 0 },
+        true,
+    );
+    assert_eq_and_ordered!(
+        response.data.as_ref().unwrap(),
+        &json! {{
+            "object": {
+                "data": "a"
+            }
+        }}
+    );
+}
+
+#[test]
+fn fragment_on_interface() {
+    let schema = "type Query
+    {
+        test_interface: Interface
+    }
+
+    interface Interface {
+        foo: String
+    }
+
+    type MyTypeA implements Interface {
+        foo: String
+        something: String
+    }
+
+    type MyTypeB implements Interface {
+        foo: String
+        somethingElse: String!
+    }
+    ";
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "query  {
+            test_interface {
+                __typename
+                foo
+                ...FragmentA
+            }
+        }
+
+        fragment FragmentA on MyTypeA {
+            something
+        }",
+        )
+        .response(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+                "something": "something"
+            }
+        }})
+        .expected(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+                "something": "something"
+            }
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "query  {
+            test_interface {
+                __typename
+                ...FragmentI
+            }
+        }
+
+        fragment FragmentI on Interface {
+            foo
+        }",
+        )
+        .response(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar"
+            }
+        }})
+        .expected(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar"
+            }
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "query  {
+            test_interface {
+                __typename
+                foo
+                ... on MyTypeA {
+                    something
+                }
+                ... on MyTypeB {
+                    somethingElse
+                }
+            }
+        }",
+        )
+        .response(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+                "something": "something"
+            }
+        }})
+        .expected(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+                "something": "something"
+            }
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "query  {
+            test_interface {
+                __typename
+                foo
+                ...FragmentB
+            }
+        }
+
+        fragment FragmentB on MyTypeB {
+            somethingElse
+        }",
+        )
+        .response(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+                "something": "something"
+            }
+        }})
+        .expected(json! {{
+            "test_interface": {
+                "__typename": "MyTypeA",
+                "foo": "bar",
+            }
+        }})
+        .test();
+}
+
+#[test]
+fn fragment_on_union() {
+    let schema = "type Query {
+        settings: ServiceSettings
+    }
+
+    type ServiceSettings {
+        location: ServiceLocation
+    }
+
+    union ServiceLocation = AccountLocation | Address
+
+    type AccountLocation {
+        id: ID
+        address: Address
+    }
+
+    type Address {
+        city: String
+    }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            "{
+            settings {
+              location {
+                ...SettingsLocation
+              }
+            }
+          }
+
+          fragment SettingsLocation on ServiceLocation {
+            ... on Address {
+              city
+            }
+             ... on AccountLocation {
+               id
+               address {
+                 city
+               }
+             }
+          }",
+        )
+        .response(json! {{
+            "settings": {
+                "location": {
+                    "__typename": "AccountLocation",
+                    "id": "1234"
+                }
+            }
+        }})
+        .expected(json! {{
+            "settings": {
+                "location": {
+                    "id": "1234",
+                    "address": null
+                }
+            }
+        }})
+        .test();
+}
+
+#[test]
+fn fragment_on_interface_without_typename() {
+    let schema = "type Query {
+        inStore(key: String!): InStore!
+    }
+
+    type InStore implements CartQueryInterface {
+        cart: Cart
+        carts: CartQueryResult!
+    }
+
+    interface CartQueryInterface {
+        carts: CartQueryResult!
+        cart: Cart
+    }
+
+    type Cart {
+        id: ID!
+        total: Int!
+    }
+
+    type CartQueryResult {
+        results: [Cart!]!
+        total: Int!
+    }";
+
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            r#"query {
+                mtb: inStore(key: "mountainbikes") {
+                    ...CartFragmentTest
+                }
+            }
+
+            fragment CartFragmentTest on CartQueryInterface {
+                carts {
+                    results {
+                        id
+                    }
+                    total
+                }
+            }"#,
+        )
+        .response(json! {{
+            "mtb": {
+                "carts": {
+                    "results": [{"id": "id"}],
+                    "total": 1234
+                },
+                "cart": null
+            }
+        }})
+        .expected(json! {{
+            "mtb": {
+                "carts": {
+                    "results": [{"id": "id"}],
+                    "total": 1234
+                },
+            }
+        }})
+        .test();
+
+    // With inline fragment
+    FormatTest::builder()
+        .schema(schema)
+        .fed2()
+        .query(
+            r#"query {
+            mtb: inStore(key: "mountainbikes") {
+                ... on CartQueryInterface {
+                    carts {
+                        results {
+                            id
+                        }
+                        total
+                    }
+                }
+            }
+        }"#,
+        )
+        .response(json! {{
+            "mtb": {
+                "carts": {
+                    "results": [{"id": "id"}],
+                    "total": 1234
+                },
+                "cart": null
+            }
+        }})
+        .expected(json! {{
+            "mtb": {
+                "carts": {
+                    "results": [{"id": "id"}],
+                    "total": 1234
+                },
+            }
+        }})
+        .test();
+}
+
+#[test]
+fn query_operation_nullification() {
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            name: String
+        }
+        ",
+        )
+        .query(
+            "{
+                get {
+                    name
+                }
+            }",
+        )
+        .response(json! {{ }})
+        .expected(json! {{
+            "get": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            "type Query {
+                get: Thing
+            }
+            type Thing {
+                name: String
+            }",
+        )
+        .query(
+            "query {
+                ...F
+             }
+
+             fragment F on Query {
+                 get {
+                     name
+                 }
+             }",
+        )
+        .response(json! {{ }})
+        .expected(json! {{
+            "get": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing
+        }
+        type Thing {
+            name: String
+        }",
+        )
+        .query(
+            "query {
+            ... on Query {
+             get {
+                 name
+             }
+            }
+         }",
+        )
+        .response(json! {{ }})
+        .expected(json! {{
+            "get": null,
+        }})
+        .test();
+
+    FormatTest::builder()
+        .schema(
+            "type Query {
+            get: Thing!
+        }
+        type Thing {
+            name: String
+        }",
+        )
+        .query(
+            "{
+            get {
+                name
+            }
+        }",
+        )
+        .response(json! {{ }})
+        .expected(Value::Null)
+        .test();
+}
+
+#[test]
+fn test_error_path_works_across_inline_fragments() {
+    let schema = Schema::parse(
+        r#"
+    schema
+        @link(url: "https://specs.apollo.dev/link/v1.0")
+        @link(url: "https://specs.apollo.dev/join/v0.2", for: EXECUTION)
+    {
+        query: Query
+    }
+
+    directive @join__field(graph: join__Graph!, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+    directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+    directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+    directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+    directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+    scalar link__Import
+    scalar join__FieldSet
+    enum link__Purpose {
+        SECURITY
+        EXECUTION
+    }
+    enum join__Graph {
+        TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+    }
+
+    type Query {
+        rootType: RootType
+    }
+
+    union RootType
+    @join__type(graph: TEST)
+    = MyFragment
+
+    type MyFragment
+    @join__type(graph: TEST)
+    {
+        edges: [MyFragmentEdge]
+    }
+
+    type MyFragmentEdge
+    @join__type(graph: TEST)
+    {
+      node: MyType
+    }
+
+    type MyType
+    @join__type(graph: TEST)
+    {
+        id: ID!
+        subType: MySubtype
+    }
+
+
+    type MySubtype
+    @join__type(graph: TEST)
+    {
+        edges: [MySubtypeEdge]
+    }
+
+    type MySubtypeEdge
+    @join__type(graph: TEST)
+    {
+      node: MyLeafType
+    }
+
+    type MyLeafType
+    @join__type(graph: TEST)
+    {
+        id: ID!
+        myField: String!
+    }
+"#, &Default::default()
+    )
+    .unwrap();
+
+    let query = Query::parse(
+        r#"query MyQueryThatContainsFragments {
+                rootType {
+                  ... on MyFragment {
+                    edges {
+                      node {
+                        id
+                        subType {
+                          __typename
+                          edges {
+                            __typename
+                            node {
+                              __typename
+                              id
+                              myField
+                            }
+                          }
+                        }
+                      }
+                      __typename
+                    }
+                    __typename
+                  }
+                }
+              }"#,
+        Some("MyQueryThatContainsFragments"),
+        &schema,
+        &Default::default(),
+    )
+    .unwrap();
+
+    assert!(query.contains_error_path(
+        &None,
+        None,
+        &Path::from("rootType/edges/0/node/subType/edges/0/node/myField"),
+        BooleanValues { bits: 0 }
+    ));
+}
+
+#[test]
+fn test_query_not_named_query() {
+    let config = Default::default();
+    let schema = Schema::parse(
+        r#"
+        schema
+            @link(url: "https://specs.apollo.dev/link/v1.0")
+            @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+        {
+            query: TheOneAndOnlyQuery
+        }
+        directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+        directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+        directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+
+        scalar join__FieldSet
+        scalar link__Import
+
+        enum link__Purpose {
+          """
+          `SECURITY` features provide metadata necessary to securely resolve fields.
+          """
+          SECURITY
+
+          """
+          `EXECUTION` features provide metadata necessary for operation execution.
+          """
+          EXECUTION
+        }
+
+        enum join__Graph {
+            TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+        }
+
+        type TheOneAndOnlyQuery @join__type(graph: TEST) { example: Boolean }
+        "#,
+        &Default::default(),
+    )
+    .unwrap();
+    let query = Query::parse("{ example }", None, &schema, &config).unwrap();
+    let selection = &query.operation.selection_set[0];
+    assert!(
+        matches!(
+            selection,
+            Selection::Field {
+                field_type: FieldType(apollo_compiler::executable::Type::Named(name)),
+                ..
+            }
+            if name == "Boolean"
+        ),
+        "unexpected selection {selection:?}"
+    );
+}
+
+const AUTHENTICATED_INTERFACE_SCHEMA: &str = r#"
+    schema
+        @link(url: "https://specs.apollo.dev/link/v1.0")
+        @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+        @link(url: "https://specs.apollo.dev/authenticated/v0.1", for: SECURITY)
+    {
+        query: Query
+    }
+    directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+    directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+    directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+    directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+    directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+    directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+    directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+    directive @authenticated on OBJECT | FIELD_DEFINITION | INTERFACE | SCALAR | ENUM
+
+    scalar join__FieldSet
+    scalar link__Import
+
+    enum link__Purpose {
+      SECURITY
+      EXECUTION
+    }
+    enum join__Graph {
+        TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+    }
+
+    type Query @join__type(graph: TEST) {
+        thing: Thing
+    }
+
+    interface Thing @join__type(graph: TEST) {
+        id: ID
+    }
+
+    type Foo implements Thing
+    @join__type(graph: TEST)
+    @join__implements(graph: TEST, interface: "Thing") {
+        id: ID
+        inline: String
+        spread: String
+        secret: String @authenticated
+    }
+"#;
+
+/// Plans `query_str` as an unauthenticated request and returns the original `Query` with
+/// `filtered_query` populated, alongside the schema.
+///
+/// The pair comes from `QueryPlannerService`, so the filtered `Query` is the one
+/// `filter_query` produces, marked `is_original = false` by the planner.
+async fn authorization_filtered_query(query_str: &str) -> (Arc<Query>, Arc<Schema>) {
+    let configuration: Configuration = serde_json::from_value(serde_json::json!({
+        "authorization": { "directives": { "enabled": true } }
+    }))
+    .unwrap();
+    let configuration = Arc::new(configuration);
+    let schema = Arc::new(Schema::parse(AUTHENTICATED_INTERFACE_SCHEMA, &configuration).unwrap());
+    let doc = Query::parse_document(query_str, None, &schema, &configuration).unwrap();
+
+    let planner = QueryPlannerService::for_test(schema.clone(), configuration.clone()).unwrap();
+    let response = planner
+        .oneshot(QueryPlannerRequest {
+            query: query_str.to_string(),
+            operation_name: None,
+            document: doc,
+            metadata: CacheKeyMetadata::default(),
+            plan_options: PlanOptions::default(),
+            compute_job_type: ComputeJobType::QueryPlanning,
+        })
+        .await
+        .unwrap();
+
+    let query = match response.content {
+        Some(plan) => plan.query.clone(),
+        _ => panic!("filtering removed only `secret`, so the planner must return a plan"),
+    };
+    assert!(
+        query.filtered_query.is_some(),
+        "filtering must have produced a second Query, otherwise the two-pass formatting \
+         under test never runs"
+    );
+
+    (query, schema)
+}
+
+/// Formats `data` through [`Query::format_response_filtered_then_original`] and returns
+/// the resulting `thing` object.
+fn format_filtered_then_original(query: &Query, schema: &Schema, data: Value) -> Value {
+    let mut response = crate::graphql::Response::builder().data(data).build();
+
+    query.format_response_filtered_then_original(
+        &mut response,
+        &Object::new(),
+        schema.api_schema(),
+        BooleanValues { bits: 0 },
+        true,
+    );
+
+    response
+        .data
+        .as_ref()
+        .unwrap()
+        .get("thing")
+        .unwrap()
+        .clone()
+}
+
+/// Double-applying response formatting on an abstract type should apply the
+/// correct fragment spread.
+/// `__typename` is not selected by the input query, but internally we have to
+/// pass it along to the final formatting pass, else it wouldn't know which concrete
+/// type it's working on.
+///
+/// One fragment form per test: each form passes `__typename` along independently, so a
+/// query carrying both keeps its fields alive when either does.
+#[tokio::test]
+async fn filtered_inline_fragment_on_abstract_type() {
+    // `secret` is `@authenticated`, so filtering drops it and leaves `inline`.
+    let (query, schema) =
+        authorization_filtered_query("{ thing { id ... on Foo { inline secret } } }").await;
+
+    // What the subgraph returns for the filtered plan: `secret` was never requested.
+    let thing = format_filtered_then_original(
+        &query,
+        &schema,
+        json! {{ "thing": { "__typename": "Foo", "id": "1", "inline": "inline" } }},
+    );
+
+    assert_eq!(thing.get("inline"), Some(&json!("inline")));
+}
+
+/// The fragment-spread counterpart of `filtered_inline_fragment_on_abstract_type`,
+/// covering the second `!is_original` branch in `apply_selection_set`.
+#[tokio::test]
+async fn filtered_fragment_spread_on_abstract_type() {
+    let (query, schema) = authorization_filtered_query(
+        "{ thing { id ...Spread } } fragment Spread on Foo { spread secret }",
+    )
+    .await;
+
+    let thing = format_filtered_then_original(
+        &query,
+        &schema,
+        json! {{ "thing": { "__typename": "Foo", "id": "1", "spread": "spread" } }},
+    );
+
+    assert_eq!(thing.get("spread"), Some(&json!("spread")));
+}
+
+#[test]
+fn filtered_defer_fragment() {
+    let config = Configuration::default();
+    let schema = Schema::parse(
+        r#"
+        schema
+            @link(url: "https://specs.apollo.dev/link/v1.0")
+            @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+        {
+            query: Query
+        }
+        directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+        directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+        directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+
+        scalar join__FieldSet
+        scalar link__Import
+
+        enum link__Purpose {
+          SECURITY
+          EXECUTION
+        }
+        enum join__Graph {
+            TEST @join__graph(name: "test", url: "http://localhost:4001/graphql")
+        }
+
+        type Query @join__type(graph: TEST) {
+            a: A
+        }
+
+        type A {
+            b: String
+            c: String!
+        }
+        "#,
+        &Default::default(),
+    )
+    .unwrap();
+    let query = r#"{
+        a {
+          b
+          ... @defer(label: "A") {
+            c
+          }
+        }
+      }"#;
+
+    let filtered_query = "{
+        a {
+          b
+        }
+      }";
+
+    let ast = Parser::new()
+        .parse_ast(filtered_query, "filtered_query.graphql")
+        .unwrap();
+    let doc = ast.to_executable(schema.supergraph_schema()).unwrap();
+    let (fragments, operation, defer_stats, schema_aware_hash) =
+        Query::extract_query_information(&schema, filtered_query, &doc, None).unwrap();
+
+    let subselections = crate::spec::query::subselections::collect_subselections(
+        &config,
+        &operation,
+        &fragments.map,
+        &defer_stats,
+    )
+    .unwrap();
+    let mut query = Query {
+        string: query.to_string(),
+        fragments,
+        operation,
+        filtered_query: None,
+        subselections,
+        defer_stats,
+        is_original: true,
+        unauthorized: UnauthorizedPaths::default(),
+        schema_aware_hash,
+    };
+
+    let ast = Parser::new()
+        .parse_ast(filtered_query, "filtered_query.graphql")
+        .unwrap();
+    let doc = ast.to_executable(schema.supergraph_schema()).unwrap();
+    let (fragments, operation, defer_stats, schema_aware_hash) =
+        Query::extract_query_information(&schema, filtered_query, &doc, None).unwrap();
+
+    let subselections = crate::spec::query::subselections::collect_subselections(
+        &config,
+        &operation,
+        &fragments.map,
+        &defer_stats,
+    )
+    .unwrap();
+
+    let filtered = Query {
+        string: filtered_query.to_string(),
+        fragments,
+        operation,
+        filtered_query: None,
+        subselections,
+        defer_stats,
+        is_original: false,
+        unauthorized: UnauthorizedPaths::default(),
+        schema_aware_hash,
+    };
+
+    query.filtered_query = Some(Arc::new(filtered));
+
+    let mut response = crate::graphql::Response::builder()
+        .data(json! {{
+            "a": {
+                "b": "b",
+              }
+        }})
+        .build();
+
+    query.filtered_query.as_ref().unwrap().format_response(
+        &mut response,
+        &Object::new(),
+        schema.api_schema(),
+        BooleanValues { bits: 0 },
+        true,
+    );
+
+    assert_json_snapshot!(response);
+
+    query.format_response(
+        &mut response,
+        &Object::new(),
+        schema.api_schema(),
+        BooleanValues { bits: 0 },
+        true,
+    );
+
+    assert_json_snapshot!(response);
+}
+
+// ─── ROUTER-1598: fragment spread non-null nullification tests ────────────────
+//
+// The bug: when two named-fragment spreads BOTH target the *parent* type (Thing),
+// and the FIRST fragment processes a child field that triggers a non-null
+// violation (setting output["collection"] = null), the SECOND fragment would
+// re-encounter the same field, see input["collection"] still non-null, miss the
+// guard, call format_named_type, which overwrites the null with a fresh empty
+// object, and ultimately return {"__typename":"A"} instead of null.
+//
+// Fixing the guard to ALSO skip when output[field].is_null() closes the hole.
+//
+// Schema: Thing.collection is a nullable union U = A | B.  A has id: ID! (non-
+// null).  When the response carries {"__typename":"A"} but omits id, the null
+// must propagate to collection.
+//
+// The query structure that triggers the bug has BOTH fragments on Thing (the
+// parent), so apply_selection_set sees "collection" twice in the same pass:
+//   ...AThingFrag on Thing  → processes collection → null propagation → collection=null
+//   ...BThingFrag on Thing  → processes collection again → (bug) overwrites null
+//
+// If fragments were on the union members (on A / on B) instead of on Thing,
+// only one fragment would match and the second pass never happens.
+
+const NULLIFICATION_SCHEMA: &str = "
+    type Query {
+        thing: Thing
+    }
+    type Thing {
+        collection: U
+    }
+    union U = A | B
+    type A {
+        id: ID!
+        a: String
+    }
+    type B {
+        b: String
+    }
+";
+
+// Both fragments are on Thing (parent) so apply_selection_set processes
+// "collection" twice in the same invocation — the exact condition the guard
+// must defend against.
+//
+// BThingFrag includes __typename in its collection selection so the buggy
+// output is the recognisable {"__typename":"A"} rather than the less obvious {}.
+const NULLIFICATION_QUERY: &str = "
+    query TestQuery {
+        thing {
+            ...AThingFrag
+            ...BThingFrag
+        }
+    }
+    fragment AThingFrag on Thing {
+        collection {
+            ... on A { id a }
+        }
+    }
+    fragment BThingFrag on Thing {
+        collection {
+            __typename
+            ... on B { b }
+        }
+    }
+";
+
+#[test]
+fn reformat_response_data_nested_fragment_spread_with_unions() {
+    // Happy path — id is present.
+    // AThingFrag writes {id, a}; BThingFrag then merges __typename into the
+    // same (non-null) object.  The new guard must NOT fire here because
+    // output["collection"] is an object, not null.
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(NULLIFICATION_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A", "id": "a1", "a": null }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": { "id": "a1", "a": null, "__typename": "A" }
+            }
+        }))
+        .test();
+
+    // Primary bug — __typename is "A" but required `id: ID!` is absent.
+    //
+    // Without the fix:
+    //   AThingFrag: collection = null  (null propagation from missing id)
+    //   BThingFrag: input["collection"] is non-null {"__typename":"A"}, old
+    //               guard only checked input_value.is_null(), so it didn't fire,
+    //               format_named_type overwrote null with {"__typename":"A"}.
+    //   Final output: {"collection": {"__typename": "A"}}  ← spec-incorrect
+    //
+    // With the fix:
+    //   BThingFrag: guard also checks output["collection"].is_null() → true →
+    //               skips the field entirely; null is preserved.
+    //   Final output: {"collection": null}  ← correct
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(NULLIFICATION_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A" }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": null
+            }
+        }))
+        // `emit_missing_field` writes to BOTH sinks for non-null missing:
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["thing", "collection", "id"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" },
+            }
+        ]))
+        .expected_extensions(json!({
+            "valueCompletion": [
+                {
+                    "message": "Cannot return null for non-nullable type ID",
+                    "path": ["thing", "collection"]
+                }
+            ]
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_nullification_inline() {
+    // Same bug, exercised via inline fragments on the parent type instead of
+    // named fragment spreads.  Exercises the InlineFragment branch of
+    // apply_selection_set (lines ~810-847 in query.rs).
+    const INLINE_QUERY: &str = "
+        query TestQuery {
+            thing {
+                ... on Thing {
+                    collection {
+                        ... on A { id a }
+                    }
+                }
+                ... on Thing {
+                    collection {
+                        __typename
+                        ... on B { b }
+                    }
+                }
+            }
+        }
+    ";
+
+    // Happy path — both inline fragments contribute to collection.
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(INLINE_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A", "id": "a1", "a": null }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": { "id": "a1", "a": null, "__typename": "A" }
+            }
+        }))
+        .test();
+
+    // Bug case — missing id must propagate null despite the second ... on Thing
+    // fragment trying to re-process collection.
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(INLINE_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A" }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": null
+            }
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_nullification_non_null_parent() {
+    // Regression guard for propagation through a non-null parent field.
+    // When collection is U! (non-null), the InvalidValue from missing id propagates
+    // via format_non_nullable_value all the way up through apply_selection_set
+    // for AThingFrag — causing an early return before BThingFrag can run.
+    // format_named_type for thing catches the error and sets thing = null.
+    // This works correctly with and without the fix, confirming the propagation
+    // chain is intact.
+    const NON_NULL_SCHEMA: &str = "
+        type Query {
+            thing: Thing
+        }
+        type Thing {
+            collection: U!
+        }
+        union U = A | B
+        type A {
+            id: ID!
+            a: String
+        }
+        type B {
+            b: String
+        }
+    ";
+
+    FormatTest::builder()
+        .schema(NON_NULL_SCHEMA)
+        .query(NULLIFICATION_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A" }
+            }
+        }))
+        .expected(json!({
+            "thing": null
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_nullification_reverse_order() {
+    // Regression guard: BThingFrag first, AThingFrag second.
+    //
+    // BThingFrag runs first — type is A, ... on B doesn't match, but __typename
+    // is written, leaving collection = {"__typename":"A"} (non-null object).
+    //
+    // AThingFrag runs second — output["collection"] is a non-null object, so the
+    // new guard's is_null() branch does NOT fire.  Processing continues, format_
+    // named_type finds id missing, nullifies collection.
+    //
+    // Result must be the same as the forward-order case: collection = null.
+    // This verifies the fix doesn't break nullification when it happens on the
+    // *second* fragment rather than the first.
+    const REVERSED_QUERY: &str = "
+        query TestQuery {
+            thing {
+                ...BThingFrag
+                ...AThingFrag
+            }
+        }
+        fragment AThingFrag on Thing {
+            collection {
+                ... on A { id a }
+            }
+        }
+        fragment BThingFrag on Thing {
+            collection {
+                __typename
+                ... on B { b }
+            }
+        }
+    ";
+
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(REVERSED_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": { "__typename": "A" }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": null
+            }
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_merge_still_works() {
+    // Regression guard: two fragments on the same parent type (Thing) that both
+    // select the same nested object (review) but contribute *different* leaf
+    // fields — and neither triggers a non-null violation.
+    //
+    // After the fix, the guard fires only when output[field].is_null().  Here
+    // IdThingFrag writes {id: "r1"} (non-null object), so BothThingFrag's
+    // output["review"].is_null() is FALSE, the guard does not fire, and body
+    // gets merged in correctly.  Both fields must be present in the output.
+    const MERGE_SCHEMA: &str = "
+        type Query {
+            thing: Thing
+        }
+        type Thing {
+            review: Review
+        }
+        type Review {
+            id: ID!
+            body: String
+        }
+    ";
+    // Both fragments on Thing (parent), each contributes one leaf field of review.
+    const MERGE_QUERY: &str = "
+        query TestQuery {
+            thing {
+                ...IdThingFrag
+                ...BodyThingFrag
+            }
+        }
+        fragment IdThingFrag on Thing   { review { id   } }
+        fragment BodyThingFrag on Thing { review { body } }
+    ";
+
+    FormatTest::builder()
+        .schema(MERGE_SCHEMA)
+        .query(MERGE_QUERY)
+        .response(json!({
+            "thing": {
+                "review": { "id": "r1", "body": "Great!" }
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "review": { "id": "r1", "body": "Great!" }
+            }
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_data_fragment_semantic_null_not_overwritten() {
+    // Regression guard for the semantic-null case raised during review.
+    //
+    // When the subgraph returns `null` for `collection` explicitly (a semantic
+    // null — the field exists but is intentionally null), a subsequent fragment
+    // must NOT overwrite it.  The guard `output[field].is_null()` must fire and
+    // preserve the null rather than re-entering format_value with a non-null
+    // input object.
+    FormatTest::builder()
+        .schema(NULLIFICATION_SCHEMA)
+        .query(NULLIFICATION_QUERY)
+        .response(json!({
+            "thing": {
+                "collection": null
+            }
+        }))
+        .expected(json!({
+            "thing": {
+                "collection": null
+            }
+        }))
+        .test();
+}
+
+// ---------------------------------------------------------------------------
+// Fragment-caching tests for `apply_root_selection_set`
+//
+// These validate that the named-fragment deduplication cache in
+// `apply_root_selection_set_cached` produces correct results.
+// ---------------------------------------------------------------------------
+
+const FRAGMENT_CACHE_SCHEMA: &str = "
+    type Query {
+        a: T  b: T  c: T
+    }
+    type T {
+        x: String  y: String
+    }
+";
+
+#[test]
+fn reformat_response_root_fragment_spread_twice_is_idempotent() {
+    // Spreading the same fragment twice at the root must produce the same
+    // result as spreading it once — the cache short-circuits the second
+    // application.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                ...F ...F
+            }
+            fragment F on Query { a { x y } b { x y } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "b": {"x": "3", "y": "4"}
+        }))
+        .expected(json!({
+            "a": {"x": "1", "y": "2"},
+            "b": {"x": "3", "y": "4"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_distinct_root_fragments_both_applied() {
+    // Two *different* named fragments must both be applied — the cache only
+    // deduplicates by fragment name.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                ...FA ...FB
+            }
+            fragment FA on Query { a { x } }
+            fragment FB on Query { b { y } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "b": {"x": "3", "y": "4"}
+        }))
+        .expected(json!({
+            "a": {"x": "1"},
+            "b": {"y": "4"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_fragment_inside_inline_fragment_deduplicated() {
+    // A named fragment spread inside an inline fragment wrapper at the root
+    // shares the same deduplication cache. The second `...F` inside a
+    // different `... on Query` must be skipped.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                ...F
+                ... on Query { ...F }
+                ... on Query { ...F }
+            }
+            fragment F on Query { a { x y } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"}
+        }))
+        .expected(json!({
+            "a": {"x": "1", "y": "2"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_exponential_fragment_chain_correct_output() {
+    // Chains like L0, L1 = ...L0 ...L0, L2 = ...L1 ...L1, etc. cause
+    // exponential expansion without caching. This test verifies the output
+    // is correct with the cache in place.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment L0 on Query { a { x y } b { x y } }
+            fragment L1 on Query { ...L0 ...L0 }
+            fragment L2 on Query { ...L1 ...L1 }
+            fragment L3 on Query { ...L2 ...L2 }
+            fragment L4 on Query { ...L3 ...L3 }
+            query { ...L4 }",
+        )
+        .response(json!({
+            "a": {"x": "ax", "y": "ay"},
+            "b": {"x": "bx", "y": "by"}
+        }))
+        .expected(json!({
+            "a": {"x": "ax", "y": "ay"},
+            "b": {"x": "bx", "y": "by"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_fragment_with_typename() {
+    // Fragments that select __typename at the root level should work
+    // correctly with caching — the first spread writes the typename,
+    // and the second is skipped.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                ...F ...F
+            }
+            fragment F on Query { __typename a { x } }",
+        )
+        .response(json!({
+            "a": {"x": "1"}
+        }))
+        .expected(json!({
+            "__typename": "Query",
+            "a": {"x": "1"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_fragment_chain_with_distinct_leaves() {
+    // Two chain-of-fragment paths that converge on the same leaf fragment.
+    // Both chains should still produce correct output — the leaf fragment
+    // is applied once.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment Leaf on Query { a { x y } }
+            fragment ChainA on Query { ...Leaf }
+            fragment ChainB on Query { ...Leaf }
+            query { ...ChainA ...ChainB c { x } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .expected(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_direct_leaf_then_chain_deduplicated() {
+    // Regression: unique spread names at the root (`Leaf`, `ChainA`) must still
+    // record Leaf so ChainA's nested `...Leaf` is skipped. Gating dedup on
+    // "duplicate spread names in this selection set" would re-apply Leaf.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment Leaf on Query { a { x y } }
+            fragment ChainA on Query { ...Leaf }
+            query { ...Leaf ...ChainA c { x } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .expected(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_chain_then_direct_leaf_deduplicated() {
+    // Symmetric ordering: ChainA applies Leaf first; the later direct `...Leaf`
+    // must be skipped.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment Leaf on Query { a { x y } }
+            fragment ChainA on Query { ...Leaf }
+            query { ...ChainA ...Leaf c { x } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .expected(json!({
+            "a": {"x": "1", "y": "2"},
+            "c": {"x": "3"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_fragment_non_null_field_missing() {
+    // When a cached fragment selects a non-null field that is missing from
+    // the response, the error propagation must still happen correctly.
+    let schema = "
+        type Query {
+            a: T!
+        }
+        type T {
+            x: String!
+        }
+    ";
+
+    FormatTest::builder()
+        .schema(schema)
+        .query(
+            "query { ...F ...F }
+            fragment F on Query { a { x } }",
+        )
+        .response(json!({
+            "a": {}
+        }))
+        .expected(json!(null))
+        .test();
+}
+
+#[test]
+fn reformat_response_root_fragment_mixed_with_direct_fields() {
+    // A query that mixes direct field selections with fragment spreads.
+    // The direct field must appear in output even though the fragment
+    // is deduplicated.
+    FormatTest::builder()
+        .schema(FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                c { x }
+                ...F
+                ...F
+            }
+            fragment F on Query { a { x y } b { x } }",
+        )
+        .response(json!({
+            "a": {"x": "1", "y": "2"},
+            "b": {"x": "3"},
+            "c": {"x": "4"}
+        }))
+        .expected(json!({
+            "c": {"x": "4"},
+            "a": {"x": "1", "y": "2"},
+            "b": {"x": "3"}
+        }))
+        .test();
+}
+
+// ---------------------------------------------------------------------------
+// Fragment-caching tests for `apply_selection_set`
+//
+// These validate that the named-fragment deduplication cache in
+// `apply_selection_set` produces correct results on nested objects.
+// ---------------------------------------------------------------------------
+
+const NESTED_FRAGMENT_CACHE_SCHEMA: &str = "
+    type Query {
+        node: Node
+    }
+    type Node {
+        a: String  b: String  c: String
+    }
+";
+
+#[test]
+fn reformat_response_nested_fragment_spread_twice_is_idempotent() {
+    // Spreading the same fragment twice inside a nested object must produce
+    // the same result as spreading it once.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                node { ...F ...F }
+            }
+            fragment F on Node { a b }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .expected(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_distinct_fragments_both_applied() {
+    // Two *different* named fragments inside a nested object must both be applied.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                node { ...FA ...FB }
+            }
+            fragment FA on Node { a }
+            fragment FB on Node { b }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .expected(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_fragment_inside_inline_fragment_deduplicated() {
+    // A named fragment spread inside an inline fragment wrapper at a nested
+    // level shares the same deduplication cache.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                node {
+                    ...F
+                    ... on Node { ...F }
+                    ... on Node { ...F }
+                }
+            }
+            fragment F on Node { a b }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .expected(json!({
+            "node": {"a": "1", "b": "2"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_exponential_fragment_chain_correct_output() {
+    // Chains like L0, L1 = ...L0 ...L0, L2 = ...L1 ...L1 etc. on a nested
+    // object cause exponential expansion without caching.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment L0 on Node { a b }
+            fragment L1 on Node { ...L0 ...L0 }
+            fragment L2 on Node { ...L1 ...L1 }
+            fragment L3 on Node { ...L2 ...L2 }
+            fragment L4 on Node { ...L3 ...L3 }
+            query { node { ...L4 } }",
+        )
+        .response(json!({
+            "node": {"a": "av", "b": "bv"}
+        }))
+        .expected(json!({
+            "node": {"a": "av", "b": "bv"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_fragment_mixed_with_direct_fields() {
+    // Direct field selections mixed with deduplicated fragment spreads on a
+    // nested object must all appear in output.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "query {
+                node {
+                    c
+                    ...F
+                    ...F
+                }
+            }
+            fragment F on Node { a b }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2", "c": "3"}
+        }))
+        .expected(json!({
+            "node": {"c": "3", "a": "1", "b": "2"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_direct_leaf_then_chain_deduplicated() {
+    // Nested equivalent of the root Leaf+ChainA regression: unique spread
+    // names on a nested object must still record Leaf for ChainA to skip.
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment Leaf on Node { a b }
+            fragment ChainA on Node { ...Leaf }
+            query { node { ...Leaf ...ChainA c } }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2", "c": "3"}
+        }))
+        .expected(json!({
+            "node": {"a": "1", "b": "2", "c": "3"}
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_nested_chain_then_direct_leaf_deduplicated() {
+    FormatTest::builder()
+        .schema(NESTED_FRAGMENT_CACHE_SCHEMA)
+        .query(
+            "fragment Leaf on Node { a b }
+            fragment ChainA on Node { ...Leaf }
+            query { node { ...ChainA ...Leaf c } }",
+        )
+        .response(json!({
+            "node": {"a": "1", "b": "2", "c": "3"}
+        }))
+        .expected(json!({
+            "node": {"a": "1", "b": "2", "c": "3"}
+        }))
+        .test();
+}
+
+// Schema with a recursive Node type for cross-frame fragment-dedup tests.
+const RECURSIVE_NODE_SCHEMA: &str = "
+    type Query {
+        node: Node
+    }
+    type Node {
+        a: String
+        b: String
+        node: Node
+    }
+";
+
+#[test]
+fn reformat_response_child_fragment_does_not_contaminate_parent_dedup() {
+    // Regression: a nested field that spreads fragment F must not leave F
+    // recorded in the parent object's `visited_fragments`. If the set were shared
+    // across objects, the parent's second ...F (and the first, depending on
+    // ordering) would be silently skipped.
+    FormatTest::builder()
+        .schema(RECURSIVE_NODE_SCHEMA)
+        .query(
+            "query {
+                node {
+                    node { ...F ...F }
+                    ...F
+                    ...F
+                }
+            }
+            fragment F on Node { a b }",
+        )
+        .response(json!({
+            "node": {
+                "a": "parent-a",
+                "b": "parent-b",
+                "node": {"a": "child-a", "b": "child-b"}
+            }
+        }))
+        .expected(json!({
+            "node": {
+                "node": {"a": "child-a", "b": "child-b"},
+                "a": "parent-a",
+                "b": "parent-b"
+            }
+        }))
+        .test();
+}
+
+#[test]
+fn reformat_response_parent_fragment_does_not_contaminate_child_dedup() {
+    // Regression: a parent that already inserted F into its `visited_fragments`
+    // before recursing into a nested field must not cause the child's ...F
+    // spread to be skipped (the child gets its own set).
+    FormatTest::builder()
+        .schema(RECURSIVE_NODE_SCHEMA)
+        .query(
+            "query {
+                node {
+                    ...F
+                    ...F
+                    node { ...F ...F }
+                }
+            }
+            fragment F on Node { a b }",
+        )
+        .response(json!({
+            "node": {
+                "a": "parent-a",
+                "b": "parent-b",
+                "node": {"a": "child-a", "b": "child-b"}
+            }
+        }))
+        .expected(json!({
+            "node": {
+                "a": "parent-a",
+                "b": "parent-b",
+                "node": {"a": "child-a", "b": "child-b"}
+            }
+        }))
+        .test();
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic fragment-visit assertions.
+//
+// The tests above assert only on output, so they would still pass if the
+// deduplication cache were removed. These count fragment *applications*
+// instead, and fail if the cache stops working.
+//
+// The counter is `response.errors`: a nullable field that the fragment selects
+// but the response omits pushes exactly one "Missing field" coercion error per
+// visit (see `emit_missing_field`), and unlike a written field that error is
+// not idempotent. So `errors.len()` is the number of times the fragment body
+// was actually applied.
+// ---------------------------------------------------------------------------
+
+const VISIT_COUNT_SCHEMA: &str = "
+    type Query {
+        node: Node
+        nodes: [Node]
+        absent: String
+    }
+    type Node {
+        a: String  b: String  c: String
+    }
+";
+
+#[test]
+fn fragment_applied_once_per_object_root() {
+    // Three spreads of F at the root, F selects `c` which the response omits.
+    // Cached: one application, one error. Uncached: three errors.
+    FormatTest::builder()
+        .schema(VISIT_COUNT_SCHEMA)
+        .query(
+            "query { ...F ...F ...F }
+            fragment F on Query { node { a } absent }",
+        )
+        .response(json!({ "node": {"a": "1"} }))
+        .expected(json!({ "node": {"a": "1"}, "absent": null }))
+        .expected_errors(json!([{
+            "message": "Missing field",
+            "path": ["absent"],
+            "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+        }]))
+        .test();
+}
+
+#[test]
+fn fragment_applied_once_per_object_nested() {
+    // Same, one level down: exercises `apply_selection_set` rather than
+    // `apply_root_selection_set_cached`.
+    FormatTest::builder()
+        .schema(VISIT_COUNT_SCHEMA)
+        .query(
+            "query { node { ...F ...F ...F } }
+            fragment F on Node { a c }",
+        )
+        .response(json!({ "node": {"a": "1"} }))
+        .expected(json!({ "node": {"a": "1", "c": null} }))
+        .expected_errors(json!([{
+            "message": "Missing field",
+            "path": ["node", "c"],
+            "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+        }]))
+        .test();
+}
+
+#[test]
+fn exponential_fragment_chain_applies_leaf_once() {
+    // L0 is reachable by 2^9 = 512 distinct spread paths. Cached, the leaf body
+    // runs once and emits one error; uncached it would emit 512.
+    FormatTest::builder()
+        .schema(VISIT_COUNT_SCHEMA)
+        .query(
+            "fragment L0 on Node { a c }
+            fragment L1 on Node { ...L0 ...L0 }
+            fragment L2 on Node { ...L1 ...L1 }
+            fragment L3 on Node { ...L2 ...L2 }
+            fragment L4 on Node { ...L3 ...L3 }
+            fragment L5 on Node { ...L4 ...L4 }
+            fragment L6 on Node { ...L5 ...L5 }
+            fragment L7 on Node { ...L6 ...L6 }
+            fragment L8 on Node { ...L7 ...L7 }
+            fragment L9 on Node { ...L8 ...L8 }
+            query { node { ...L9 } }",
+        )
+        .response(json!({ "node": {"a": "1"} }))
+        .expected(json!({ "node": {"a": "1", "c": null} }))
+        .expected_errors(json!([{
+            "message": "Missing field",
+            "path": ["node", "c"],
+            "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+        }]))
+        .test();
+}
+
+#[test]
+fn fragment_applied_once_per_list_element() {
+    // Each list element is its own object: the fragment must be applied exactly
+    // once per element (3 errors), not once for the whole list (1) and not
+    // twice per element (6).
+    FormatTest::builder()
+        .schema(VISIT_COUNT_SCHEMA)
+        .query(
+            "query { nodes { ...F ...F } }
+            fragment F on Node { a c }",
+        )
+        .response(json!({ "nodes": [{"a": "1"}, {"a": "2"}, {"a": "3"}] }))
+        .expected(json!({
+            "nodes": [
+                {"a": "1", "c": null},
+                {"a": "2", "c": null},
+                {"a": "3", "c": null}
+            ]
+        }))
+        .expected_errors(json!([
+            {
+                "message": "Missing field",
+                "path": ["nodes", 0, "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Missing field",
+                "path": ["nodes", 1, "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            },
+            {
+                "message": "Missing field",
+                "path": ["nodes", 2, "c"],
+                "extensions": { "code": "RESPONSE_VALIDATION_FAILED" }
+            }
+        ]))
+        .test();
+}

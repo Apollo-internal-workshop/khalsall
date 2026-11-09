@@ -1,0 +1,20 @@
+---
+source: apollo-router/src/configuration/tests.rs
+expression: error.to_string()
+---
+apollo::configuration::schema
+
+  × schema validation error
+  ╰─▶ schema validation error
+
+Error: apollo::configuration::validation
+
+  × Additional properties are not allowed ('bad', 'another_one' were
+  │ unexpected)
+   ╭─[6:3]
+ 5 │   listen: 127.0.0.1:4000
+ 6 │   bad: "donotwork"
+   ·   ─┬─
+   ·    ╰── Additional properties are not allowed ('bad', 'another_one' were unexpected)
+ 7 │   another_one: true
+   ╰────

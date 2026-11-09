@@ -1,0 +1,1180 @@
+//! Validate and check semantics of the `@connect(selection:)` argument
+
+use std::fmt::Display;
+use std::iter::once;
+use std::ops::Range;
+
+use apollo_compiler::Node;
+use apollo_compiler::ast::FieldDefinition;
+use apollo_compiler::ast::Value;
+use apollo_compiler::collections::IndexSet;
+use apollo_compiler::parser::LineColumn;
+use apollo_compiler::schema::ExtendedType;
+use itertools::Itertools;
+use shape::Shape;
+use shape::ShapeCase;
+use shape::location::Location;
+
+use self::variables::VariableResolver;
+use super::Code;
+use super::Message;
+use super::Name;
+use crate::connectors::ConnectSpec;
+use crate::connectors::JSONSelection;
+use crate::connectors::Namespace;
+use crate::connectors::PathSelection;
+use crate::connectors::SubSelection;
+use crate::connectors::expand::visitors::FieldVisitor;
+use crate::connectors::expand::visitors::GroupVisitor;
+use crate::connectors::graphql_shapes::source_file;
+use crate::connectors::id::ConnectedElement;
+use crate::connectors::json_selection::NamedSelection;
+use crate::connectors::json_selection::Ranged;
+use crate::connectors::json_selection::SelectionAnalysis;
+use crate::connectors::json_selection::SelectionTrie;
+use crate::connectors::json_selection::VarPaths;
+use crate::connectors::schema_type_ref::SchemaTypeRef;
+use crate::connectors::spec::connect::CONNECT_SELECTION_ARGUMENT_NAME;
+use crate::connectors::validation::coordinates::ConnectDirectiveCoordinate;
+use crate::connectors::validation::coordinates::SelectionCoordinate;
+use crate::connectors::validation::expression::MappingArgument;
+use crate::connectors::validation::expression::parse_mapping_argument;
+use crate::connectors::validation::graphql::SchemaInfo;
+use crate::connectors::validation::graphql::subslice_location;
+use crate::connectors::variable::Phase;
+use crate::connectors::variable::Target;
+use crate::connectors::variable::VariableContext;
+
+mod variables;
+
+/// The `@connect(selection:)` argument
+pub(super) struct Selection<'schema> {
+    parsed: JSONSelection,
+    node: Node<Value>,
+    coordinate: SelectionCoordinate<'schema>,
+}
+
+impl<'schema> Selection<'schema> {
+    pub(super) fn parse(
+        connect_directive: ConnectDirectiveCoordinate<'schema>,
+        schema: &'schema SchemaInfo<'schema>,
+    ) -> Result<Self, Message> {
+        let coordinate = SelectionCoordinate::from(connect_directive);
+        let selection_arg = connect_directive
+            .directive
+            .arguments
+            .iter()
+            .find(|arg| arg.name == CONNECT_SELECTION_ARGUMENT_NAME)
+            .ok_or_else(|| Message {
+                code: Code::GraphQLError,
+                message: format!("{coordinate} is required."),
+                locations: connect_directive
+                    .directive
+                    .line_column_range(&schema.sources)
+                    .into_iter()
+                    .collect(),
+            })?;
+
+        let MappingArgument { expression, node } = parse_mapping_argument(
+            &selection_arg.value,
+            coordinate,
+            Code::InvalidSelection,
+            schema,
+        )?;
+
+        Ok(Self {
+            parsed: expression.expression,
+            node,
+            coordinate,
+        })
+    }
+
+    /// The shape of what the selection produces when `$` has the given shape.
+    pub(super) fn output_shape(&self, input_shape: Shape) -> Shape {
+        SelectionAnalysis::new(self.parsed.clone())
+            .with_input_shape(input_shape)
+            .output_shape()
+    }
+
+    /// Type check the selection using the visitor pattern, returning a list of seen fields as
+    /// (ObjectName, FieldName) pairs.
+    ///
+    /// `input_shape` is what's known about `$`, such as that a streamed response is a list of
+    /// events. With `None`, nothing is assumed.
+    pub(super) fn type_check(
+        self,
+        schema: &SchemaInfo,
+        input_shape: Option<Shape>,
+    ) -> Result<Vec<(Name, Name)>, Message> {
+        let coordinate = self.coordinate.connect;
+        let context = VariableContext::new(&coordinate.element, Phase::Response, Target::Body);
+        validate_selection_variables(
+            &VariableResolver::new(context.clone(), schema),
+            self.coordinate,
+            &self.node,
+            schema,
+            context,
+            self.parsed.external_var_paths(),
+            &self.parsed.local_var_names(),
+        )?;
+
+        // Fork based on ConnectSpec version:
+        //
+        // - v0.1/v0.2/v0.3: Use legacy visitor-based validation
+        //   (behaviorally frozen for forwards/backwards compatibility)
+        //   Note: in v0.1 and v0.2, all -> method result shapes were
+        //   Unknown, so the shape-based validation would not work at
+        //   all. In v0.3, -> method shape checking was fully enabled,
+        //   but v0.3 shipped before the shape-based validation code was
+        //   ready, so we still use the legacy path for v0.3, even
+        //   though it could in principle swap over to shape-based
+        //   validation at some point if need arises.
+        //
+        // - v0.4+: Use shape-driven validation (actively maintained)
+        if schema.connect_link.spec < ConnectSpec::V0_4 {
+            // Legacy path for v0.1/v0.2 compatibility
+            self.type_check_legacy(schema)
+        } else {
+            // Modern path for v0.3+
+            self.type_check_shape_based(schema, input_shape)
+        }
+    }
+
+    /// Shape-based type checking for v0.3+ (actively maintained)
+    fn type_check_shape_based(
+        self,
+        schema: &SchemaInfo,
+        input_shape: Option<Shape>,
+    ) -> Result<Vec<(Name, Name)>, Message> {
+        let coordinate = self.coordinate.connect;
+        let shape = match input_shape {
+            Some(input_shape) => self.output_shape(input_shape),
+            None => self.parsed.shape(),
+        };
+
+        match coordinate.element {
+            ConnectedElement::Field {
+                parent_type,
+                field_def,
+                ..
+            } => {
+                let return_type_name = field_def.ty.inner_named_type();
+                let Some(return_type_ref) = SchemaTypeRef::new(schema, return_type_name) else {
+                    // Scalar or unknown type - no fields to validate
+                    return Ok(Vec::new());
+                };
+
+                let concrete_type_refs = match return_type_ref.extended() {
+                    ExtendedType::Object(_) => vec![return_type_ref],
+
+                    ExtendedType::Interface(interface_type) => schema
+                        .types
+                        .values()
+                        .filter_map(|t| {
+                            if let ExtendedType::Object(o) = t {
+                                if o.implements_interfaces.contains(&interface_type.name) {
+                                    SchemaTypeRef::new(schema, &o.name)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+
+                    ExtendedType::Union(union_type) => union_type
+                        .members
+                        .iter()
+                        .filter_map(|member_name| SchemaTypeRef::new(schema, member_name))
+                        .collect(),
+
+                    _ => {
+                        return Ok(Vec::new());
+                    }
+                };
+
+                if concrete_type_refs.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let mut validator = SelectionValidator::new(
+                    schema,
+                    PathPart::Root(parent_type),
+                    &self.node,
+                    self.coordinate,
+                );
+
+                // Add the connector field to the initial path for field connectors
+                validator.path.push(PathPart::Field {
+                    definition: field_def,
+                    ty: parent_type,
+                });
+
+                // Clear seen_fields for this connector
+                validator.seen_fields.clear();
+
+                for concrete_type_ref in concrete_type_refs {
+                    // Use the new shape-based walk method for each concrete type
+                    validator.walk_selection_with_shape(concrete_type_ref, &shape)?;
+                }
+
+                Ok(validator.seen_fields)
+            }
+
+            ConnectedElement::Type { type_ref } => {
+                if self.parsed.next_subselection().is_none() {
+                    // TODO: Validate scalar selections
+                    return Ok(Vec::new());
+                }
+
+                if !type_ref.is_object() {
+                    return Err(Message {
+                        code: Code::GraphQLError,
+                        message: format!(
+                            "Root type definition {} is not an object type",
+                            type_ref.name()
+                        ),
+                        locations: vec![],
+                    });
+                }
+
+                let mut validator = SelectionValidator::new(
+                    schema,
+                    PathPart::Root(type_ref),
+                    &self.node,
+                    self.coordinate,
+                );
+
+                // Clear seen_fields for this connector
+                validator.seen_fields.clear();
+
+                // Use the new shape-based walk method
+                validator.walk_selection_with_shape(type_ref, &shape)?;
+                Ok(validator.seen_fields)
+            }
+        }
+    }
+
+    pub(super) fn variables(&self) -> impl Iterator<Item = Namespace> + '_ {
+        self.parsed
+            .variable_references()
+            .map(|var_ref| var_ref.namespace.namespace)
+    }
+
+    /// Diagnose a *requestless* `@connect` directive — one that specifies no
+    /// transport (`http:` is absent; no other transport argument exists yet) —
+    /// whose `selection` nevertheless reads request-phase data: the response
+    /// body (the implicit `$root`), the response status (`$status`), or the
+    /// response headers (`$response`). Without a transport, none of those are
+    /// bound at runtime: the response body is synthesized as the empty object
+    /// `{}` and `$status` / `$response` are never populated, so the offending
+    /// paths would silently produce `null`.
+    ///
+    /// The wording is transport-agnostic on purpose. `$root` is the implicit
+    /// "the data the transport returned," not "the HTTP response body" — when
+    /// a future `sql:` (or other) transport joins `http:`, the same code keeps
+    /// describing the same condition without needing a parallel HTTP-specific
+    /// variant. The error message says "transport" rather than "HTTP" for the
+    /// same reason.
+    ///
+    /// `$request` is intentionally absent from the disallowed list: it refers
+    /// to the router's incoming GraphQL request, not to anything the connector
+    /// itself fetched. `handle_mapping_only_response` in `runtime::responses`
+    /// threads `client_headers` through to `$request` regardless of whether
+    /// the connector performs a transport call.
+    pub(super) fn validate_requestless_consumption(&self, schema: &SchemaInfo) -> Vec<Message> {
+        // Cloning is acceptable here: this runs once per `@connect` directive
+        // during validation, not on any hot path, and the analysis machinery
+        // is designed to be cheap after a one-shot wrap.
+        let analysis = SelectionAnalysis::new(self.parsed.clone());
+        let consumption = analysis.consumption();
+
+        // Each entry is (namespace, human-readable description of the
+        // request-phase data it exposes). Order is deterministic so the
+        // resulting error list is stable across runs.
+        const REQUEST_PHASE_NAMESPACES: &[(&str, &str)] = &[
+            ("$root", "the response body"),
+            ("$status", "the response status"),
+            ("$response", "the response headers"),
+        ];
+
+        let mut messages = Vec::new();
+        for (namespace, description) in REQUEST_PHASE_NAMESPACES {
+            let Some(sub) = consumption.get(*namespace) else {
+                continue;
+            };
+            if sub.is_empty() && !sub.is_leaf() {
+                // Subtree was navigated through but nothing terminal was
+                // recorded — defensive guard; the analysis should not produce
+                // such empty-non-leaf entries at the top level.
+                continue;
+            }
+
+            // Collect every source range the analysis attributed to this
+            // namespace. `$root` is implicit (no `$root` token in source), so
+            // we always include descendant ranges to give the error a place
+            // to point at. The other namespaces appear textually, so their
+            // own `key_ranges` typically yield the variable-name range.
+            let mut ranges: Vec<Range<usize>> = consumption.key_ranges(namespace).collect();
+            collect_descendant_ranges(sub, &mut ranges);
+
+            let locations: Vec<_> = ranges
+                .into_iter()
+                .flat_map(|range| subslice_location(&self.node, range, schema))
+                .collect();
+
+            // Render the consumed subtree under the namespace so the error
+            // shows precisely *which* paths drove the diagnostic. For a bare
+            // reference (`$status` with no children) the subtree is an empty
+            // leaf; in that case the namespace name alone is the detail.
+            let details = if sub.is_empty() {
+                namespace.to_string()
+            } else {
+                format!("{namespace} {{ {sub} }}")
+            };
+
+            messages.push(Message {
+                code: Code::RequestlessSelectionUsesRequestData,
+                message: format!(
+                    "{coordinate}: selection consumes `{namespace}` \
+                     ({description}) but the directive has no transport \
+                     (no `http:`)\n\
+                     Details: {details}",
+                    coordinate = self.coordinate,
+                ),
+                locations,
+            });
+        }
+        messages
+    }
+
+    /// Legacy visitor-based type checking for v0.1/v0.2 (frozen, will be removed)
+    fn type_check_legacy(self, schema: &SchemaInfo) -> Result<Vec<(Name, Name)>, Message> {
+        let coordinate = self.coordinate.connect;
+
+        match coordinate.element {
+            ConnectedElement::Field {
+                parent_type,
+                field_def,
+                ..
+            } => {
+                // Get the return type's object node
+                let field_type_name = field_def.ty.inner_named_type();
+                let Some(return_type) = schema.types.get(field_type_name) else {
+                    // TODO: Validate scalar return types
+                    return Ok(Vec::new());
+                };
+                let ExtendedType::Object(return_type_obj) = return_type else {
+                    return Ok(Vec::new());
+                };
+
+                let Some(sub_selection) = self.parsed.next_subselection() else {
+                    // TODO: Validate scalar selections
+                    return Ok(Vec::new());
+                };
+
+                // Get parent type's object node
+                let ExtendedType::Object(parent_type_obj) = parent_type.extended() else {
+                    return Err(Message {
+                        code: Code::GraphQLError,
+                        message: "Parent type is not an object type".to_string(),
+                        locations: vec![],
+                    });
+                };
+
+                let group = LegacyGroup {
+                    selection: sub_selection,
+                    ty: return_type_obj,
+                    definition: Some(field_def),
+                };
+
+                LegacySelectionValidator::new(
+                    schema,
+                    LegacyPathPart::Root(parent_type_obj),
+                    &self.node,
+                    self.coordinate,
+                )
+                .walk(group)
+                .map(|validator| validator.seen_fields)
+            }
+
+            ConnectedElement::Type { type_ref } => {
+                let Some(sub_selection) = self.parsed.next_subselection() else {
+                    // TODO: Validate scalar selections
+                    return Ok(Vec::new());
+                };
+
+                let ExtendedType::Object(type_obj) = type_ref.extended() else {
+                    return Err(Message {
+                        code: Code::GraphQLError,
+                        message: "Type definition is not an object type".to_string(),
+                        locations: vec![],
+                    });
+                };
+
+                let group = LegacyGroup {
+                    selection: sub_selection,
+                    ty: type_obj,
+                    definition: None,
+                };
+
+                LegacySelectionValidator::new(
+                    schema,
+                    LegacyPathPart::Root(type_obj),
+                    &self.node,
+                    self.coordinate,
+                )
+                .walk(group)
+                .map(|validator| validator.seen_fields)
+            }
+        }
+    }
+}
+
+/// Collect the source-byte ranges of every key reachable from `trie`,
+/// including its own top-level keys and all descendants. Used by
+/// [`Selection::validate_requestless_consumption`] to give the diagnostic a
+/// place to point at when the offending namespace (e.g. `$root`) does not
+/// appear textually in the selection but its consumed subpaths do.
+fn collect_descendant_ranges(trie: &SelectionTrie, out: &mut Vec<Range<usize>>) {
+    for key in trie.keys() {
+        out.extend(trie.key_ranges(key));
+    }
+    for (_, sub) in trie.iter() {
+        collect_descendant_ranges(sub, out);
+    }
+}
+
+/// Validate variable references in a JSON Selection
+pub(super) fn validate_selection_variables<'a>(
+    variable_resolver: &VariableResolver,
+    coordinate: impl Display,
+    selection_str: &Node<Value>,
+    schema: &SchemaInfo,
+    context: VariableContext,
+    variable_paths: impl IntoIterator<Item = &'a PathSelection>,
+    local_var_names: &IndexSet<String>,
+) -> Result<(), Message> {
+    for path in variable_paths {
+        if let Some(reference) = path.variable_reference() {
+            variable_resolver
+                .resolve(&reference, selection_str)
+                .map_err(|mut err| {
+                    err.message = format!("In {coordinate}: {message}", message = err.message);
+                    err
+                })?;
+        } else if let Some(reference) = path.variable_reference::<String>() {
+            let locals_suffix = {
+                let local_var_vec = local_var_names.iter().cloned().collect::<Vec<_>>();
+                if local_var_vec.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(", {}", local_var_vec.join(", "))
+                }
+            };
+
+            return Err(Message {
+                code: context.error_code(),
+                message: format!(
+                    "In {coordinate}: unknown variable `{namespace}`, must be one of {available}{locals}",
+                    namespace = reference.namespace.namespace.as_str(),
+                    available = context.namespaces_joined(),
+                    locals = locals_suffix,
+                ),
+                locations: reference
+                    .namespace
+                    .location
+                    .iter()
+                    .flat_map(|range| subslice_location(selection_str, range.clone(), schema))
+                    .collect(),
+            });
+        }
+    }
+    Ok(())
+}
+
+struct SelectionValidator<'schema> {
+    schema: &'schema SchemaInfo<'schema>,
+    root: PathPart<'schema>,
+    path: Vec<PathPart<'schema>>,
+    node: &'schema Node<Value>,
+    coordinate: SelectionCoordinate<'schema>,
+    seen_fields: Vec<(Name, Name)>,
+}
+
+impl<'schema> SelectionValidator<'schema> {
+    const fn new(
+        schema: &'schema SchemaInfo<'schema>,
+        root: PathPart<'schema>,
+        node: &'schema Node<Value>,
+        coordinate: SelectionCoordinate<'schema>,
+    ) -> Self {
+        Self {
+            schema,
+            root,
+            path: Vec::new(),
+            node,
+            coordinate,
+            seen_fields: Vec::new(),
+        }
+    }
+}
+
+impl<'schema> SelectionValidator<'schema> {
+    fn check_for_circular_reference(
+        &self,
+        field_def: &Node<FieldDefinition>,
+        current_ty: SchemaTypeRef<'schema>,
+    ) -> Result<(), Message> {
+        for (depth, seen_part) in self.path_with_root().enumerate() {
+            let (seen_type, ancestor_field) = match seen_part {
+                PathPart::Root(root) => (root, None),
+                PathPart::Field { ty, definition } => (ty, Some(definition)),
+            };
+
+            if seen_type == current_ty {
+                return Err(Message {
+                    code: Code::CircularReference,
+                    message: format!(
+                        "Circular reference detected in {coordinate}: type `{type_name}` appears more than once in `{selection_path}`. For more information, see https://go.apollo.dev/connectors/limitations#circular-references",
+                        coordinate = self.coordinate,
+                        selection_path = self
+                            .path_with_root()
+                            .map(|part| match part {
+                                PathPart::Root(ty) => ty.name().as_str(),
+                                PathPart::Field { definition, .. } => definition.name.as_str(),
+                            })
+                            .join("."),
+                        type_name = current_ty.name(),
+                    ),
+                    // TODO: make a helper function for easier range collection
+                    locations: if depth > 1 {
+                        ancestor_field
+                            .and_then(|def| def.line_column_range(&self.schema.sources))
+                            .into_iter()
+                            .chain(field_def.line_column_range(&self.schema.sources))
+                            .collect()
+                    } else {
+                        field_def
+                            .line_column_range(&self.schema.sources)
+                            .into_iter()
+                            .collect()
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn get_shape_locations<'a>(
+        &self,
+        shape_locations: impl IntoIterator<Item = &'a Location>,
+    ) -> Vec<Range<LineColumn>> {
+        shape_locations
+            .into_iter()
+            .filter_map(|location| {
+                // GraphQL locations are `graphql:<path>` `SourceId::Other` values
+                // since shape 0.9.0; `source_file` returns `None` for the
+                // JSONSelection ids, which is how the two are told apart here.
+                if let Some(source) = source_file(self.schema, &location.source_id) {
+                    source.get_line_column_range(location.span.clone())
+                } else {
+                    // JSONSelection location - convert to range in the selection string
+                    subslice_location(self.node, location.span.clone(), self.schema)
+                }
+            })
+            .collect()
+    }
+
+    fn path_with_root(&self) -> impl Iterator<Item = PathPart<'_>> {
+        once(self.root).chain(self.path.iter().copied())
+    }
+
+    /// Whether a selected field's value shape implies a group selection
+    /// (`field { ... }`), which requires the field's GraphQL type to be an object.
+    ///
+    /// An `Object` shape is a group selection. An `Array` shape is a group
+    /// selection only when its element shape is itself a group — i.e. a list of
+    /// objects. A list of scalars (for example `data: data->map(@->map(@->toString))`
+    /// over a `[[String]]` field) is a scalar projection, not a group selection,
+    /// so it must not require an object type.
+    fn shape_implies_group_selection(shape: &Shape) -> bool {
+        match shape.case() {
+            ShapeCase::Object { .. } => true,
+            ShapeCase::Array { prefix, tail } => {
+                prefix.iter().any(Self::shape_implies_group_selection)
+                    || Self::shape_implies_group_selection(tail)
+            }
+            ShapeCase::One(shapes) => shapes.iter().any(Self::shape_implies_group_selection),
+            ShapeCase::All(shapes) => shapes.iter().any(Self::shape_implies_group_selection),
+            // `ShapeCase::Name` is a placeholder; scalars/leaves are not groups.
+            _ => false,
+        }
+    }
+
+    fn walk_selection_with_shape(
+        &mut self,
+        type_ref: SchemaTypeRef<'schema>,
+        shape: &Shape,
+    ) -> Result<bool, Message> {
+        // Shape errors are carried as metadata rather than a dedicated
+        // `ShapeCase::Error` variant, so they ride on a shape that still has a
+        // partial structure. Report the first one and stop: descending into a
+        // structure we already know is partial would emit spurious
+        // `SelectedFieldNotFound`-style errors on top of the real failure.
+        //
+        // Returning `Ok(false)` here instead would credit no fields as
+        // seen, which does not suppress the diagnostic so much as replace it:
+        // the selected fields then look unresolved by any connector, and the
+        // reader is told the wrong thing about a different field.
+        if let Some(error) = shape.own_errors().next() {
+            return Err(Message {
+                code: Code::InvalidSelection,
+                message: error.message.clone(),
+                locations: self.get_shape_locations(shape.locations()),
+            });
+        }
+        match shape.case() {
+            ShapeCase::Object { fields, .. } => {
+                for (field_name, field_shape) in fields.iter() {
+                    if field_name == "__typename" {
+                        continue;
+                    }
+
+                    // A field whose shape is an error means the mapping that
+                    // produces it is malformed: a method called wrongly, most
+                    // often. The shape functions already diagnosed it precisely
+                    // (`Unknown (err "Method ->withWarning requires exactly
+                    // one argument, the value to record as the message, got
+                    // 0")`);
+                    // without this arm that diagnosis is computed and
+                    // discarded, the selection type-checks, and the author
+                    // finds out only when a request runs and the mapping
+                    // silently produces nothing. Reported here rather than by
+                    // the terminal error check below because an
+                    // error nested in an object never reaches that arm: the
+                    // walk treats a non-object field shape as a scalar leaf and
+                    // stops.
+                    if let Some(shape::Error { message }) = field_shape.own_errors().next() {
+                        return Err(Message {
+                            code: Code::InvalidSelection,
+                            message: format!(
+                                "{} contains an invalid mapping for field `{field_name}`: {message}",
+                                self.coordinate,
+                            ),
+                            locations: self.get_shape_locations(field_shape.locations()),
+                        });
+                    }
+
+                    let fields_by_type_name = type_ref.get_fields(field_name.as_str());
+                    if fields_by_type_name.is_empty() {
+                        return Err(Message {
+                            code: Code::SelectedFieldNotFound,
+                            message: format!(
+                                "{} contains field `{field_name}`, which does not exist on `{}`.",
+                                self.coordinate,
+                                type_ref.name(),
+                            ),
+                            locations: self.get_shape_locations(field_shape.locations()),
+                        });
+                    }
+
+                    for (type_name, field_component) in fields_by_type_name.iter() {
+                        let field_def = &**field_component;
+
+                        // Shadowing the type_ref parameter with a concrete type reference.
+                        let Some(type_ref) = SchemaTypeRef::new(self.schema, type_name) else {
+                            continue;
+                        };
+
+                        // Add current field to path for nested traversal
+                        self.path.push(PathPart::Field {
+                            definition: field_def,
+                            ty: type_ref,
+                        });
+
+                        // Check for circular reference after adding field to path
+                        let inner_type_name = field_def.ty.inner_named_type();
+                        if let Some(field_type_ref) =
+                            SchemaTypeRef::new(self.schema, inner_type_name)
+                        {
+                            self.check_for_circular_reference(field_def, field_type_ref)?;
+                        }
+
+                        // Validate field without arguments
+                        if !field_def.arguments.is_empty() {
+                            let mut locations = self.get_shape_locations(field_shape.locations());
+                            // Also include field definition location from schema
+                            if let Some(def_location) =
+                                field_def.line_column_range(&self.schema.sources)
+                            {
+                                locations.push(def_location);
+                            }
+                            return Err(Message {
+                                code: Code::ConnectorsFieldWithArguments,
+                                message: format!(
+                                    "{coordinate} selects field `{parent_type}.{field_name}`, which has arguments. Only fields with a connector can have arguments.",
+                                    coordinate = self.coordinate,
+                                    parent_type = type_ref.name(),
+                                    field_name = field_name,
+                                ),
+                                locations,
+                            });
+                        }
+
+                        // Mark the field as seen (shape only contains selected fields)
+                        self.seen_fields
+                            .push((type_ref.name().clone(), field_def.name.clone()));
+
+                        // Check if this field has subselections (group selection).
+                        // An object shape (or a list of objects) is a group selection; a
+                        // list of scalars is a scalar projection, not a group selection.
+                        let has_subselection = Self::shape_implies_group_selection(field_shape);
+
+                        if let Some(field_type_ref) =
+                            SchemaTypeRef::new(self.schema, inner_type_name)
+                        {
+                            match (field_type_ref.extended(), has_subselection) {
+                                (ExtendedType::Object(_), true) => {
+                                    // Valid: object field with subselection
+                                    self.walk_selection_with_shape(field_type_ref, field_shape)?;
+                                }
+                                (ExtendedType::Union(union_type), true) => {
+                                    // Expand union to concrete member types and
+                                    // validate against each, mirroring the top-level
+                                    // expansion in type_check_shape_based.
+                                    let concrete_refs: Vec<_> = union_type
+                                        .members
+                                        .iter()
+                                        .filter_map(|member_name| {
+                                            SchemaTypeRef::new(self.schema, member_name)
+                                        })
+                                        .collect();
+                                    for concrete_ref in concrete_refs {
+                                        self.walk_selection_with_shape(concrete_ref, field_shape)?;
+                                    }
+                                }
+                                (ExtendedType::Interface(interface_type), true) => {
+                                    // Expand interface to concrete implementing
+                                    // types and validate against each.
+                                    let concrete_refs: Vec<_> = self
+                                        .schema
+                                        .types
+                                        .values()
+                                        .filter_map(|t| {
+                                            if let ExtendedType::Object(o) = t {
+                                                if o.implements_interfaces
+                                                    .contains(&interface_type.name)
+                                                {
+                                                    SchemaTypeRef::new(self.schema, &o.name)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    for concrete_ref in concrete_refs {
+                                        self.walk_selection_with_shape(concrete_ref, field_shape)?;
+                                    }
+                                }
+                                (_, true) => {
+                                    // Invalid: non-composite field with subselection (group selection)
+                                    return Err(Message {
+                                        code: Code::GroupSelectionIsNotObject,
+                                        message: format!(
+                                            "{} selects a group `{} {{}}`, but `{}.{}` is of type `{}` which is not an object.",
+                                            self.coordinate,
+                                            field_name,
+                                            type_ref.name(),
+                                            field_name,
+                                            inner_type_name,
+                                        ),
+                                        locations: self
+                                            .get_shape_locations(field_shape.locations()),
+                                    });
+                                }
+                                _ => {
+                                    // Valid: scalar field without subselection, or object field without subselection
+                                }
+                            }
+                        }
+
+                        self.path.pop();
+                    }
+                }
+                Ok(!self.seen_fields.is_empty())
+            }
+            ShapeCase::One(shapes) => {
+                // For union shapes, we need to collect seen fields from ALL branches
+                // that succeed, not just the first one. This is because different
+                // branches may resolve different fields (e.g., in a ->match expression
+                // that returns different object types for interface implementations).
+                let mut any_seen = false;
+                let mut all_errors = Vec::new();
+
+                for (index, member_shape) in shapes.iter().enumerate() {
+                    match self.walk_selection_with_shape(type_ref, member_shape) {
+                        Ok(seen) => any_seen |= seen,
+                        Err(e) => all_errors.push((index, e)),
+                    }
+                }
+
+                // If at least one branch succeeded, return all collected fields
+                if any_seen || all_errors.is_empty() {
+                    Ok(any_seen)
+                } else {
+                    // If no shape worked, provide a comprehensive error
+                    Err(Message {
+                        code: Code::GraphQLError,
+                        message: format!(
+                            "No matching shape found for selection. Attempted {} different shape variations and all failed.",
+                            all_errors.len()
+                        ),
+                        // Optionally, include details from the first error
+                        locations: all_errors
+                            .first()
+                            .map(|(_, e)| e.locations.clone())
+                            .unwrap_or_default(),
+                    })
+                }
+            }
+            ShapeCase::Array { prefix, tail } => {
+                // A list-valued shape — e.g. produced by methods with statically known
+                // list outputs like `->entries` — validates each item shape against the
+                // same type: the caller already unwrapped GraphQL list types to their
+                // inner named type via `inner_named_type()`. Without this arm, fields
+                // selected beneath such methods were never marked as seen, producing
+                // spurious CONNECTORS_UNRESOLVED_FIELD errors (e.g. `->entries { key value }`
+                // against `[FooEntry]` left `FooEntry.key`/`FooEntry.value` unresolved).
+                let mut any_seen = false;
+                for item_shape in prefix {
+                    any_seen |= self.walk_selection_with_shape(type_ref, item_shape)?;
+                }
+                if !tail.is_none() {
+                    any_seen |= self.walk_selection_with_shape(type_ref, tail)?;
+                }
+                Ok(any_seen)
+            }
+            ShapeCase::All(shapes) => {
+                // An intersection shape (e.g. `IntfA & IntfB`, or merged records):
+                // the value simultaneously satisfies every member, so the selected
+                // fields are the union across members and each must validate against
+                // `type_ref`. Walk every member and accumulate, propagating errors —
+                // unlike `One` (a union of alternatives), an intersection member that
+                // fails to validate is a genuine error, not a discarded branch.
+                let mut any_seen = false;
+                for member_shape in shapes.iter() {
+                    any_seen |= self.walk_selection_with_shape(type_ref, member_shape)?;
+                }
+                Ok(any_seen)
+            }
+            // Structureless shapes expose no selectable GraphQL fields, so they
+            // contribute nothing to `seen_fields`. These are listed explicitly,
+            // rather than behind a `_` catch-all, so that introducing a new
+            // `ShapeCase` variant becomes a compile error here — forcing a
+            // deliberate decision instead of silently dropping fields (the root
+            // cause of the `->entries` bug the `Array` arm above fixes).
+            ShapeCase::Bool(_)
+            | ShapeCase::String(_)
+            | ShapeCase::Int(_)
+            | ShapeCase::Float
+            | ShapeCase::Null
+            | ShapeCase::None => Ok(false),
+            // Opaque / deferred shapes whose structure is not statically known
+            // here. We preserve the existing behavior of contributing nothing;
+            // crucially we do NOT treat them as resolving every field, which could
+            // mask genuine `CONNECTORS_UNRESOLVED_FIELD` errors. A structure-aware
+            // policy for these is left to a follow-up.
+            ShapeCase::Name(_, _) | ShapeCase::Unknown => Ok(false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PathPart<'a> {
+    // Query, Mutation, Subscription OR an Entity type
+    Root(SchemaTypeRef<'a>),
+    Field {
+        definition: &'a Node<FieldDefinition>,
+        ty: SchemaTypeRef<'a>,
+    },
+}
+
+/// Legacy validation structures for v0.1/v0.2 (frozen, will be removed)
+/// These mirror the old visitor-based validation approach.
+use apollo_compiler::schema::ObjectType;
+
+struct LegacySelectionValidator<'schema> {
+    schema: &'schema SchemaInfo<'schema>,
+    root: LegacyPathPart<'schema>,
+    path: Vec<LegacyPathPart<'schema>>,
+    node: &'schema Node<Value>,
+    coordinate: SelectionCoordinate<'schema>,
+    seen_fields: Vec<(Name, Name)>,
+}
+
+impl<'schema> LegacySelectionValidator<'schema> {
+    const fn new(
+        schema: &'schema SchemaInfo<'schema>,
+        root: LegacyPathPart<'schema>,
+        node: &'schema Node<Value>,
+        coordinate: SelectionCoordinate<'schema>,
+    ) -> Self {
+        Self {
+            schema,
+            root,
+            path: Vec::new(),
+            node,
+            coordinate,
+            seen_fields: Vec::new(),
+        }
+    }
+
+    fn check_for_circular_reference(
+        &self,
+        field: LegacyField,
+        object: &Node<ObjectType>,
+    ) -> Result<(), Message> {
+        for (depth, seen_part) in self.path_with_root().enumerate() {
+            let (seen_type, ancestor_field) = match seen_part {
+                LegacyPathPart::Root(root) => (root, None),
+                LegacyPathPart::Field { ty, definition } => (ty, Some(definition)),
+            };
+
+            if seen_type == object {
+                return Err(Message {
+                    code: Code::CircularReference,
+                    message: format!(
+                        "Circular reference detected in {coordinate}: type `{new_object_name}` appears more than once in `{selection_path}`. For more information, see https://go.apollo.dev/connectors/limitations#circular-references",
+                        coordinate = self.coordinate,
+                        selection_path = self.path_string(field.definition),
+                        new_object_name = object.name,
+                    ),
+                    locations: self
+                        .get_range_location(field.inner_range())
+                        .chain(if depth > 1 {
+                            ancestor_field
+                                .and_then(|def| def.line_column_range(&self.schema.sources))
+                        } else {
+                            None
+                        })
+                        .chain(field.definition.line_column_range(&self.schema.sources))
+                        .collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn get_selection_location(
+        &self,
+        selection: &impl Ranged,
+    ) -> impl Iterator<Item = Range<LineColumn>> {
+        selection
+            .range()
+            .and_then(|range| subslice_location(self.node, range, self.schema))
+            .into_iter()
+    }
+
+    fn get_range_location(
+        &self,
+        selection: Option<Range<usize>>,
+    ) -> impl Iterator<Item = Range<LineColumn>> {
+        selection
+            .as_ref()
+            .and_then(|range| subslice_location(self.node, range.clone(), self.schema))
+            .into_iter()
+    }
+
+    fn path_with_root(&self) -> impl Iterator<Item = LegacyPathPart<'_>> {
+        once(self.root).chain(self.path.iter().copied())
+    }
+
+    fn path_string(&self, tail: &FieldDefinition) -> String {
+        self.path_with_root()
+            .map(|part| match part {
+                LegacyPathPart::Root(ty) => ty.name.as_str(),
+                LegacyPathPart::Field { definition, .. } => definition.name.as_str(),
+            })
+            .chain(once(tail.name.as_str()))
+            .join(".")
+    }
+
+    fn last_field(&self) -> &LegacyPathPart<'_> {
+        self.path.last().unwrap_or(&self.root)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LegacyField<'schema> {
+    selection: &'schema NamedSelection,
+    definition: &'schema Node<FieldDefinition>,
+}
+
+impl<'schema> LegacyField<'schema> {
+    fn next_subselection(&self) -> Option<&'schema SubSelection> {
+        self.selection.next_subselection()
+    }
+
+    fn inner_range(&self) -> Option<Range<usize>> {
+        self.selection.range()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyPathPart<'a> {
+    Root(&'a Node<ObjectType>),
+    Field {
+        definition: &'a Node<FieldDefinition>,
+        ty: &'a Node<ObjectType>,
+    },
+}
+
+impl LegacyPathPart<'_> {
+    const fn ty(&self) -> &Node<ObjectType> {
+        match self {
+            LegacyPathPart::Root(ty) => ty,
+            LegacyPathPart::Field { ty, .. } => ty,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LegacyGroup<'schema> {
+    selection: &'schema SubSelection,
+    ty: &'schema Node<ObjectType>,
+    definition: Option<&'schema Node<FieldDefinition>>,
+}
+
+impl<'schema> GroupVisitor<LegacyGroup<'schema>, LegacyField<'schema>>
+    for LegacySelectionValidator<'schema>
+{
+    fn try_get_group_for_field(
+        &self,
+        field: &LegacyField<'schema>,
+    ) -> Result<Option<LegacyGroup<'schema>>, Self::Error> {
+        let Some(selection) = field.next_subselection() else {
+            return Ok(None);
+        };
+        let Some(ty) = self
+            .schema
+            .get_object(field.definition.ty.inner_named_type())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(LegacyGroup {
+            selection,
+            ty,
+            definition: Some(field.definition),
+        }))
+    }
+
+    fn enter_group(
+        &mut self,
+        group: &LegacyGroup<'schema>,
+    ) -> Result<Vec<LegacyField<'schema>>, Self::Error> {
+        if let Some(definition) = group.definition {
+            self.path.push(LegacyPathPart::Field {
+                definition,
+                ty: group.ty,
+            });
+        }
+
+        group.selection.selections_iter().flat_map(|selection| {
+            let mut results = Vec::new();
+            for field_name in selection.names() {
+                if let Some(definition) = group.ty.fields.get(field_name) {
+                    results.push(Ok(LegacyField {
+                        selection,
+                        definition,
+                    }));
+                } else if field_name != "__typename" {
+                    results.push(Err(Message {
+                        code: Code::SelectedFieldNotFound,
+                        message: format!(
+                            "{coordinate} contains field `{field_name}`, which does not exist on `{parent_type}`.",
+                            coordinate = self.coordinate,
+                            parent_type = group.ty.name,
+                        ),
+                        locations: self.get_selection_location(selection).collect(),
+                    }));
+                }
+            }
+            results
+        }).collect()
+    }
+
+    fn exit_group(&mut self) -> Result<(), Self::Error> {
+        self.path.pop();
+        Ok(())
+    }
+}
+
+impl<'schema> FieldVisitor<LegacyField<'schema>> for LegacySelectionValidator<'schema> {
+    type Error = Message;
+
+    fn visit(&mut self, field: LegacyField<'schema>) -> Result<(), Self::Error> {
+        let field_name = field.definition.name.as_str();
+        let type_name = field.definition.ty.inner_named_type();
+        let coordinate = self.coordinate;
+        let field_type = self.schema.types.get(type_name).ok_or_else(|| Message {
+            code: Code::GraphQLError,
+            message: format!(
+                "{coordinate} contains field `{field_name}`, which has undefined type `{type_name}`.",
+            ),
+            locations: self.get_range_location(field.inner_range()).collect(),
+        })?;
+        let is_group = field.next_subselection().is_some();
+
+        self.seen_fields.push((
+            self.last_field().ty().name.clone(),
+            field.definition.name.clone(),
+        ));
+
+        if !field.definition.arguments.is_empty() {
+            return Err(Message {
+                code: Code::ConnectorsFieldWithArguments,
+                message: format!(
+                    "{coordinate} selects field `{parent_type}.{field_name}`, which has arguments. Only fields with a connector can have arguments.",
+                    parent_type = self.last_field().ty().name,
+                ),
+                locations: self
+                    .get_range_location(field.inner_range())
+                    .chain(field.definition.line_column_range(&self.schema.sources))
+                    .collect(),
+            });
+        }
+
+        match (field_type, is_group) {
+            (ExtendedType::Object(object), true) => {
+                self.check_for_circular_reference(field, object)
+            }
+            (_, true) => Err(Message {
+                code: Code::GroupSelectionIsNotObject,
+                message: format!(
+                    "{coordinate} selects a group `{field_name}{{}}`, but `{parent_type}.{field_name}` is of type `{type_name}` which is not an object.",
+                    parent_type = self.last_field().ty().name,
+                ),
+                locations: self
+                    .get_range_location(field.inner_range())
+                    .chain(field.definition.line_column_range(&self.schema.sources))
+                    .collect(),
+            }),
+            (ExtendedType::Object(_), false) => Err(Message {
+                code: Code::GroupSelectionRequiredForObject,
+                message: format!(
+                    "`{parent_type}.{field_name}` is an object, so {coordinate} must select a group `{field_name}{{}}`.",
+                    parent_type = self.last_field().ty().name,
+                ),
+                locations: self
+                    .get_range_location(field.inner_range())
+                    .chain(field.definition.line_column_range(&self.schema.sources))
+                    .collect(),
+            }),
+            (_, false) => Ok(()),
+        }
+    }
+}

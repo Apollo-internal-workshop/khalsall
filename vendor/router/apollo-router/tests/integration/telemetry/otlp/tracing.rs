@@ -1,0 +1,961 @@
+use std::collections::HashMap;
+
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
+use prost::Message;
+use tower::BoxError;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+use super::mock_otlp_server;
+use super::mock_otlp_server_delayed;
+use crate::integration::IntegrationTest;
+use crate::integration::common::Query;
+use crate::integration::common::Telemetry;
+use crate::integration::common::graph_os_enabled;
+use crate::integration::telemetry::TraceSpec;
+use crate::integration::telemetry::unique_trace_id;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_trace_error() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server_delayed().await;
+    let config = include_str!("../fixtures/otlp_invalid_endpoint.router.yaml");
+
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+    router.assert_metrics_contains(r#"apollo_router_telemetry_batch_processor_errors_total{error="channel full",name="otlp-tracing",otel_scope_name="apollo/router"}"#, None).await;
+    router.graceful_shutdown().await;
+
+    drop(mock_server);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_basic() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    for _ in 0..2 {
+        TraceSpec::builder()
+            .operation_name("ExampleQuery")
+            .services(["client", "router", "subgraph"].into())
+            .span_names(
+                [
+                    "query_planning",
+                    "client_request",
+                    "ExampleQuery__products__0",
+                    "fetch",
+                    "execution",
+                    "query ExampleQuery",
+                    "subgraph server",
+                    "parse_query",
+                    "http_request",
+                ]
+                .into(),
+            )
+            .subgraph_sampled(true)
+            .build()
+            .validate_otlp_trace(&mut router, &mock_server, Query::default())
+            .await?;
+        TraceSpec::builder()
+            .service("router")
+            .build()
+            .validate_otlp_metrics(&mock_server)
+            .await?;
+        router.touch_config().await;
+        router.assert_reloaded().await;
+        router.assert_log_not_contained("OpenTelemetry metric error occurred: Metrics error: metrics provider already shut down");
+    }
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+/// SIGTERM must produce a clean exit, not a panic on the way out.
+///
+/// The OTel batch span processor runs its background loop on a `spawn_blocking` thread via
+/// `Handle::block_on` (see `BlockingSafeTokioRuntime`), and that loop only terminates on an
+/// explicit shutdown — a closed message channel is not enough, because its interval ticker keeps
+/// the stream alive. Nothing dropped the last clone of the installed tracer provider, so the
+/// processor was still polling `tokio::time::sleep` when the runtime was torn down, tripping
+/// tokio's `A Tokio 1.x context was found, but it is being shutdown` assert. The panic handler
+/// then turned an otherwise clean SIGTERM into `exit(1)`.
+///
+/// `assert_shutdown` ignores the exit code, which is why the rest of the suite never caught this.
+///
+/// The same shutdown is also what flushes the batch processor, so this covers the other half of
+/// the fix: the fixture's tracing `scheduled_delay` is far enough out that the spans from the
+/// query below cannot be exported on the schedule, only by the flush at exit.
+///
+/// Unix only: `graceful_shutdown` is a SIGTERM, which Windows has no equivalent of - there it
+/// falls back to a hard kill, and a killed process never reports a successful exit status.
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_graceful_shutdown_exits_cleanly() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_shutdown_flush.router.yaml");
+    // Deliberately no `.telemetry(Telemetry::Otlp { .. })`: that would point the *harness's* own
+    // tracer at the same collector on a 10ms schedule, and its exports would satisfy the
+    // post-shutdown assertion below without the router having flushed anything.
+    let mut router = IntegrationTest::builder()
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+    // Put spans through the batch processor so its background worker is running by the time we
+    // signal, rather than idling before its first tick.
+    router.execute_default_query().await;
+    let exports_before_shutdown = trace_export_count(&mock_server).await;
+
+    router.graceful_shutdown().await;
+
+    router.read_logs();
+    router.assert_clean_exit();
+    router.assert_log_not_contained("it is being shutdown");
+    // The router's stdout is forwarded by a background pump task, so the last lines it writes
+    // before `exit()` can still be in flight when the process is reaped. Drain for a bounded
+    // window as well, so the check above cannot pass merely because the panic line had not
+    // arrived yet.
+    router.assert_log_not_contains("it is being shutdown").await;
+
+    assert!(
+        trace_export_count(&mock_server).await > exports_before_shutdown,
+        "no spans were exported during shutdown: the spans the batch processor had buffered \
+         when SIGTERM arrived were dropped instead of flushed"
+    );
+
+    Ok(())
+}
+
+/// Number of OTLP trace export requests the collector has received so far.
+#[cfg(target_family = "unix")]
+async fn trace_export_count(mock_server: &wiremock::MockServer) -> usize {
+    mock_server
+        .received_requests()
+        .await
+        .expect("mock server records requests")
+        .iter()
+        .filter(|request| request.url.path().ends_with("/traces"))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_resources() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .resource("env", "local1")
+        .resource("service.version", "router_version_override")
+        .resource("service.name", "router")
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_otlp_tracing_reload() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(0..).await;
+    let config_initial = include_str!("../fixtures/otlp_tracing.router.yaml");
+
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config_initial)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Verify initial resource env=local1
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .resource("env", "local1")
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+
+    // This config will NOT reload tracing as the config did not change
+    router.update_config(config_initial).await;
+    router.touch_config().await;
+    router.assert_reloaded().await;
+    router.assert_log_not_contained("OpenTelemetry trace error occurred");
+
+    // Execute query and verify resource is still local1
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .resource("env", "local1")
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+
+    // This config will force a reload as it changes the resource env value
+    let config_reload = include_str!("../fixtures/otlp_tracing_reload.router.yaml");
+    router.update_config(config_reload).await;
+    router.assert_reloaded().await;
+
+    // Execute query and verify resource changed to local2
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .resource("env", "local2")
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_otlp_request_with_datadog_propagator() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_propagation.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_otlp_request_with_datadog_propagator_no_agent() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_propagation_no_agent.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).build(),
+        )
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_otlp_request_with_trace_context_propagator_with_datadog() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config =
+        include_str!("../fixtures/otlp_datadog_request_with_trace_context_propagator.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).build(),
+        )
+        .await?;
+    // ---------------------- trace context propagation
+    // Testing for a trace containing the right tracestate with m and psr for DD and a sampled trace, so it should be sent to the otlp exporter with sampling priority set to 1
+    // And it should also send the trace to subgraph as the trace is sampled
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder()
+                .traced(true)
+                .header(
+                    "traceparent",
+                    format!("00-{}-b7ad6b7169203331-01", unique_trace_id()),
+                )
+                .header("tracestate", "m=1,psr=1")
+                .build(),
+        )
+        .await?;
+    // ----------------------
+    // Testing for a trace containing the right tracestate with m and psr for DD and an unsampled trace, so it should be sent to the otlp exporter with sampling priority set to 0
+    // But it shouldn't send the trace to subgraph as the trace is originally not sampled, the main goal is to measure it at the DD agent level
+    TraceSpec::builder()
+        .services(["router"].into())
+        .priority_sampled("0")
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder()
+                .traced(false)
+                .header(
+                    "traceparent",
+                    format!("00-{}-b7ad6b7169203331-02", unique_trace_id()),
+                )
+                .header("tracestate", "m=1,psr=0")
+                .build(),
+        )
+        .await?;
+    // ----------------------
+    // Testing for a trace containing a tracestate m and psr with psr set to 1 for DD and an unsampled trace, so it should be sent to the otlp exporter with sampling priority set to 1
+    // It should not send the trace to the subgraph as we didn't use the datadog propagator and therefore the trace will remain unsampled.
+    TraceSpec::builder()
+        .services(["router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder()
+                .traced(false)
+                .header(
+                    "traceparent",
+                    format!("00-{}-b7ad6b7169203331-03", unique_trace_id()),
+                )
+                .header("tracestate", "m=1,psr=1")
+                .build(),
+        )
+        .await?;
+
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_untraced_request_no_sample_datadog_agent() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_agent_no_sample.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["router"].into())
+        .priority_sampled("0")
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(false).build(),
+        )
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_untraced_request_sample_datadog_agent() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_agent_sample.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(false).build(),
+        )
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_untraced_request_sample_datadog_agent_unsampled() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_agent_sample_no_sample.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["router"].into())
+        .priority_sampled("0")
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(false).build(),
+        )
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_priority_sampling_propagated() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_propagation.router.yaml");
+    let mut router = IntegrationTest::builder()
+        // We're using datadog propagation as this is what we are trying to test.
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // Parent based sampling. psr MUST be populated with the value that we pass in.
+    TraceSpec::builder()
+        .services(["client", "router"].into())
+        .priority_sampled("-1")
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("-1").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router"].into())
+        .priority_sampled("0")
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("0").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("1").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("2")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("2").build(),
+        )
+        .await?;
+
+    // No psr was passed in the router is free to set it. This will be 1 as we are going to sample here.
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).build(),
+        )
+        .await?;
+
+    router.graceful_shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_priority_sampling_parent_sampler_very_small_no_parent_no_agent_sampling()
+-> Result<(), BoxError> {
+    // Note that there is a very small chance this test will fail. We are trying to test a non-zero sampler.
+    let mock_server = mock_otlp_server(0..).await;
+
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let config = include_str!(
+        "../fixtures/otlp_parent_sampler_very_small_no_parent_no_agent_sampling.router.yaml"
+    );
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // The router should not respect upstream but also almost never sample if left to its own devices.
+
+    TraceSpec::builder()
+        .services(["client"].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).build(),
+        )
+        .await?;
+
+    TraceSpec::builder()
+        .services(["client"].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().psr("-1").traced(true).build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client"].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().psr("0").traced(true).build(),
+        )
+        .await?;
+
+    TraceSpec::builder()
+        .services(["client"].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().psr("1").traced(true).build(),
+        )
+        .await?;
+
+    TraceSpec::builder()
+        .services(["client"].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().psr("2").traced(true).build(),
+        )
+        .await?;
+
+    TraceSpec::builder()
+        .services([].into())
+        .subgraph_sampled(false)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(false).build(),
+        )
+        .await?;
+
+    router.graceful_shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_priority_sampling_no_parent_propagated() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_datadog_propagation_no_parent_sampler.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .extra_propagator(Telemetry::Datadog)
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // The router will ignore the upstream PSR as parent based sampling is disabled.
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("-1").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("0").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("1").build(),
+        )
+        .await?;
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).psr("2").build(),
+        )
+        .await?;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .priority_sampled("1")
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder().traced(true).build(),
+        )
+        .await?;
+
+    router.graceful_shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_attributes() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp.router.yaml");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .services(["client", "router", "subgraph"].into())
+        .attribute("client.name", "foobar")
+        .build()
+        .validate_otlp_trace(
+            &mut router,
+            &mock_server,
+            Query::builder()
+                .traced(true)
+                .header("apollographql-client-name", "foobar")
+                .build(),
+        )
+        .await?;
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_plugin_overridden_client_name_is_included_in_telemetry() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+    let mock_server = mock_otlp_server(1..).await;
+    let config = include_str!("../fixtures/otlp_override_client_name.router.yaml");
+    // Each iteration validates the resulting trace via `find_valid_trace`,
+    // which can poll for up to 10 s while the harness's reqwest client
+    // holds an idle keep-alive socket to the router. Under CI load the
+    // pooled connection can be RST'd before the next iteration reuses
+    // it, surfacing as `error sending request` from `execute_query`.
+    // Disable client-side keep-alive so each iteration opens a fresh
+    // TCP connection.
+    let reqwest_client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("reqwest client build");
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", mock_server.uri())),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", mock_server.uri())
+        .reqwest_client(reqwest_client)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    // rhai script overrides client.name - no matter what client name we pass via headers, it should
+    // end up equalling the value set in the script (`foo`)
+    for header_value in [None, Some(""), Some("foo"), Some("bar")] {
+        let mut headers = HashMap::default();
+        if let Some(value) = header_value {
+            headers.insert("apollographql-client-name".to_string(), value.to_string());
+        }
+
+        let query = Query::builder().traced(true).headers(headers).build();
+        TraceSpec::builder()
+            .services(["client", "router", "subgraph"].into())
+            .attribute("client.name", "foo")
+            .build()
+            .validate_otlp_trace(&mut router, &mock_server, query)
+            .await
+            .unwrap_or_else(|_| panic!("Failed with header value {header_value:?}"));
+    }
+
+    router.graceful_shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_otlp_ipv6() -> Result<(), BoxError> {
+    if !graph_os_enabled() {
+        return Ok(());
+    }
+
+    // Create a TCP listener bound to IPv6 localhost
+    // Skip test if IPv6 is not available (common in CI environments)
+    let listener = match std::net::TcpListener::bind("[::1]:0") {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            eprintln!("Skipping test_otlp_ipv6: IPv6 not available");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let ipv6_address = listener.local_addr().expect("Failed to get local address");
+    let ipv6_endpoint = format!("http://{}", ipv6_address);
+
+    // Create mock server using the IPv6 listener
+    let mock_server = wiremock::MockServer::builder()
+        .listener(listener)
+        .start()
+        .await;
+
+    // Set up the expected mocks for traces and metrics
+    Mock::given(method("POST"))
+        .and(path("/v1/traces"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            ExportTraceServiceResponse::default().encode_to_vec(),
+            "application/x-protobuf",
+        ))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
+
+    let config = include_str!("../fixtures/otlp.router.yaml");
+
+    let mut router = IntegrationTest::builder()
+        .telemetry(Telemetry::Otlp {
+            endpoint: Some(format!("{}/v1/traces", ipv6_endpoint)),
+        })
+        .config(config)
+        .env_entry("TEST_CONFIG_COLLECTOR_ENDPOINT", &ipv6_endpoint)
+        .build()
+        .await;
+
+    router.start().await;
+    router.assert_started().await;
+
+    TraceSpec::builder()
+        .operation_name("ExampleQuery")
+        .services(["client", "router", "subgraph"].into())
+        .span_names(
+            [
+                "query_planning",
+                "client_request",
+                "ExampleQuery__products__0",
+                "fetch",
+                "execution",
+                "query ExampleQuery",
+                "subgraph server",
+                "parse_query",
+                "http_request",
+            ]
+            .into(),
+        )
+        .subgraph_sampled(true)
+        .build()
+        .validate_otlp_trace(&mut router, &mock_server, Query::default())
+        .await?;
+
+    router.graceful_shutdown().await;
+    Ok(())
+}

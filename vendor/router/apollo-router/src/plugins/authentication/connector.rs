@@ -1,0 +1,51 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use apollo_federation::connectors::runtime::http_json_transport::TransportRequest;
+use tower::ServiceBuilder;
+use tower::ServiceExt;
+
+use super::subgraph::AuthConfig;
+use crate::plugins::authentication::subgraph::SigningParamsConfig;
+use crate::services::connector;
+use crate::services::connector_service::ConnectorSourceRef;
+
+pub(super) struct ConnectorAuth {
+    pub(super) signing_params: Arc<HashMap<ConnectorSourceRef, Arc<SigningParamsConfig>>>,
+}
+
+impl ConnectorAuth {
+    pub(super) fn connector_request_service(
+        &self,
+        service: connector::request_service::BoxCloneService,
+    ) -> connector::request_service::BoxCloneService {
+        let signing_params = self.signing_params.clone();
+        ServiceBuilder::new()
+            .map_request(move |mut req: connector::request_service::Request| {
+                if let Some(ref source_name) = req.connector.id.source_name
+                    && let Some(signing_params) = signing_params
+                        .get(&ConnectorSourceRef::new(
+                            req.connector.id.subgraph_name.clone(),
+                            source_name.clone(),
+                        ))
+                        .cloned()
+                    && let TransportRequest::Http(ref mut http_request) = req.transport_request
+                {
+                    http_request.inner.extensions_mut().insert(signing_params);
+                }
+                req
+            })
+            .service(service)
+            .boxed_clone()
+    }
+}
+
+/// Configure connector authentication
+// Holds AWS credentials, so it cannot serialize its defaults: the schema declares them by hand.
+#[apollo_configuration::configuration]
+#[schemars(rename = "AuthenticationConnectorConfig")]
+pub(crate) struct Config {
+    #[schemars(extend("default" = {}))]
+    /// Create a configuration that will apply only to a specific source.
+    pub(crate) sources: HashMap<String, AuthConfig>,
+}

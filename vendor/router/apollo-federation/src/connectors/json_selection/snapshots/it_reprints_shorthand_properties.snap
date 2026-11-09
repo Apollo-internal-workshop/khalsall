@@ -1,0 +1,499 @@
+---
+source: apollo-federation/src/connectors/json_selection/pretty.rs
+expression: "&sel"
+---
+JSONSelection {
+    inner: Named(
+        SubSelection {
+            selections: [
+                NamedSelection {
+                    prefix: None,
+                    path: WithRange {
+                        node: Path(
+                            PathSelection {
+                                path: WithRange {
+                                    node: Key(
+                                        WithRange {
+                                            node: Field(
+                                                "upc",
+                                            ),
+                                            range: Some(
+                                                0..3,
+                                            ),
+                                        },
+                                        WithRange {
+                                            node: Empty,
+                                            range: Some(
+                                                3..3,
+                                            ),
+                                        },
+                                    ),
+                                    range: Some(
+                                        0..3,
+                                    ),
+                                },
+                            },
+                        ),
+                        range: Some(
+                            0..3,
+                        ),
+                    },
+                },
+                NamedSelection {
+                    prefix: Spread(
+                        Some(
+                            4..7,
+                        ),
+                    ),
+                    path: WithRange {
+                        node: Path(
+                            PathSelection {
+                                path: WithRange {
+                                    node: Key(
+                                        WithRange {
+                                            node: Field(
+                                                "category",
+                                            ),
+                                            range: Some(
+                                                8..16,
+                                            ),
+                                        },
+                                        WithRange {
+                                            node: Method(
+                                                WithRange {
+                                                    node: "match",
+                                                    range: Some(
+                                                        18..23,
+                                                    ),
+                                                },
+                                                Some(
+                                                    MethodArgs {
+                                                        args: [
+                                                            WithRange {
+                                                                node: Array(
+                                                                    [
+                                                                        WithRange {
+                                                                            node: String(
+                                                                                "book",
+                                                                            ),
+                                                                            range: Some(
+                                                                                28..34,
+                                                                            ),
+                                                                        },
+                                                                        WithRange {
+                                                                            node: Object(
+                                                                                SubSelection {
+                                                                                    selections: [
+                                                                                        NamedSelection {
+                                                                                            prefix: Alias(
+                                                                                                Alias {
+                                                                                                    name: WithRange {
+                                                                                                        node: Field(
+                                                                                                            "__typename",
+                                                                                                        ),
+                                                                                                        range: Some(
+                                                                                                            42..52,
+                                                                                                        ),
+                                                                                                    },
+                                                                                                    range: Some(
+                                                                                                        42..53,
+                                                                                                    ),
+                                                                                                },
+                                                                                            ),
+                                                                                            path: WithRange {
+                                                                                                node: String(
+                                                                                                    "Book",
+                                                                                                ),
+                                                                                                range: Some(
+                                                                                                    54..60,
+                                                                                                ),
+                                                                                            },
+                                                                                        },
+                                                                                        NamedSelection {
+                                                                                            prefix: None,
+                                                                                            path: WithRange {
+                                                                                                node: Path(
+                                                                                                    PathSelection {
+                                                                                                        path: WithRange {
+                                                                                                            node: Key(
+                                                                                                                WithRange {
+                                                                                                                    node: Field(
+                                                                                                                        "title",
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        66..71,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                                WithRange {
+                                                                                                                    node: Empty,
+                                                                                                                    range: Some(
+                                                                                                                        71..71,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                            ),
+                                                                                                            range: Some(
+                                                                                                                66..71,
+                                                                                                            ),
+                                                                                                        },
+                                                                                                    },
+                                                                                                ),
+                                                                                                range: Some(
+                                                                                                    66..71,
+                                                                                                ),
+                                                                                            },
+                                                                                        },
+                                                                                        NamedSelection {
+                                                                                            prefix: None,
+                                                                                            path: WithRange {
+                                                                                                node: Path(
+                                                                                                    PathSelection {
+                                                                                                        path: WithRange {
+                                                                                                            node: Key(
+                                                                                                                WithRange {
+                                                                                                                    node: Field(
+                                                                                                                        "author",
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        77..83,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                                WithRange {
+                                                                                                                    node: Selection(
+                                                                                                                        SubSelection {
+                                                                                                                            selections: [
+                                                                                                                                NamedSelection {
+                                                                                                                                    prefix: None,
+                                                                                                                                    path: WithRange {
+                                                                                                                                        node: Path(
+                                                                                                                                            PathSelection {
+                                                                                                                                                path: WithRange {
+                                                                                                                                                    node: Key(
+                                                                                                                                                        WithRange {
+                                                                                                                                                            node: Field(
+                                                                                                                                                                "id",
+                                                                                                                                                            ),
+                                                                                                                                                            range: Some(
+                                                                                                                                                                92..94,
+                                                                                                                                                            ),
+                                                                                                                                                        },
+                                                                                                                                                        WithRange {
+                                                                                                                                                            node: Empty,
+                                                                                                                                                            range: Some(
+                                                                                                                                                                94..94,
+                                                                                                                                                            ),
+                                                                                                                                                        },
+                                                                                                                                                    ),
+                                                                                                                                                    range: Some(
+                                                                                                                                                        92..94,
+                                                                                                                                                    ),
+                                                                                                                                                },
+                                                                                                                                            },
+                                                                                                                                        ),
+                                                                                                                                        range: Some(
+                                                                                                                                            92..94,
+                                                                                                                                        ),
+                                                                                                                                    },
+                                                                                                                                },
+                                                                                                                            ],
+                                                                                                                            range: Some(
+                                                                                                                                84..100,
+                                                                                                                            ),
+                                                                                                                        },
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        84..100,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                            ),
+                                                                                                            range: Some(
+                                                                                                                77..100,
+                                                                                                            ),
+                                                                                                        },
+                                                                                                    },
+                                                                                                ),
+                                                                                                range: Some(
+                                                                                                    77..100,
+                                                                                                ),
+                                                                                            },
+                                                                                        },
+                                                                                    ],
+                                                                                    range: Some(
+                                                                                        36..104,
+                                                                                    ),
+                                                                                },
+                                                                            ),
+                                                                            range: Some(
+                                                                                36..104,
+                                                                            ),
+                                                                        },
+                                                                    ],
+                                                                ),
+                                                                range: Some(
+                                                                    27..105,
+                                                                ),
+                                                            },
+                                                            WithRange {
+                                                                node: Array(
+                                                                    [
+                                                                        WithRange {
+                                                                            node: String(
+                                                                                "film",
+                                                                            ),
+                                                                            range: Some(
+                                                                                110..116,
+                                                                            ),
+                                                                        },
+                                                                        WithRange {
+                                                                            node: Path(
+                                                                                PathSelection {
+                                                                                    path: WithRange {
+                                                                                        node: Var(
+                                                                                            WithRange {
+                                                                                                node: $,
+                                                                                                range: Some(
+                                                                                                    118..119,
+                                                                                                ),
+                                                                                            },
+                                                                                            WithRange {
+                                                                                                node: Selection(
+                                                                                                    SubSelection {
+                                                                                                        selections: [
+                                                                                                            NamedSelection {
+                                                                                                                prefix: Alias(
+                                                                                                                    Alias {
+                                                                                                                        name: WithRange {
+                                                                                                                            node: Field(
+                                                                                                                                "__typename",
+                                                                                                                            ),
+                                                                                                                            range: Some(
+                                                                                                                                126..136,
+                                                                                                                            ),
+                                                                                                                        },
+                                                                                                                        range: Some(
+                                                                                                                            126..137,
+                                                                                                                        ),
+                                                                                                                    },
+                                                                                                                ),
+                                                                                                                path: WithRange {
+                                                                                                                    node: String(
+                                                                                                                        "Film",
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        138..144,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                            },
+                                                                                                            NamedSelection {
+                                                                                                                prefix: None,
+                                                                                                                path: WithRange {
+                                                                                                                    node: Path(
+                                                                                                                        PathSelection {
+                                                                                                                            path: WithRange {
+                                                                                                                                node: Key(
+                                                                                                                                    WithRange {
+                                                                                                                                        node: Field(
+                                                                                                                                            "title",
+                                                                                                                                        ),
+                                                                                                                                        range: Some(
+                                                                                                                                            149..154,
+                                                                                                                                        ),
+                                                                                                                                    },
+                                                                                                                                    WithRange {
+                                                                                                                                        node: Empty,
+                                                                                                                                        range: Some(
+                                                                                                                                            154..154,
+                                                                                                                                        ),
+                                                                                                                                    },
+                                                                                                                                ),
+                                                                                                                                range: Some(
+                                                                                                                                    149..154,
+                                                                                                                                ),
+                                                                                                                            },
+                                                                                                                        },
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        149..154,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                            },
+                                                                                                            NamedSelection {
+                                                                                                                prefix: None,
+                                                                                                                path: WithRange {
+                                                                                                                    node: Path(
+                                                                                                                        PathSelection {
+                                                                                                                            path: WithRange {
+                                                                                                                                node: Key(
+                                                                                                                                    WithRange {
+                                                                                                                                        node: Field(
+                                                                                                                                            "director",
+                                                                                                                                        ),
+                                                                                                                                        range: Some(
+                                                                                                                                            159..167,
+                                                                                                                                        ),
+                                                                                                                                    },
+                                                                                                                                    WithRange {
+                                                                                                                                        node: Selection(
+                                                                                                                                            SubSelection {
+                                                                                                                                                selections: [
+                                                                                                                                                    NamedSelection {
+                                                                                                                                                        prefix: None,
+                                                                                                                                                        path: WithRange {
+                                                                                                                                                            node: Path(
+                                                                                                                                                                PathSelection {
+                                                                                                                                                                    path: WithRange {
+                                                                                                                                                                        node: Key(
+                                                                                                                                                                            WithRange {
+                                                                                                                                                                                node: Field(
+                                                                                                                                                                                    "id",
+                                                                                                                                                                                ),
+                                                                                                                                                                                range: Some(
+                                                                                                                                                                                    176..178,
+                                                                                                                                                                                ),
+                                                                                                                                                                            },
+                                                                                                                                                                            WithRange {
+                                                                                                                                                                                node: Empty,
+                                                                                                                                                                                range: Some(
+                                                                                                                                                                                    178..178,
+                                                                                                                                                                                ),
+                                                                                                                                                                            },
+                                                                                                                                                                        ),
+                                                                                                                                                                        range: Some(
+                                                                                                                                                                            176..178,
+                                                                                                                                                                        ),
+                                                                                                                                                                    },
+                                                                                                                                                                },
+                                                                                                                                                            ),
+                                                                                                                                                            range: Some(
+                                                                                                                                                                176..178,
+                                                                                                                                                            ),
+                                                                                                                                                        },
+                                                                                                                                                    },
+                                                                                                                                                ],
+                                                                                                                                                range: Some(
+                                                                                                                                                    168..184,
+                                                                                                                                                ),
+                                                                                                                                            },
+                                                                                                                                        ),
+                                                                                                                                        range: Some(
+                                                                                                                                            168..184,
+                                                                                                                                        ),
+                                                                                                                                    },
+                                                                                                                                ),
+                                                                                                                                range: Some(
+                                                                                                                                    159..184,
+                                                                                                                                ),
+                                                                                                                            },
+                                                                                                                        },
+                                                                                                                    ),
+                                                                                                                    range: Some(
+                                                                                                                        159..184,
+                                                                                                                    ),
+                                                                                                                },
+                                                                                                            },
+                                                                                                        ],
+                                                                                                        range: Some(
+                                                                                                            120..188,
+                                                                                                        ),
+                                                                                                    },
+                                                                                                ),
+                                                                                                range: Some(
+                                                                                                    120..188,
+                                                                                                ),
+                                                                                            },
+                                                                                        ),
+                                                                                        range: Some(
+                                                                                            118..188,
+                                                                                        ),
+                                                                                    },
+                                                                                },
+                                                                            ),
+                                                                            range: Some(
+                                                                                118..188,
+                                                                            ),
+                                                                        },
+                                                                    ],
+                                                                ),
+                                                                range: Some(
+                                                                    109..189,
+                                                                ),
+                                                            },
+                                                            WithRange {
+                                                                node: Array(
+                                                                    [
+                                                                        WithRange {
+                                                                            node: Path(
+                                                                                PathSelection {
+                                                                                    path: WithRange {
+                                                                                        node: Var(
+                                                                                            WithRange {
+                                                                                                node: @,
+                                                                                                range: Some(
+                                                                                                    194..195,
+                                                                                                ),
+                                                                                            },
+                                                                                            WithRange {
+                                                                                                node: Empty,
+                                                                                                range: Some(
+                                                                                                    195..195,
+                                                                                                ),
+                                                                                            },
+                                                                                        ),
+                                                                                        range: Some(
+                                                                                            194..195,
+                                                                                        ),
+                                                                                    },
+                                                                                },
+                                                                            ),
+                                                                            range: Some(
+                                                                                194..195,
+                                                                            ),
+                                                                        },
+                                                                        WithRange {
+                                                                            node: Null,
+                                                                            range: Some(
+                                                                                197..201,
+                                                                            ),
+                                                                        },
+                                                                    ],
+                                                                ),
+                                                                range: Some(
+                                                                    193..202,
+                                                                ),
+                                                            },
+                                                        ],
+                                                        range: Some(
+                                                            23..204,
+                                                        ),
+                                                    },
+                                                ),
+                                                WithRange {
+                                                    node: Empty,
+                                                    range: Some(
+                                                        204..204,
+                                                    ),
+                                                },
+                                            ),
+                                            range: Some(
+                                                16..204,
+                                            ),
+                                        },
+                                    ),
+                                    range: Some(
+                                        8..204,
+                                    ),
+                                },
+                            },
+                        ),
+                        range: Some(
+                            8..204,
+                        ),
+                    },
+                },
+            ],
+            range: Some(
+                0..204,
+            ),
+        },
+    ),
+    spec: V0_4,
+}

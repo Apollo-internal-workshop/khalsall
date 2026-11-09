@@ -1,0 +1,31 @@
+---
+title: Zipkin tracing
+subtitle: Configure tracing for Zipkin
+description: Enable and configure tracing for Zipkin in Apollo GraphOS Router or Apollo Router Core.
+context:
+  - telemetry
+redirectFrom:
+    - /graphos/routing/observability/telemetry/trace-exporters/zipkin
+---
+
+Enable and configure tracing for [Zipkin](https://zipkin.io/) in GraphOS Router or Apollo Router Core.
+
+For general tracing configuration, refer to [Router Tracing Configuration](/router/configuration/telemetry/exporters/tracing/overview).
+
+## OTLP configuration
+
+Zipkin supports OTLP ingestion via [zipkin-otel](https://github.com/openzipkin-contrib/zipkin-otel). Configure the router's OTLP exporter to send traces to Zipkin:
+
+```yaml title="router.yaml"
+telemetry:
+  exporters:
+    tracing:
+      otlp:
+        enabled: true
+        endpoint: "http://${env.ZIPKIN_HOST}:9411"
+        protocol: http
+```
+
+This sends traces to Zipkin using the OTLP protocol.
+
+See [OTLP configuration](/router/configuration/telemetry/exporters/tracing/otlp#configuration) for more details on settings.

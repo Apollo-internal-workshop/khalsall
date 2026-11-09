@@ -1,0 +1,650 @@
+//! Configuration for apollo telemetry.
+use std::collections::HashMap;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::num::NonZeroUsize;
+use std::ops::AddAssign;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+
+use http::header::HeaderName;
+use itertools::Itertools;
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde::ser::SerializeMap;
+use url::Url;
+use uuid::Uuid;
+
+use super::apollo_exporter::proto::reports::QueryMetadata;
+use super::config::ApolloMetricsReferenceMode;
+use super::config::ApolloSignatureNormalizationAlgorithm;
+use super::metrics::apollo::studio::ContextualizedStats;
+use super::metrics::apollo::studio::SingleStats;
+use super::metrics::apollo::studio::SingleStatsReport;
+use super::otlp::Protocol;
+use crate::plugins::telemetry::apollo_exporter::proto::reports::ReferencedFieldsForType;
+use crate::plugins::telemetry::apollo_exporter::proto::reports::ReportHeader;
+use crate::plugins::telemetry::apollo_exporter::proto::reports::StatsContext;
+use crate::plugins::telemetry::config::SamplerOption;
+use crate::plugins::telemetry::tracing::BatchProcessorConfig;
+use crate::plugins::telemetry::tracing::max_export_timeout_default;
+use crate::plugins::telemetry::tracing::max_queue_size_default;
+use crate::plugins::telemetry::tracing::scheduled_delay_default;
+use crate::query_planner::OperationKind;
+use crate::services::apollo_graph_reference;
+use crate::services::apollo_key;
+
+pub(crate) const ENDPOINT_DEFAULT: &str =
+    "https://usage-reporting.api.apollographql.com/api/ingress/traces";
+
+pub(crate) const OTLP_ENDPOINT_DEFAULT: &str = "https://usage-reporting.api.apollographql.com";
+
+// Random unique UUID for the Router. This doesn't actually identify the router, it just allows disambiguation between multiple routers with the same metadata.
+static ROUTER_ID: OnceLock<Uuid> = OnceLock::new();
+
+/// Returns the current unique UUID for this instance of the Router.
+pub(crate) fn router_id() -> String {
+    ROUTER_ID.get_or_init(Uuid::new_v4).to_string()
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+#[schemars(rename = "ApolloTelemetryConfig")]
+pub(crate) struct Config {
+    /// The Apollo Studio endpoint for exporting usage report metrics.
+    #[config(default = endpoint_default().into())]
+    #[schemars(with = "String", default = "endpoint_default")]
+    pub(crate) endpoint: apollo_configuration::types::Url,
+
+    /// The Apollo Studio endpoint for exporting traces and metrics.
+    #[config(default = otlp_endpoint_default().into())]
+    #[schemars(with = "String", default = "otlp_endpoint_default")]
+    pub(crate) otlp_endpoint: apollo_configuration::types::Url,
+
+    /// The Apollo Studio API key.
+    #[config(default = apollo_key())]
+    #[schemars(skip)]
+    pub(crate) apollo_key: Option<String>,
+
+    /// The Apollo Studio graph reference.
+    #[config(default = apollo_graph_reference())]
+    #[schemars(skip)]
+    pub(crate) apollo_graph_ref: Option<String>,
+
+    /// The name of the header to extract from requests when populating 'client name' for traces and metrics in Apollo Studio.
+    #[config(default = client_name_header_default().into())]
+    #[schemars(with = "Option<String>", default = "client_name_header_default_str")]
+    pub(crate) client_name_header: apollo_configuration::types::HeaderName,
+
+    /// The name of the header to extract from requests when populating 'client version' for traces and metrics in Apollo Studio.
+    #[config(default = client_version_header_default().into())]
+    #[schemars(with = "Option<String>", default = "client_version_header_default_str")]
+    pub(crate) client_version_header: apollo_configuration::types::HeaderName,
+
+    /// The name of the header to extract from requests when populating 'library name' for traces and metrics in Apollo Studio.
+    /// Valid values must match the regex `^[ a-zA-Z0-9.@/_\-]{1,60}$`. Invalid values result in a `400` response.
+    #[config(default = library_name_header_default().into())]
+    #[schemars(with = "Option<String>", default = "library_name_header_default_str")]
+    pub(crate) library_name_header: apollo_configuration::types::HeaderName,
+
+    /// The name of the header to extract from requests when populating 'library version' for traces and metrics in Apollo Studio.
+    /// Valid values must match the regex `^[ a-zA-Z0-9.@/_\-]{1,60}$`. Invalid values result in a `400` response.
+    #[config(default = library_version_header_default().into())]
+    #[schemars(
+        with = "Option<String>",
+        default = "library_version_header_default_str"
+    )]
+    pub(crate) library_version_header: apollo_configuration::types::HeaderName,
+
+    /// The buffer size for sending traces to Apollo. Increase this if you are experiencing lost traces.
+    #[config(default = default_buffer_size())]
+    pub(crate) buffer_size: NonZeroUsize,
+
+    /// Field level instrumentation for subgraphs via ftv1. ftv1 tracing can cause performance issues as it is transmitted in band with subgraph responses.
+    #[config(default = default_field_level_instrumentation_sampler())]
+    pub(crate) field_level_instrumentation_sampler: SamplerOption,
+
+    /// OTLP protocol used for OTel traces.
+    /// Note this only applies if OTel traces are enabled and is only intended for use in tests.
+    pub(crate) otlp_tracing_protocol: Protocol,
+
+    /// OTLP protocol used for OTel metrics.
+    /// Note this is only intended for use in tests.
+    pub(crate) otlp_metrics_protocol: Protocol,
+
+    /// To configure which request header names and values are included in trace data that's sent to Apollo Studio.
+    pub(crate) send_headers: ForwardHeaders,
+    /// To configure which GraphQL variable values are included in trace data that's sent to Apollo Studio
+    pub(crate) send_variable_values: ForwardValues,
+
+    // This'll get overridden if a user tries to set it.
+    // The purpose is to allow is to pass this in to the plugin.
+    #[config(default = "<no_schema_id>".to_string())]
+    #[schemars(skip)]
+    pub(crate) schema_id: String,
+
+    /// Configuration for tracing.
+    pub(crate) tracing: TracingConfiguration,
+
+    /// Configuration for metrics.
+    pub(crate) metrics: MetricsConfiguration,
+
+    /// Configure the way errors are transmitted to Apollo Studio
+    pub(crate) errors: ErrorsConfiguration,
+
+    /// Set the signature normalization algorithm to use when sending Apollo usage reports.
+    pub(crate) signature_normalization_algorithm: ApolloSignatureNormalizationAlgorithm,
+
+    /// Set the Apollo usage report reference reporting mode to use.
+    pub(crate) metrics_reference_mode: ApolloMetricsReferenceMode,
+
+    /// Enable field metrics that are generated without FTV1 to be sent to Apollo Studio.
+    pub(crate) experimental_local_field_metrics: bool,
+
+    /// Enable sending additional subgraph metrics to Apollo Studio via OTLP
+    #[config(default = true)]
+    pub(crate) subgraph_metrics: bool,
+
+    /// Per-exporter sampler for traces sent to Apollo Studio.
+    ///
+    /// Uses the same trace-ID-based algorithm as `telemetry.exporters.tracing.common.sampler`.
+    /// Accepts a decimal between 0.0 and 1.0, `always_on`, or `always_off`.
+    /// Should be ≤ the common sampler; setting it higher has no effect.
+    ///
+    /// When `parent_based_sampler` is enabled (the default), traces arriving with a `traceparent`
+    /// header already marked as sampled by the calling service will be passed through to this
+    /// exporter regardless of this sampler's value — including when set to `always_off`.
+    ///
+    /// Whatever this sampler lets through is then subject to `tracing.throttle`, which acts as a
+    /// back-stop that further reduces trace volume sent to Apollo Studio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sampler: Option<SamplerOption>,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct TracingConfiguration {
+    /// Configuration for tracing batch processor.
+    pub(crate) batch_processor: BatchProcessorConfig,
+
+    /// Back-stop that throttles the volume of traces sent to Apollo Studio, applied *after* the
+    /// `telemetry.apollo.sampler` and `telemetry.exporters.tracing.common.sampler` head samplers.
+    pub(crate) throttle: ApolloTraceThrottleConfig,
+}
+
+/// The back-stop strategy used to throttle the volume of traces exported to Apollo Studio, after
+/// head sampling.
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq, Eq)]
+pub(crate) enum ApolloTraceThrottleConfig {
+    /// Send at most one representative trace per minute for each distinct combination of dimensions
+    /// (operation, client, latency bucket, error status, operation type). Duplicate traces sharing
+    /// a combination already seen within the current minute are dropped. These traces would end up
+    /// being dropped by Apollo at ingestion time anyway.
+    #[config(default)]
+    RepresentativeTraces,
+
+    /// Send every trace, but cap the export rate at a fixed maximum of 100 traces per second (per
+    /// router instance). Cheaper than `representative_traces` in CPU and memory, at the cost of a
+    /// less even sample. The rate is not configurable.
+    RateLimited,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct MetricsConfiguration {
+    /// Configuration for exporting metrics via OTLP.
+    pub(crate) otlp: OtlpMetricsConfiguration,
+    /// Configuration for exporting metrics via Apollo usage reports.
+    pub(crate) usage_reports: UsageReportsMetricsConfiguration,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct OtlpMetricsConfiguration {
+    /// Batch processor config for OTLP metrics.
+    pub(crate) batch_processor: OtlpMetricsBatchProcessorConfiguration,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct UsageReportsMetricsConfiguration {
+    /// Batch processor config for Apollo usage report metrics.
+    pub(crate) batch_processor: ApolloUsageReportsBatchProcessorConfiguration,
+}
+
+// This config copies the relevant values from BatchProcessorConfig.
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct OtlpMetricsBatchProcessorConfiguration {
+    #[config(default = scheduled_delay_default().into())]
+    #[schemars(with = "String")]
+    /// The delay interval in milliseconds between two consecutive processing
+    /// of batches. The default value is 5 seconds.
+    pub(crate) scheduled_delay: apollo_configuration::types::Duration,
+
+    /// The maximum duration to export a batch of data.
+    /// The default value is 30 seconds.
+    #[config(default = max_export_timeout_default().into())]
+    #[schemars(with = "String")]
+    pub(crate) max_export_timeout: apollo_configuration::types::Duration,
+}
+
+impl Display for OtlpMetricsBatchProcessorConfiguration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format!(
+            "OtlpMetricsBatchProcessorConfiguration {{ scheduled_delay={}, max_export_timeout={} }}",
+            self.scheduled_delay, self.max_export_timeout
+        ))
+    }
+}
+
+// This config copies the relevant values from BatchProcessorConfig.
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct ApolloUsageReportsBatchProcessorConfiguration {
+    /// The delay interval in milliseconds between two consecutive processing
+    /// of batches. The default value is 5 seconds.
+    #[config(default = scheduled_delay_default().into())]
+    #[schemars(with = "String")]
+    pub(crate) scheduled_delay: apollo_configuration::types::Duration,
+
+    /// The maximum queue size to buffer spans for delayed processing. If the
+    /// queue gets full it drops the reports. The default value is 2048.
+    #[config(default = max_queue_size_default())]
+    pub(crate) max_queue_size: usize,
+
+    /// The maximum duration to export a batch of data.
+    /// The default value is 30 seconds.
+    #[config(default = max_export_timeout_default().into())]
+    #[schemars(with = "String")]
+    pub(crate) max_export_timeout: apollo_configuration::types::Duration,
+}
+
+impl From<&BatchProcessorConfig> for ApolloUsageReportsBatchProcessorConfiguration {
+    fn from(value: &BatchProcessorConfig) -> Self {
+        ApolloUsageReportsBatchProcessorConfiguration {
+            scheduled_delay: value.scheduled_delay,
+            max_queue_size: value.max_queue_size,
+            max_export_timeout: value.max_export_timeout,
+        }
+    }
+}
+
+impl Display for ApolloUsageReportsBatchProcessorConfiguration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format!("ApolloUsageReportsBatchProcessorConfiguration {{ scheduled_delay={}, max_queue_size={}, max_export_timeout={} }}",
+                             self.scheduled_delay,
+                             self.max_queue_size,
+                             self.max_export_timeout))
+    }
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct ErrorsConfiguration {
+    /// Handling of errors coming from subgraph
+    pub(crate) subgraph: SubgraphErrorConfig,
+
+    /// Send error metrics via OTLP with additional dimensions [`extensions.service`, `extensions.code`]
+    pub(crate) extended_error_metrics: ExtendedErrorMetricsMode,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct SubgraphErrorConfig {
+    /// Handling of errors coming from all subgraphs
+    pub(crate) all: ErrorConfiguration,
+    /// Handling of errors coming from specified subgraphs
+    pub(crate) subgraphs: HashMap<String, ErrorConfiguration>,
+}
+
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) struct ErrorConfiguration {
+    /// Send subgraph errors to Apollo Studio
+    #[config(default = true)]
+    pub(crate) send: bool,
+    /// Redact subgraph errors to Apollo Studio
+    #[config(default = true)]
+    pub(crate) redact: bool,
+    /// Allows additional dimension `extensions.code` to be sent with errors
+    /// even when `redact` is set to `true`.  Has no effect when `redact` is false.
+    pub(crate) redaction_policy: ErrorRedactionPolicy,
+}
+
+impl SubgraphErrorConfig {
+    pub(crate) fn get_error_config(&self, subgraph: &str) -> &ErrorConfiguration {
+        if let Some(subgraph_conf) = self.subgraphs.get(subgraph) {
+            subgraph_conf
+        } else {
+            &self.all
+        }
+    }
+}
+
+/// Extended Open Telemetry error metrics mode
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq)]
+pub(crate) enum ExtendedErrorMetricsMode {
+    /// Do not send extended OTLP error metrics
+    Disabled,
+    /// Send extended OTLP error metrics to Apollo Studio with additional dimensions [`extensions.service`, `extensions.code`].
+    /// If enabled, it's also recommended to enable `redaction_policy: extended` on subgraphs to send the `extensions.code` for subgraph errors.
+    #[config(default)]
+    Enabled,
+}
+
+/// Allow some error fields to be send to Apollo Studio even when `redact` is true.
+#[apollo_configuration::configuration]
+#[derive(Copy, PartialEq)]
+pub(crate) enum ErrorRedactionPolicy {
+    /// Applies redaction to all error details.
+    #[config(default)]
+    Strict,
+    /// Modifies the `redact` setting by excluding the `extensions.code` field in errors from redaction.
+    Extended,
+}
+
+const fn default_field_level_instrumentation_sampler() -> SamplerOption {
+    SamplerOption::TraceIdRatioBased(0.01)
+}
+
+fn endpoint_default() -> Url {
+    Url::parse(ENDPOINT_DEFAULT).expect("must be valid url")
+}
+
+fn otlp_endpoint_default() -> Url {
+    Url::parse(OTLP_ENDPOINT_DEFAULT).expect("must be valid url")
+}
+
+const fn client_name_header_default_str() -> &'static str {
+    "apollographql-client-name"
+}
+
+const fn client_name_header_default() -> HeaderName {
+    HeaderName::from_static(client_name_header_default_str())
+}
+
+const fn client_version_header_default_str() -> &'static str {
+    "apollographql-client-version"
+}
+
+const fn client_version_header_default() -> HeaderName {
+    HeaderName::from_static(client_version_header_default_str())
+}
+
+const fn library_name_header_default_str() -> &'static str {
+    "apollographql-library-name"
+}
+
+const fn library_name_header_default() -> HeaderName {
+    HeaderName::from_static(library_name_header_default_str())
+}
+
+const fn library_version_header_default_str() -> &'static str {
+    "apollographql-library-version"
+}
+
+const fn library_version_header_default() -> HeaderName {
+    HeaderName::from_static(library_version_header_default_str())
+}
+
+pub(crate) const fn default_buffer_size() -> NonZeroUsize {
+    unsafe { NonZeroUsize::new_unchecked(10000) }
+}
+
+schemar_fn!(
+    forward_headers_only,
+    Vec<String>,
+    "Send only the headers specified"
+);
+schemar_fn!(
+    forward_headers_except,
+    Vec<String>,
+    "Send all headers except those specified"
+);
+
+/// Forward headers
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) enum ForwardHeaders {
+    /// Don't send any headers
+    #[config(default)]
+    None,
+
+    /// Send all headers
+    All,
+
+    /// Send only the headers specified
+    #[schemars(schema_with = "forward_headers_only")]
+    Only(Vec<apollo_configuration::types::HeaderName>),
+
+    /// Send all headers except those specified
+    #[schemars(schema_with = "forward_headers_except")]
+    Except(Vec<apollo_configuration::types::HeaderName>),
+}
+
+schemar_fn!(
+    forward_variables_except,
+    Vec<String>,
+    "Send all variables except those specified"
+);
+
+schemar_fn!(
+    forward_variables_only,
+    Vec<String>,
+    "Send only the variables specified"
+);
+
+/// Forward GraphQL variables
+#[apollo_configuration::configuration]
+#[derive(PartialEq)]
+pub(crate) enum ForwardValues {
+    /// Dont send any variables
+    #[config(default)]
+    None,
+    /// Send all variables
+    All,
+    /// Send only the variables specified
+    #[schemars(schema_with = "forward_variables_only")]
+    Only(Vec<String>),
+    /// Send all variables except those specified
+    #[schemars(schema_with = "forward_variables_except")]
+    Except(Vec<String>),
+}
+
+#[derive(Default, Debug, Serialize)]
+pub(crate) struct Report {
+    pub(crate) traces_per_query: HashMap<String, TracesAndStats>,
+    #[serde(serialize_with = "serialize_licensed_operation_count_by_type")]
+    pub(crate) licensed_operation_count_by_type:
+        HashMap<(OperationKind, Option<OperationSubType>), LicensedOperationCountByType>,
+    pub(crate) router_features_enabled: Vec<String>,
+}
+
+#[derive(Clone, Default, Debug, Serialize, PartialEq, Eq, Hash)]
+pub(crate) struct LicensedOperationCountByType {
+    pub(crate) r#type: OperationKind,
+    pub(crate) subtype: Option<OperationSubType>,
+    pub(crate) licensed_operation_count: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum OperationSubType {
+    SubscriptionEvent,
+    SubscriptionRequest,
+}
+
+impl OperationSubType {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            OperationSubType::SubscriptionEvent => "subscription-event",
+            OperationSubType::SubscriptionRequest => "subscription-request",
+        }
+    }
+}
+
+impl Display for OperationSubType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationSubType::SubscriptionEvent => write!(f, "subscription-event"),
+            OperationSubType::SubscriptionRequest => write!(f, "subscription-request"),
+        }
+    }
+}
+
+impl From<LicensedOperationCountByType>
+    for crate::plugins::telemetry::apollo_exporter::proto::reports::report::OperationCountByType
+{
+    fn from(value: LicensedOperationCountByType) -> Self {
+        Self {
+            r#type: value.r#type.as_apollo_operation_type().to_string(),
+            subtype: value.subtype.map(|s| s.to_string()).unwrap_or_default(),
+            operation_count: value.licensed_operation_count,
+        }
+    }
+}
+
+fn serialize_licensed_operation_count_by_type<S>(
+    elt: &HashMap<(OperationKind, Option<OperationSubType>), LicensedOperationCountByType>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut map_ser = serializer.serialize_map(Some(elt.len()))?;
+    for ((op_type, op_subtype), v) in elt {
+        map_ser.serialize_entry(
+            &format!(
+                "{}{}",
+                op_type.as_apollo_operation_type(),
+                op_subtype
+                    .map(|o| "/".to_owned() + o.as_str())
+                    .unwrap_or_default()
+            ),
+            v,
+        )?;
+    }
+    map_ser.end()
+}
+
+impl Report {
+    #[cfg(test)]
+    pub(crate) fn new(reports: Vec<SingleStatsReport>) -> Report {
+        let mut aggregated_report = Report::default();
+        for report in reports {
+            aggregated_report += report;
+        }
+        aggregated_report
+    }
+
+    pub(crate) fn build_proto_report(
+        &self,
+        header: ReportHeader,
+        extended_references_enabled: bool,
+    ) -> crate::plugins::telemetry::apollo_exporter::proto::reports::Report {
+        let mut report = crate::plugins::telemetry::apollo_exporter::proto::reports::Report {
+            header: Some(header),
+            end_time: Some(SystemTime::now().into()),
+            operation_count_by_type: self
+                .licensed_operation_count_by_type
+                .values()
+                .cloned()
+                .map(|op| op.into())
+                .collect(),
+            traces_pre_aggregated: true,
+            extended_references_enabled,
+            router_features_enabled: self.router_features_enabled.clone(),
+            ..Default::default()
+        };
+
+        for (key, traces_and_stats) in &self.traces_per_query {
+            report
+                .traces_per_query
+                .insert(key.clone(), traces_and_stats.clone().into());
+        }
+
+        report
+    }
+}
+
+impl AddAssign<SingleStatsReport> for Report {
+    fn add_assign(&mut self, report: SingleStatsReport) {
+        for (k, v) in report.stats {
+            *self.traces_per_query.entry(k).or_default() += v;
+        }
+
+        if let Some(licensed_operation_count_by_type) = report.licensed_operation_count_by_type {
+            let key = (
+                licensed_operation_count_by_type.r#type,
+                licensed_operation_count_by_type.subtype,
+            );
+            self.licensed_operation_count_by_type
+                .entry(key)
+                .and_modify(|e| {
+                    e.licensed_operation_count += 1;
+                })
+                .or_insert(licensed_operation_count_by_type);
+        }
+        self.router_features_enabled = self
+            .router_features_enabled
+            .clone()
+            .into_iter()
+            .chain(report.router_features_enabled)
+            .unique()
+            .collect();
+    }
+}
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub(crate) struct TracesAndStats {
+    #[serde(with = "vectorize")]
+    pub(crate) stats_with_context: HashMap<StatsContext, ContextualizedStats>,
+    pub(crate) referenced_fields_by_type: HashMap<String, ReferencedFieldsForType>,
+    pub(crate) query_metadata: Option<QueryMetadata>,
+}
+
+impl From<TracesAndStats>
+    for crate::plugins::telemetry::apollo_exporter::proto::reports::TracesAndStats
+{
+    fn from(stats: TracesAndStats) -> Self {
+        Self {
+            stats_with_context: stats.stats_with_context.into_values().map_into().collect(),
+            referenced_fields_by_type: stats.referenced_fields_by_type,
+            trace: Vec::new(),
+            query_metadata: stats.query_metadata,
+        }
+    }
+}
+
+impl AddAssign<SingleStats> for TracesAndStats {
+    fn add_assign(&mut self, stats: SingleStats) {
+        *self
+            .stats_with_context
+            .entry(stats.stats_with_context.context.clone())
+            .or_default() += stats.stats_with_context;
+
+        // No merging required here because references fields by type and metadata will always be the same for
+        // each stats report key.
+        self.referenced_fields_by_type = stats.referenced_fields_by_type;
+        self.query_metadata = stats.query_metadata;
+    }
+}
+
+pub(crate) mod vectorize {
+    use serde::Serialize;
+    use serde::Serializer;
+
+    pub(crate) fn serialize<'a, T, K, V, S>(target: T, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: IntoIterator<Item = (&'a K, &'a V)>,
+        K: Serialize + 'a,
+        V: Serialize + 'a,
+    {
+        let container: Vec<_> = target.into_iter().collect();
+        serde::Serialize::serialize(&container, ser)
+    }
+}

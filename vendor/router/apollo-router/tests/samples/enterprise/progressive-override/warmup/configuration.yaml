@@ -1,0 +1,14 @@
+include_subgraph_errors:
+  all: true
+
+supergraph:
+  query_planning:
+    warmed_up_queries: 5
+
+telemetry:
+  exporters:
+    logging:
+      stdout:
+        format: text
+
+expose_query_plan: true

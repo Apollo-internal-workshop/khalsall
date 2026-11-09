@@ -1,0 +1,190 @@
+use std::ops::ControlFlow;
+
+use http::StatusCode;
+use tower::BoxError;
+use tower::ServiceBuilder;
+use tower::ServiceExt;
+
+use crate::error::Error;
+use crate::layers::ServiceBuilderExt;
+use crate::plugin::Enabled;
+use crate::plugin::Plugin;
+use crate::plugin::PluginInit;
+use crate::services::ExecutionRequest;
+use crate::services::ExecutionResponse;
+use crate::services::execution;
+
+#[derive(Debug, Clone)]
+struct ForbidMutations {
+    forbid: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ForbidMutations {
+    type Config = Enabled;
+
+    async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
+        Ok(ForbidMutations {
+            forbid: init.config.0,
+        })
+    }
+
+    fn execution_service(&self, service: execution::BoxCloneService) -> execution::BoxCloneService {
+        if self.forbid {
+            ServiceBuilder::new()
+                .checkpoint_async(|req: ExecutionRequest| async move {
+                    if req.query_plan.contains_mutations() {
+                        let error = Error::builder()
+                            .message("Mutations are forbidden".to_string())
+                            .extension_code("MUTATION_FORBIDDEN")
+                            .build();
+                        let res = ExecutionResponse::builder()
+                            .error(error)
+                            .status_code(StatusCode::BAD_REQUEST)
+                            .context(req.context)
+                            .build()?;
+                        Ok(ControlFlow::Break(res))
+                    } else {
+                        Ok(ControlFlow::Continue(req))
+                    }
+                })
+                .service(service)
+                .boxed_clone()
+        } else {
+            service
+        }
+    }
+}
+
+#[cfg(test)]
+mod forbid_http_get_mutations_tests {
+    use http::Method;
+    use http::StatusCode;
+    use serde_json::json;
+    use tower::Service;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::assert_error_eq_ignoring_id;
+    use crate::graphql;
+    use crate::http_ext::Request;
+    use crate::plugin::PluginInit;
+    use crate::query_planner::PlanNode;
+    use crate::query_planner::QueryPlan;
+    use crate::query_planner::fetch::OperationKind;
+
+    #[tokio::test]
+    async fn it_lets_queries_pass_through() {
+        let (mock, mut handle) = tower_test::mock::pair::<ExecutionRequest, ExecutionResponse>();
+
+        let mut service_stack =
+            ForbidMutations::new(PluginInit::fake_new(Enabled(true), Default::default()))
+                .await
+                .expect("couldn't create forbid_mutations plugin")
+                .execution_service(mock.boxed_clone());
+
+        let call = service_stack
+            .ready()
+            .await
+            .unwrap()
+            .call(create_request(Method::GET, OperationKind::Query));
+
+        let driver = tokio::spawn(async move {
+            let (_req, responder) = handle.next_request().await.unwrap();
+            responder.send_response(ExecutionResponse::fake_builder().build().unwrap());
+        });
+
+        call.await.unwrap().next_response().await.unwrap();
+        crate::plugin::test::await_mock_driver(driver).await;
+    }
+
+    #[tokio::test]
+    async fn it_doesnt_let_mutations_pass_through() {
+        let expected_error = Error::builder()
+            .message("Mutations are forbidden".to_string())
+            .extension_code("MUTATION_FORBIDDEN")
+            .build();
+        let expected_status = StatusCode::BAD_REQUEST;
+
+        let (mock, handle) = tower_test::mock::pair::<ExecutionRequest, ExecutionResponse>();
+        let service_stack =
+            ForbidMutations::new(PluginInit::fake_new(Enabled(true), Default::default()))
+                .await
+                .expect("couldn't create forbid_mutations plugin")
+                .execution_service(mock.boxed_clone());
+
+        let mut response = service_stack
+            .oneshot(create_request(Method::GET, OperationKind::Mutation))
+            .await
+            .unwrap();
+        let actual_error = &response.next_response().await.unwrap().errors[0];
+
+        assert_eq!(expected_status, response.response.status());
+        assert_error_eq_ignoring_id!(actual_error, expected_error);
+        crate::plugin::test::assert_no_mock_calls(handle).await;
+    }
+
+    #[tokio::test]
+    async fn configuration_set_to_false_lets_mutations_pass_through() {
+        let (mock, mut handle) = tower_test::mock::pair::<ExecutionRequest, ExecutionResponse>();
+
+        let mut service_stack =
+            ForbidMutations::new(PluginInit::fake_new(Enabled(false), Default::default()))
+                .await
+                .expect("couldn't create forbid_mutations plugin")
+                .execution_service(mock.boxed_clone());
+
+        let call = service_stack
+            .ready()
+            .await
+            .unwrap()
+            .call(create_request(Method::GET, OperationKind::Mutation));
+        let (_req, responder) = handle.next_request().await.unwrap();
+        responder.send_response(ExecutionResponse::fake_builder().build().unwrap());
+        call.await.unwrap().next_response().await.unwrap();
+    }
+
+    fn create_request(method: Method, operation_kind: OperationKind) -> ExecutionRequest {
+        let root: PlanNode = if operation_kind == OperationKind::Mutation {
+            serde_json::from_value(json!({
+                "kind": "Sequence",
+                "nodes": [
+                    {
+                        "kind": "Fetch",
+                        "serviceName": "product",
+                        "variableUsages": [],
+                        "operation": "{__typename}",
+                        "operationKind": "mutation"
+                      },
+                ]
+            }))
+            .unwrap()
+        } else {
+            serde_json::from_value(json!({
+                "kind": "Sequence",
+                "nodes": [
+                    {
+                        "kind": "Fetch",
+                        "serviceName": "product",
+                        "variableUsages": [],
+                        "operation": "{__typename}",
+                        "operationKind": "query"
+                      },
+                ]
+            }))
+            .unwrap()
+        };
+
+        let request = Request::fake_builder()
+            .method(method)
+            .body(graphql::Request::default())
+            .build()
+            .expect("expecting valid request");
+        ExecutionRequest::fake_builder()
+            .supergraph_request(request)
+            .query_plan(QueryPlan::fake_builder().root(root).build())
+            .build()
+    }
+}
+
+register_plugin!("apollo", "forbid_mutations", ForbidMutations);

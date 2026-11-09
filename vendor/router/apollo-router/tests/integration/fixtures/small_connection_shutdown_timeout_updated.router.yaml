@@ -1,0 +1,9 @@
+telemetry:
+  exporters:
+    metrics:
+      prometheus:
+        enabled: true
+        path: /metrics
+supergraph:
+  early_cancel: true
+  connection_shutdown_timeout: 2ms

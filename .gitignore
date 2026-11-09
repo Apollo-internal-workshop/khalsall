@@ -4,3 +4,8 @@ build
 ./router/router
 .DS_Store
 *.patch
+vendor/router/target/
+vendor/fedutils-build-plugins/target/
+.env.local
+tickets-mcp/dist
+vendor/fedutils-build-plugins/

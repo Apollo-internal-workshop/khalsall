@@ -1,0 +1,11 @@
+# The spec's JohnDoeBriefing, adapted: persona is Kris Marrier (id 10) and
+# orderDate/total are not in the Orders schema.
+query KrisBriefing {
+  user(id: "10") {
+    firstName
+    lastName
+    phone
+    orders { id items { id } }
+    tickets { subject status priority orderId }
+  }
+}

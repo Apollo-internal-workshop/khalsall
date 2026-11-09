@@ -1,0 +1,1504 @@
+//! Calls out to the apollo-federation crate
+
+use std::fmt::Debug;
+use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::task::Poll;
+use std::time::Instant;
+
+use apollo_compiler::ExecutableDocument;
+use apollo_compiler::Name;
+use apollo_federation::error::FederationError;
+use apollo_federation::error::SingleFederationError;
+use apollo_federation::query_plan::query_planner::QueryPlanOptions;
+use apollo_federation::query_plan::query_planner::QueryPlanner;
+use apollo_federation::query_plan::query_planner::QueryPlannerDebugConfig;
+use futures::future::BoxFuture;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry::metrics::ObservableGauge;
+use tower::Service;
+
+use super::PlanNode;
+use super::QueryKey;
+use super::QueryPlan;
+use crate::Configuration;
+use crate::apollo_studio_interop::generate_usage_reporting;
+use crate::compute_job;
+use crate::compute_job::ComputeJobType;
+use crate::compute_job::MaybeBackPressureError;
+use crate::error::FederationErrorBridge;
+use crate::error::QueryPlannerError;
+use crate::error::ServiceBuildError;
+use crate::error::ValidationErrors;
+use crate::metrics::meter_provider;
+use crate::plugins::authorization;
+use crate::plugins::authorization::AuthorizationPlugin;
+use crate::plugins::authorization::CacheKeyMetadata;
+use crate::plugins::authorization::FilterResult;
+use crate::plugins::authorization::UnauthorizedPaths;
+use crate::plugins::telemetry::config::ApolloSignatureNormalizationAlgorithm;
+use crate::plugins::telemetry::config::Conf as TelemetryConfig;
+use crate::query_planner::HashedSubgraphSchemas;
+use crate::query_planner::convert::convert_root_query_plan_node;
+use crate::query_planner::hashed_subgraph_schemas;
+use crate::query_planner::labeler::add_defer_labels;
+use crate::services::QueryPlannerContent;
+use crate::services::QueryPlannerRequest;
+use crate::services::QueryPlannerResponse;
+use crate::services::query_parsing::ParsedDocument;
+use crate::services::query_parsing::ParsedDocumentInner;
+use crate::services::query_planner::PlanOptions;
+use crate::spec::Query;
+use crate::spec::Schema;
+use crate::spec::SpecError;
+
+pub(crate) const RUST_QP_MODE: &str = "rust";
+const UNSUPPORTED_FED1: &str = "fed1";
+const UNSUPPORTED_FEDERATION_VERSION: &str = "unsupported_federation_version";
+const INTERNAL_INIT_ERROR: &str = "internal";
+
+const ENV_DISABLE_NON_LOCAL_SELECTIONS_CHECK: &str =
+    "APOLLO_ROUTER_DISABLE_SECURITY_NON_LOCAL_SELECTIONS_CHECK";
+/// Should we enforce the non-local selections limit? Default true, can be toggled off with an
+/// environment variable.
+///
+/// Disabling this check is very much not advisable and we don't expect that anyone will need to do
+/// it. In the extremely unlikely case that the new protection breaks someone's legitimate queries,
+/// though, they could temporarily disable this individual limit so they can still benefit from the
+/// other new limits, until we improve the detection.
+pub(crate) fn non_local_selections_check_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let disabled =
+            std::env::var(ENV_DISABLE_NON_LOCAL_SELECTIONS_CHECK).as_deref() == Ok("true");
+
+        !disabled
+    })
+}
+
+const ENV_MAX_NON_LOCAL_SELECTIONS: &str = "APOLLO_ROUTER_MAX_NON_LOCAL_SELECTIONS";
+/// The default for max number of non-local selections is 100000 defined in
+/// [`QueryPlannerDebugConfig::max_non_local_selections`], but that default can
+/// be altered with `APOLLO_ROUTER_MAX_NON_LOCAL_SELECTIONS` environment
+/// variable. The query planning process is aborted if this number is reached.
+///
+/// Since query planning configuration is part of the cache key, setting or
+/// changing the value of this env var will clear the query planner cache and
+/// cause replanning of the previously cached query plans.
+///
+/// If the env var value is unable to be parsed into a `NonZeroU64`, the default
+/// value is used and a warn message is emitted which can be found in the logs.
+/// An info log is emitted when that env var value parsed and is set.
+///
+/// This env var is intentionally undocumented. It is meant for troubleshooting
+/// purposes when investigating query plan and operation complexity in regards
+/// to non-local selection sets, an internal to query planner measurement for
+/// the number of selection sets that cannot be optimized due to not being local
+/// to the selection set currently being explored.
+///
+/// The number of non-local selections explored for a given plan is tracked in
+/// `apollo.router.query_planning.plan.non_local_selections` histogram and is
+/// available to everyone. This histogram defaults to bucket boundaries of 100,
+/// 1000, 25000, 50000, 100000, and 150000 (see [`NON_LOCAL_SELECTIONS_BUCKETS`]).
+pub(crate) fn max_non_local_selections() -> NonZeroU64 {
+    static MAX: OnceLock<NonZeroU64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        let default = QueryPlannerDebugConfig::default().max_non_local_selections;
+        let Ok(value) = std::env::var(ENV_MAX_NON_LOCAL_SELECTIONS) else {
+            return default;
+        };
+        match value.parse::<NonZeroU64>() {
+            Ok(limit) => {
+                tracing::info!(
+                    limit = limit,
+                    "non-local selections limit set"
+                );
+                limit
+            }
+            Err(_) => {
+                tracing::warn!(
+                    value = value,
+                    default = default,
+                    "falling back to default max non-local selection due to invalid {ENV_MAX_NON_LOCAL_SELECTIONS} value"
+                );
+                default
+            }
+        }
+    })
+}
+
+/// A query planner that calls out to the apollo-federation crate.
+///
+/// No caching is performed. To cache, wrap in a [`CachingQueryPlanner`].
+#[derive(Clone)]
+pub(crate) struct QueryPlannerService {
+    planner: Arc<QueryPlanner>,
+    schema: Arc<Schema>,
+    subgraph_schemas: Arc<HashedSubgraphSchemas>,
+    configuration: Arc<Configuration>,
+    enable_authorization_directives: bool,
+    authorization_config: Arc<authorization::Conf>,
+    _federation_instrument: ObservableGauge<u64>,
+    signature_normalization_algorithm: ApolloSignatureNormalizationAlgorithm,
+}
+
+fn federation_version_instrument(federation_version: Option<i64>) -> ObservableGauge<u64> {
+    meter_provider()
+        .meter("apollo/router")
+        .u64_observable_gauge("apollo.router.supergraph.federation")
+        .with_callback(move |observer| {
+            observer.observe(
+                1,
+                &[KeyValue::new(
+                    "federation.version",
+                    federation_version.unwrap_or(0),
+                )],
+            );
+        })
+        .build()
+}
+
+impl QueryPlannerService {
+    pub(crate) fn create_planner(
+        schema: &Schema,
+        configuration: &Configuration,
+    ) -> Result<Arc<QueryPlanner>, ServiceBuildError> {
+        let config = configuration.rust_query_planner_config();
+        let result = QueryPlanner::new(schema.federation_supergraph(), config);
+
+        match &result {
+            Err(FederationError::SingleFederationError(error)) => match error {
+                SingleFederationError::UnsupportedFederationVersion { .. } => {
+                    if schema.federation_version() == Some(1) {
+                        metric_rust_qp_init(Some(UNSUPPORTED_FED1));
+                    } else {
+                        metric_rust_qp_init(Some(UNSUPPORTED_FEDERATION_VERSION));
+                    }
+                }
+                SingleFederationError::UnsupportedFeature {
+                    message: _,
+                    kind: _,
+                } => metric_rust_qp_init(Some(INTERNAL_INIT_ERROR)),
+                _ => {
+                    metric_rust_qp_init(Some(INTERNAL_INIT_ERROR));
+                }
+            },
+            Err(_) => metric_rust_qp_init(Some(INTERNAL_INIT_ERROR)),
+            Ok(_) => metric_rust_qp_init(None),
+        }
+
+        Ok(Arc::new(result.map_err(ServiceBuildError::QpInitError)?))
+    }
+
+    async fn plan_inner(
+        &self,
+        doc: &ParsedDocument,
+        operation: Option<String>,
+        plan_options: PlanOptions,
+        compute_job_type: ComputeJobType,
+        // Initialization code that needs mutable access to the plan,
+        // before we potentially share it in Arc with a background thread
+        // for "both" mode.
+        init_query_plan_root_node: impl Fn(&mut PlanNode) -> Result<(), ValidationErrors>,
+    ) -> Result<QueryPlanResult, MaybeBackPressureError<QueryPlannerError>> {
+        let doc = doc.clone();
+        let rust_planner = self.planner.clone();
+        let job = move |status: compute_job::JobStatus<'_, _>| -> Result<_, QueryPlannerError> {
+            let start = Instant::now();
+
+            let check = move || status.check_for_cooperative_cancellation();
+            let query_plan_options = QueryPlanOptions {
+                override_conditions: plan_options.override_conditions,
+                check_for_cooperative_cancellation: Some(&check),
+                non_local_selections_limit_enabled: non_local_selections_check_enabled(),
+                disabled_subgraph_names: Default::default(),
+            };
+
+            let result = operation
+                .as_deref()
+                .map(|n| Name::new(n).map_err(FederationError::from))
+                .transpose()
+                .and_then(|operation| {
+                    rust_planner.build_query_plan(&doc.executable, operation, query_plan_options)
+                });
+            if let Err(FederationError::SingleFederationError(
+                SingleFederationError::InternalUnmergeableFields { .. },
+            )) = &result
+            {
+                u64_counter!(
+                    "apollo.router.operations.query_planner.unmergeable_fields",
+                    "Query planner caught attempting to merge unmergeable fields",
+                    1
+                );
+            }
+            let result = result.map_err(FederationErrorBridge::from);
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let outcome = match &result {
+                Ok(_) => QueryPlanningOutcome::Success,
+                Err(e) => QueryPlanningOutcome::from(e),
+            };
+            metric_query_planning_plan_duration(RUST_QP_MODE, elapsed, outcome, compute_job_type);
+
+            let plan = result?;
+            let root_node = convert_root_query_plan_node(&plan);
+            Ok((plan, root_node))
+        };
+        let (plan, mut root_node) = compute_job::execute(compute_job_type, job)
+            .map_err(MaybeBackPressureError::TemporaryError)?
+            .await?;
+        if let Some(node) = &mut root_node {
+            init_query_plan_root_node(node).map_err(QueryPlannerError::from)?;
+        }
+
+        Ok(QueryPlanResult {
+            formatted_query_plan: Some(Arc::new(plan.to_string())),
+            query_plan_root_node: root_node.map(Arc::new),
+            evaluated_plan_count: plan.statistics.evaluated_plan_count.clone().into_inner() as u64,
+            evaluated_plan_paths: plan.statistics.evaluated_plan_paths.clone().into_inner() as u64,
+            fuel_consumed: plan.statistics.fuel_consumed.get(),
+            fuel_remaining: plan.statistics.fuel_remaining.get(),
+            non_local_selections_count: plan.statistics.non_local_selections_count,
+        })
+    }
+
+    /// Simplified constructor for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        schema: Arc<Schema>,
+        configuration: Arc<Configuration>,
+    ) -> Result<Self, ServiceBuildError> {
+        let planner = Self::create_planner(&schema, &configuration)?;
+
+        Ok(Self::new(schema, configuration, planner))
+    }
+
+    pub(crate) fn new(
+        schema: Arc<Schema>,
+        configuration: Arc<Configuration>,
+        planner: Arc<QueryPlanner>,
+    ) -> Self {
+        let enable_authorization_directives =
+            AuthorizationPlugin::enable_directives(&configuration, &schema);
+        let federation_instrument = federation_version_instrument(schema.federation_version());
+        let signature_normalization_algorithm =
+            TelemetryConfig::signature_normalization_algorithm(&configuration);
+        let subgraph_schemas = hashed_subgraph_schemas(&planner);
+
+        Self {
+            planner,
+            schema,
+            subgraph_schemas,
+            enable_authorization_directives,
+            authorization_config: Arc::new(AuthorizationPlugin::configuration(&configuration)),
+            configuration,
+            _federation_instrument: federation_instrument,
+            signature_normalization_algorithm,
+        }
+    }
+
+    async fn parse_selections(
+        &self,
+        query: String,
+        operation_name: Option<&str>,
+        doc: &ParsedDocument,
+    ) -> Result<Query, QueryPlannerError> {
+        let executable = &doc.executable;
+
+        let (fragments, operation, defer_stats, schema_aware_hash) =
+            Query::extract_query_information(&self.schema, &query, executable, operation_name)?;
+
+        let subselections = crate::spec::query::subselections::collect_subselections(
+            &self.configuration,
+            &operation,
+            &fragments.map,
+            &defer_stats,
+        )?;
+        Ok(Query {
+            string: query,
+            fragments,
+            operation,
+            filtered_query: None,
+            unauthorized: UnauthorizedPaths {
+                paths: vec![],
+                errors: self.authorization_config.error_config(),
+            },
+            subselections,
+            defer_stats,
+            is_original: true,
+            schema_aware_hash,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn plan(
+        &self,
+        original_query: String,
+        filtered_query: String,
+        operation: Option<String>,
+        key: CacheKeyMetadata,
+        selections: Query,
+        plan_options: PlanOptions,
+        doc: &ParsedDocument,
+        compute_job_type: ComputeJobType,
+    ) -> Result<QueryPlannerContent, MaybeBackPressureError<QueryPlannerError>> {
+        let plan_result = self
+            .plan_inner(
+                doc,
+                operation.clone(),
+                plan_options,
+                compute_job_type,
+                |root_node| {
+                    // XXX(@goto-bus-stop): Maybe we can use the `QueryPlanner::subgraph_schemas`
+                    // type here directly to avoid having this additional subgraph_schemas field
+                    root_node.init_parsed_operations_and_hash_subqueries(&self.subgraph_schemas)?;
+                    root_node.extract_authorization_metadata(self.schema.supergraph_schema(), &key);
+                    Ok(())
+                },
+            )
+            .await?;
+        let QueryPlanResult {
+            query_plan_root_node,
+            formatted_query_plan,
+            evaluated_plan_count,
+            evaluated_plan_paths,
+            fuel_consumed,
+            fuel_remaining,
+            non_local_selections_count,
+        } = plan_result;
+
+        // If the query is filtered, we want to generate the signature using the original query and generate the
+        // reference using the filtered query. To do this, we need to re-parse the original query here.
+        let signature_doc = if original_query != filtered_query {
+            Query::parse_document(
+                &original_query,
+                operation.clone().as_deref(),
+                &self.schema,
+                &self.configuration,
+            )
+            .unwrap_or(doc.clone())
+        } else {
+            doc.clone()
+        };
+
+        let usage_reporting = generate_usage_reporting(
+            &signature_doc.executable,
+            &doc.executable,
+            &operation,
+            self.schema.supergraph_schema(),
+            &self.signature_normalization_algorithm,
+        );
+
+        u64_histogram!(
+            "apollo.router.query_planning.plan.evaluated_plans",
+            "Number of query plans evaluated for a query before choosing the best one",
+            evaluated_plan_count
+        );
+        u64_histogram!(
+            "apollo.router.query_planning.plan.evaluated_paths",
+            "Number of paths (including intermediate ones) considered to plan a query before starting to generate a plan",
+            evaluated_plan_paths
+        );
+        if let Some(non_local_selections_count) = non_local_selections_count {
+            metric_query_planning_non_local_selections(non_local_selections_count);
+        }
+        let span = tracing::Span::current();
+        if let Some(fuel_consumed) = fuel_consumed {
+            span.record("query_planning.fuel_consumed", fuel_consumed);
+            u64_histogram!(
+                "apollo.router.query_planning.plan.fuel_consumed",
+                "Fuel the incremental planner spent improving on its first complete plan",
+                fuel_consumed
+            );
+        }
+        if let Some(fuel_remaining) = fuel_remaining {
+            span.record("query_planning.fuel_remaining", fuel_remaining);
+            u64_histogram!(
+                "apollo.router.query_planning.plan.fuel_remaining",
+                "Fuel left when the incremental planner stopped searching; zero means the budget ran out",
+                fuel_remaining
+            );
+        }
+
+        Ok(Arc::new(QueryPlan {
+            usage_reporting: Arc::new(usage_reporting),
+            root: query_plan_root_node,
+            formatted_query_plan,
+            query: Arc::new(selections),
+            estimated_size: Default::default(),
+        }))
+    }
+}
+
+impl Service<QueryPlannerRequest> for QueryPlannerService {
+    type Response = QueryPlannerResponse;
+
+    type Error = MaybeBackPressureError<QueryPlannerError>;
+
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Backpressure is not exerted by the compute job pool currently, so we can only let the
+        // caller know about pool saturation once we actually try to submit a job.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: QueryPlannerRequest) -> Self::Future {
+        let start = Instant::now();
+        let QueryPlannerRequest {
+            query: original_query,
+            operation_name,
+            document,
+            metadata,
+            plan_options,
+            compute_job_type,
+        } = req;
+
+        let this = self.clone();
+        let fut = async move {
+            let mut doc = document;
+
+            let api_schema = this.schema.api_schema();
+            match add_defer_labels(api_schema, &doc.ast) {
+                Err(e) => {
+                    return Err(QueryPlannerError::SpecError(SpecError::TransformError(
+                        e.to_string(),
+                    ))
+                    .into());
+                }
+                Ok(modified_query) => {
+                    let executable_document = modified_query
+                        .to_executable_validate(api_schema)
+                        // Assume transformation creates a valid document: ignore conversion errors
+                        .map_err(|e| {
+                            QueryPlannerError::from(SpecError::ValidationError(e.into()))
+                        })?;
+                    let hash = this
+                        .schema
+                        .schema_id
+                        .operation_hash(&modified_query.to_string(), operation_name.as_deref());
+                    doc = ParsedDocumentInner::new(
+                        modified_query,
+                        Arc::new(executable_document),
+                        operation_name.as_deref(),
+                        Arc::new(hash),
+                    )
+                    .map_err(QueryPlannerError::from)?;
+                }
+            }
+
+            let res = this
+                .get(
+                    QueryKey {
+                        original_query,
+                        filtered_query: doc.ast.to_string(),
+                        operation_name: operation_name.to_owned(),
+                        metadata,
+                        plan_options,
+                    },
+                    doc,
+                    compute_job_type,
+                )
+                .await;
+
+            f64_histogram_with_unit!(
+                "apollo.router.query_planning.total.duration",
+                "Duration of the time the router waited for a query plan, including both the queue time and planning time, in seconds.",
+                "s",
+                start.elapsed().as_secs_f64()
+            );
+
+            match res {
+                Ok(query_planner_content) => Ok(QueryPlannerResponse::builder()
+                    .content(query_planner_content)
+                    .build()),
+                Err(e) => Err(e),
+            }
+        };
+
+        // Return the response as an immediate future
+        Box::pin(fut)
+    }
+}
+
+impl QueryPlannerService {
+    async fn get(
+        &self,
+        mut key: QueryKey,
+        mut doc: ParsedDocument,
+        compute_job_type: ComputeJobType,
+    ) -> Result<QueryPlannerContent, MaybeBackPressureError<QueryPlannerError>> {
+        let mut selections = self
+            .parse_selections(
+                key.original_query.clone(),
+                key.operation_name.as_deref(),
+                &doc,
+            )
+            .await?;
+
+        // TODO(@goto-bus-stop): this is not a query planning concern
+        let filter_res = if self.enable_authorization_directives {
+            AuthorizationPlugin::filter_query(&self.authorization_config, &key, &self.schema)?
+        } else {
+            FilterResult::Unchanged
+        };
+
+        match filter_res {
+            FilterResult::Unchanged => {}
+            // Filtering can empty the document; the federation planner cannot plan a
+            // document with no definitions, so answer with a plan that carries no work.
+            FilterResult::Filtered { paths, document } if document.definitions.is_empty() => {
+                selections.unauthorized.paths = paths;
+
+                // References come from the operation that ran, and nothing did.
+                let usage_reporting = generate_usage_reporting(
+                    &doc.executable,
+                    &ExecutableDocument::new(),
+                    &key.operation_name,
+                    self.schema.supergraph_schema(),
+                    &self.signature_normalization_algorithm,
+                );
+
+                return Ok(Arc::new(QueryPlan {
+                    usage_reporting: Arc::new(usage_reporting),
+                    root: None,
+                    formatted_query_plan: None,
+                    query: Arc::new(selections),
+                    estimated_size: Default::default(),
+                }));
+            }
+            FilterResult::Filtered {
+                paths,
+                document: new_doc,
+            } => {
+                let new_query = new_doc.to_string();
+                let new_hash = self
+                    .schema
+                    .schema_id
+                    .operation_hash(&new_query, key.operation_name.as_deref());
+
+                key.filtered_query = new_query;
+                let executable_document = new_doc
+                    .to_executable_validate(self.schema.api_schema())
+                    .map_err(|e| QueryPlannerError::from(SpecError::ValidationError(e.into())))?;
+                doc = ParsedDocumentInner::new(
+                    new_doc,
+                    Arc::new(executable_document),
+                    key.operation_name.as_deref(),
+                    Arc::new(new_hash),
+                )
+                .map_err(QueryPlannerError::from)?;
+                selections.unauthorized.paths = paths;
+            }
+        }
+
+        if key.filtered_query != key.original_query {
+            let mut filtered = self
+                .parse_selections(
+                    key.filtered_query.clone(),
+                    key.operation_name.as_deref(),
+                    &doc,
+                )
+                .await?;
+            filtered.is_original = false;
+            selections.filtered_query = Some(Arc::new(filtered));
+        }
+
+        self.plan(
+            key.original_query,
+            key.filtered_query,
+            key.operation_name,
+            key.metadata,
+            selections,
+            key.plan_options,
+            &doc,
+            compute_job_type,
+        )
+        .await
+    }
+}
+
+/// Default buckets for the incremental planner fuel histograms. Decades cover
+/// any `fuel` setting without depending on it, so series stay comparable when
+/// the setting changes, and `0` isolates searches that ran out of fuel.
+pub(crate) const FUEL_BUCKETS: &[f64] = &[
+    0.0,
+    1.0,
+    10.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    100_000.0,
+    1_000_000.0,
+];
+
+/// Default buckets for the non-local selections histogram. They bracket the
+/// default limit of 100,000 to observe how close operations get to it. The
+/// 150,000 bucket catches plans allowed by a raised
+/// `APOLLO_ROUTER_MAX_NON_LOCAL_SELECTIONS`.
+pub(crate) const NON_LOCAL_SELECTIONS_BUCKETS: &[f64] =
+    &[100.0, 1_000.0, 25_000.0, 50_000.0, 100_000.0, 150_000.0];
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QueryPlanResult {
+    pub(super) formatted_query_plan: Option<Arc<String>>,
+    pub(super) query_plan_root_node: Option<Arc<PlanNode>>,
+    pub(super) evaluated_plan_count: u64,
+    pub(super) evaluated_plan_paths: u64,
+    pub(super) fuel_consumed: Option<u64>,
+    pub(super) fuel_remaining: Option<u64>,
+    pub(super) non_local_selections_count: Option<u64>,
+}
+
+/// The outcome of a query-planning attempt. Shared across query-planning metrics (e.g.
+/// `apollo.router.query_planning.plan.duration` and `apollo.router.query_planning.warmup.*`) so
+/// they use a single vocabulary. Not every value is produced by every code path.
+#[derive(Copy, Clone, Debug, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum QueryPlanningOutcome {
+    Success,
+    Timeout,
+    Cancelled,
+    Error,
+    MemoryLimit,
+}
+
+impl_otel_value_from_static_str!(QueryPlanningOutcome);
+
+impl From<&FederationErrorBridge> for QueryPlanningOutcome {
+    fn from(err: &FederationErrorBridge) -> Self {
+        match err {
+            FederationErrorBridge::Cancellation(msg) if msg.contains("timeout") => {
+                QueryPlanningOutcome::Timeout
+            }
+            FederationErrorBridge::Cancellation(_) => QueryPlanningOutcome::Cancelled,
+            _ => QueryPlanningOutcome::Error,
+        }
+    }
+}
+
+impl From<&QueryPlannerError> for QueryPlanningOutcome {
+    fn from(err: &QueryPlannerError) -> Self {
+        match err {
+            QueryPlannerError::Timeout(_) => QueryPlanningOutcome::Timeout,
+            QueryPlannerError::MemoryLimitExceeded(_) => QueryPlanningOutcome::MemoryLimit,
+            QueryPlannerError::FederationError(bridge) => QueryPlanningOutcome::from(bridge),
+            _ => QueryPlanningOutcome::Error,
+        }
+    }
+}
+
+pub(crate) fn metric_query_planning_plan_duration(
+    planner: &'static str,
+    elapsed: f64,
+    outcome: QueryPlanningOutcome,
+    compute_job_type: ComputeJobType,
+) {
+    f64_histogram_with_unit!(
+        "apollo.router.query_planning.plan.duration",
+        "Duration of the query planning, in seconds.",
+        "s",
+        elapsed,
+        "planner" = planner,
+        "outcome" = outcome,
+        "job.type" = compute_job_type
+    );
+}
+
+pub(crate) fn metric_query_planning_non_local_selections(count: u64) {
+    u64_histogram_with_unit!(
+        "apollo.router.query_planning.plan.non_local_selections",
+        "Number of non-local selections estimated during query planning traversal",
+        "{selection}",
+        count
+    );
+}
+
+pub(crate) fn metric_rust_qp_init(init_error_kind: Option<&'static str>) {
+    if let Some(init_error_kind) = init_error_kind {
+        u64_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            "Rust query planner initialization",
+            1,
+            "init.error_kind" = init_error_kind,
+            "init.is_success" = false
+        );
+    } else {
+        u64_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            "Rust query planner initialization",
+            1,
+            "init.is_success" = true
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    use test_log::test;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::metrics::FutureMetricsExt as _;
+    use crate::services::subgraph;
+    use crate::services::supergraph;
+    use crate::spec::query::subselections::SubSelectionKey;
+    use crate::spec::query::subselections::SubSelectionValue;
+
+    const EXAMPLE_SCHEMA: &str = include_str!("testdata/schema.graphql");
+
+    #[test(tokio::test)]
+    async fn test_plan() {
+        let config = Arc::new(Configuration::default());
+        let schema = Arc::new(Schema::parse(EXAMPLE_SCHEMA, &config).unwrap());
+
+        let mut service = QueryPlannerService::for_test(schema.clone(), config.clone()).unwrap();
+
+        let query = include_str!("testdata/query.graphql");
+        let document = Query::parse_document(query, None, &schema, &config).unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                QueryPlannerRequest::builder()
+                    .query(query)
+                    .and_operation_name(document.operation.name.as_deref())
+                    .document(document)
+                    .compute_job_type(ComputeJobType::QueryPlanning)
+                    .metadata(CacheKeyMetadata::default())
+                    .plan_options(PlanOptions::default())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let plan = response.content.expect("successful response");
+        insta::with_settings!({sort_maps => true}, {
+            insta::assert_json_snapshot!("plan_usage_reporting", plan.usage_reporting);
+        });
+        insta::assert_debug_snapshot!("plan_root", plan.root.as_deref().expect("non-empty plan"));
+    }
+
+    #[test(tokio::test)]
+    async fn federation_versions() {
+        let sdl = include_str!("../testdata/minimal_fed1_supergraph.graphql");
+        let config = Arc::default();
+        let schema = Schema::parse(sdl, &config).unwrap();
+        let error = QueryPlannerService::for_test(schema.into(), config)
+            .err()
+            .expect("expected error for fed1 supergraph");
+        assert_eq!(
+            error.to_string(),
+            "failed to initialize the query planner: Supergraphs composed with federation version 1 are not supported. Please recompose your supergraph with federation version 2 or greater"
+        );
+
+        async {
+            let sdl = include_str!("../../tests/fixtures/supergraph-join-v0.2.graphql");
+            let config = Arc::default();
+            let schema = Schema::parse(sdl, &config).unwrap();
+            let error = QueryPlannerService::for_test(schema.into(), config)
+                .err()
+                .expect("expected error for join v0.2 supergraph");
+            assert_eq!(
+                error.to_string(),
+                "failed to initialize the query planner: Supergraphs using join spec v0.2 are not supported (minimum supported version is v0.3). Please recompose your supergraph with federation version 2.3 or greater"
+            );
+            assert_counter!(
+                "apollo.router.lifecycle.query_planner.init",
+                1,
+                "init.error_kind" = "unsupported_federation_version",
+                "init.is_success" = false
+            );
+        }
+        .with_metrics()
+        .await;
+
+        async {
+            let sdl = include_str!("../testdata/minimal_supergraph.graphql");
+            let config = Arc::default();
+            let schema = Schema::parse(sdl, &config).unwrap();
+            let _planner = QueryPlannerService::for_test(schema.into(), config).unwrap();
+
+            assert_gauge!(
+                "apollo.router.supergraph.federation",
+                1,
+                federation.version = 2
+            );
+        }
+        .with_metrics()
+        .await;
+    }
+
+    #[test(tokio::test)]
+    async fn noop_query_should_produce_empty_plan() {
+        let config = Configuration::default();
+        let config = Arc::new(config);
+
+        let schema = Arc::new(Schema::parse(EXAMPLE_SCHEMA, &config).unwrap());
+        let query = include_str!("testdata/noop_query.graphql");
+
+        let mut service = QueryPlannerService::for_test(schema.clone(), config.clone()).unwrap();
+
+        let document = Query::parse_document(query, None, &schema, &config).unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                QueryPlannerRequest::builder()
+                    .query(query)
+                    .and_operation_name(document.operation.name.as_deref())
+                    .document(document)
+                    .compute_job_type(ComputeJobType::QueryPlanning)
+                    .metadata(CacheKeyMetadata::default())
+                    .plan_options(PlanOptions::default())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let content = response.content.expect("expected a successful response");
+
+        let plan = content;
+
+        assert_eq!(plan.root, None, "expected an empty plan");
+    }
+
+    #[test(tokio::test)]
+    async fn test_subselections() {
+        let configuration: Configuration = Default::default();
+        let configuration = Arc::new(configuration);
+
+        let schema = Schema::parse(EXAMPLE_SCHEMA, &configuration).unwrap();
+        let planner = QueryPlannerService::for_test(schema.into(), configuration.clone()).unwrap();
+
+        macro_rules! s {
+            ($query: expr) => {
+                insta::assert_snapshot!(subselections_keys($query, &planner).await);
+            };
+        }
+        s!("query Q { me { username name { first last }}}");
+        s!(r#"query Q { me {
+            username
+            name {
+                first
+                ... @defer(label: "A") { last }
+            }
+        }}"#);
+        s!(r#"query Q { me {
+            username
+            name {
+                ... @defer(label: "A") { first }
+                ... @defer(label: "B") { last }
+            }
+        }}"#);
+        // Aliases
+        // FIXME: uncomment myName alias when this is fixed:
+        // https://github.com/apollographql/router/issues/3263
+        s!(r#"query Q { me {
+            username
+            # myName:
+             name {
+                firstName: first
+                ... @defer(label: "A") { lastName: last }
+            }
+        }}"#);
+        // Arguments
+        s!(r#"query Q { user(id: 42) {
+            username
+            name {
+                first
+                ... @defer(label: "A") { last }
+            }
+        }}"#);
+        // Type condition
+        s!(r#"query Q { me {
+            username
+            ... on User {
+                name {
+                    first
+                    ... @defer(label: "A") { last }
+                }
+            }
+        }}"#);
+        s!(r#"query Q { me {
+            username
+            ... on User @defer(label: "A") {
+                name { first last }
+            }
+        }}"#);
+        s!(r#"query Q { me {
+            username
+            ... @defer(label: "A") {
+                ... on User {
+                    name { first last }
+                }
+            }
+        }}"#);
+        // Array + argument
+        s!(r#"query Q { me {
+            id
+            reviews {
+                id
+                ... @defer(label: "A") { body(format: true) }
+            }
+        }}"#);
+        // Fragment spread becomes inline fragment
+        s!(r#"
+            query Q { me { username name { ... FirstLast @defer(label: "A") }}}
+            fragment FirstLast on Name { first last }
+        "#);
+        s!(r#"
+            query Q { me { username name { ... FirstLast @defer(label: "A") }}}
+            fragment FirstLast on Name { first ... @defer(label: "B") { last }}
+        "#);
+        // Nested
+        s!(r#"query Q { me {
+            username
+            ... @defer(label: "A") { name {
+                first
+                ... @defer(label: "B") { last }
+            }}
+        }}"#);
+        s!(r#"query Q { me {
+            id
+            ... @defer(label: "A") {
+                username
+                ... @defer(label: "B") { name {
+                    first
+                    ... @defer(label: "C") { last }
+                }}
+            }
+        }}"#);
+        // Conditional
+        s!(r#"query Q($d1:Boolean!) { me {
+            username
+            name {
+                first
+                ... @defer(if: $d1, label: "A") { last }
+            }
+        }}"#);
+        s!(r#"query Q($d1:Boolean!, $d2:Boolean!) { me {
+            username
+            ... @defer(if: $d1, label: "A") { name {
+                first
+                ... @defer(if: $d2, label: "B") { last }
+            }}
+        }}"#);
+        s!(r#"query Q($d1:Boolean!, $d2:Boolean!) { me {
+            username
+            name {
+                ... @defer(if: $d1, label: "A") { first }
+                ... @defer(if: $d2, label: "B") { last }
+            }
+        }}"#);
+        // Mixed conditional and unconditional
+        s!(r#"query Q($d1:Boolean!) { me {
+            username
+            name {
+                ... @defer(label: "A") { first }
+                ... @defer(if: $d1, label: "B") { last }
+            }
+        }}"#);
+        // Include/skip
+        s!(r#"query Q($s1:Boolean!) { me {
+            username
+            name {
+                ... @defer(label: "A") {
+                    first
+                    last @skip(if: $s1)
+                }
+            }
+        }}"#);
+    }
+
+    async fn subselections_keys(query: &str, planner: &QueryPlannerService) -> String {
+        fn check_query_plan_coverage(
+            node: &PlanNode,
+            parent_label: Option<&str>,
+            subselections: &HashMap<SubSelectionKey, SubSelectionValue>,
+        ) {
+            match node {
+                PlanNode::Defer { primary, deferred } => {
+                    if let Some(subselection) = primary.subselection.clone() {
+                        assert!(
+                            subselections
+                                .keys()
+                                .any(|k| k.defer_label.as_deref() == parent_label),
+                            "Missing key: '{:?}' '{}' in {:?}",
+                            parent_label,
+                            subselection,
+                            subselections.keys().collect::<Vec<_>>()
+                        );
+                    }
+                    for deferred in deferred {
+                        if let Some(subselection) = deferred.subselection.clone() {
+                            let path = deferred.query_path.clone();
+                            assert!(
+                                subselections
+                                    .keys()
+                                    .any(|k| k.defer_label.as_deref() == deferred.label.as_deref()),
+                                "Missing key: '{}' '{:?}' '{}'",
+                                path,
+                                deferred.label,
+                                subselection
+                            );
+                        }
+                        if let Some(node) = &deferred.node {
+                            check_query_plan_coverage(
+                                node,
+                                deferred.label.as_deref(),
+                                subselections,
+                            )
+                        }
+                    }
+                }
+                PlanNode::Sequence { nodes } | PlanNode::Parallel { nodes } => {
+                    for node in nodes {
+                        check_query_plan_coverage(node, parent_label, subselections)
+                    }
+                }
+                PlanNode::Fetch(_) => {}
+                PlanNode::Flatten(flatten) => {
+                    check_query_plan_coverage(&flatten.node, parent_label, subselections)
+                }
+                PlanNode::Condition {
+                    condition: _,
+                    if_clause,
+                    else_clause,
+                } => {
+                    if let Some(node) = if_clause {
+                        check_query_plan_coverage(node, parent_label, subselections)
+                    }
+                    if let Some(node) = else_clause {
+                        check_query_plan_coverage(node, parent_label, subselections)
+                    }
+                }
+                PlanNode::Subscription { rest, .. } => {
+                    if let Some(node) = rest {
+                        check_query_plan_coverage(node, parent_label, subselections)
+                    }
+                }
+            }
+        }
+
+        fn serialize_selection_set(selection_set: &[crate::spec::Selection], to: &mut String) {
+            if let Some((first, rest)) = selection_set.split_first() {
+                to.push_str("{ ");
+                serialize_selection(first, to);
+                for sel in rest {
+                    to.push(' ');
+                    serialize_selection(sel, to);
+                }
+                to.push_str(" }");
+            }
+        }
+
+        fn serialize_selection(selection: &crate::spec::Selection, to: &mut String) {
+            match selection {
+                crate::spec::Selection::Field {
+                    name,
+                    alias,
+                    selection_set,
+                    ..
+                } => {
+                    if let Some(alias) = alias {
+                        to.push_str(alias.as_str());
+                        to.push_str(": ");
+                    }
+                    to.push_str(name.as_str());
+                    if let Some(sel) = selection_set {
+                        to.push(' ');
+                        serialize_selection_set(sel, to)
+                    }
+                }
+                crate::spec::Selection::InlineFragment {
+                    type_condition,
+                    selection_set,
+                    ..
+                } => {
+                    to.push_str("... on ");
+                    to.push_str(type_condition);
+                    serialize_selection_set(selection_set, to)
+                }
+                crate::spec::Selection::FragmentSpread { .. } => unreachable!(),
+            }
+        }
+
+        let configuration: Configuration = Default::default();
+        let configuration = Arc::new(configuration);
+
+        let doc = Query::parse_document(query, None, &planner.schema, &configuration).unwrap();
+
+        let result = planner
+            .get(
+                QueryKey {
+                    original_query: query.to_string(),
+                    filtered_query: query.to_string(),
+                    operation_name: None,
+                    metadata: CacheKeyMetadata::default(),
+                    plan_options: PlanOptions::default(),
+                },
+                doc,
+                ComputeJobType::QueryPlanning,
+            )
+            .await
+            .unwrap();
+
+        let plan = result;
+        check_query_plan_coverage(
+            plan.root.as_ref().expect("non-empty query plan"),
+            None,
+            &plan.query.subselections,
+        );
+
+        let mut keys: Vec<String> = Vec::new();
+        for (key, value) in plan.query.subselections.iter() {
+            let mut serialized = String::from("query");
+            serialize_selection_set(&value.selection_set, &mut serialized);
+            keys.push(format!(
+                "{:?} {} {}",
+                key.defer_label, key.defer_conditions.bits, serialized
+            ))
+        }
+        keys.sort();
+        keys.join("\n")
+    }
+
+    /// An unauthenticated client requesting only fields that require authentication gets
+    /// an empty query plan: nothing to execute, and every requested field in
+    /// `unauthorized.paths`.
+    #[test(tokio::test)]
+    async fn fully_unauthorized_operation_plans_no_work() {
+        let configuration: Configuration = serde_json::from_value(serde_json::json!({
+            "authorization": { "directives": { "enabled": true } }
+        }))
+        .unwrap();
+        let configuration = Arc::new(configuration);
+
+        // `Query.me` requires the `profile` scope.
+        let schema = include_str!("../../tests/fixtures/supergraph-auth.graphql");
+        let schema = Arc::new(Schema::parse(schema, &configuration).unwrap());
+        let planner = QueryPlannerService::for_test(schema.clone(), configuration.clone()).unwrap();
+
+        let query = "query { me { name } }";
+        let doc = Query::parse_document(query, None, &schema, &configuration).unwrap();
+
+        let response = planner
+            .oneshot(QueryPlannerRequest {
+                query: query.to_string(),
+                operation_name: None,
+                document: doc,
+                metadata: CacheKeyMetadata::default(),
+                plan_options: PlanOptions::default(),
+                compute_job_type: ComputeJobType::QueryPlanning,
+            })
+            .await
+            .unwrap();
+
+        let plan = response.content.expect("planning succeeded");
+        assert!(
+            plan.root.is_none(),
+            "the plan must carry no fetches when every requested field failed authorization"
+        );
+        assert_eq!(
+            plan.query
+                .unauthorized
+                .paths
+                .first()
+                .map(ToString::to_string),
+            Some("/me".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rust_mode_subgraph_operation_serialization() {
+        let subgraph_queries = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let subgraph_queries2 = Arc::clone(&subgraph_queries);
+        let mut harness = crate::TestHarness::builder()
+            // auth is not relevant here, but supergraph.graphql uses join/v0.1
+            // which is not supported by the Rust query planner
+            .schema(include_str!("../../tests/fixtures/supergraph-auth.graphql"))
+            .subgraph_hook(move |_name, _default| {
+                let subgraph_queries = Arc::clone(&subgraph_queries);
+                tower::service_fn(move |request: subgraph::Request| {
+                    let subgraph_queries = Arc::clone(&subgraph_queries);
+                    async move {
+                        let query = request
+                            .subgraph_request
+                            .body()
+                            .query
+                            .as_deref()
+                            .unwrap_or_default();
+                        let mut queries = subgraph_queries.lock().await;
+                        queries.push_str(query);
+                        queries.push('\n');
+                        Ok(subgraph::Response::builder()
+                            .extensions(crate::json_ext::Object::new())
+                            .id(request.id)
+                            .context(request.context)
+                            .subgraph_name(String::default())
+                            .build())
+                    }
+                })
+                .boxed_clone()
+            })
+            .build_supergraph()
+            .await
+            .unwrap();
+
+        let request = supergraph::Request::fake_builder()
+            .query("{ topProducts { name }}")
+            .build()
+            .unwrap();
+        let mut response = harness.ready().await.unwrap().call(request).await.unwrap();
+        assert!(response.response.status().is_success());
+        let response = response.next_response().await.unwrap();
+        assert!(response.errors.is_empty());
+
+        let subgraph_queries = subgraph_queries2.lock().await;
+        insta::assert_snapshot!(*subgraph_queries, @"{ topProducts { name } }")
+    }
+
+    #[test]
+    fn test_metric_query_planning_plan_duration() {
+        let start = Instant::now();
+        let elapsed = start.elapsed().as_secs_f64();
+        metric_query_planning_plan_duration(
+            RUST_QP_MODE,
+            elapsed,
+            QueryPlanningOutcome::Success,
+            ComputeJobType::QueryPlanning,
+        );
+        assert_histogram_exists!(
+            "apollo.router.query_planning.plan.duration",
+            f64,
+            "planner" = "rust",
+            "outcome" = "success",
+            "job.type" = "query_planning"
+        );
+        // Warm-up planning is distinguished by the `job.type` attribute.
+        metric_query_planning_plan_duration(
+            RUST_QP_MODE,
+            elapsed,
+            QueryPlanningOutcome::Success,
+            ComputeJobType::QueryPlanningWarmup,
+        );
+        assert_histogram_exists!(
+            "apollo.router.query_planning.plan.duration",
+            f64,
+            "planner" = "rust",
+            "outcome" = "success",
+            "job.type" = "query_planning_warmup"
+        );
+    }
+
+    #[test]
+    fn test_metric_rust_qp_initialization() {
+        metric_rust_qp_init(None);
+        assert_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            1,
+            "init.is_success" = true
+        );
+        metric_rust_qp_init(Some(UNSUPPORTED_FED1));
+        assert_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            1,
+            "init.error_kind" = "fed1",
+            "init.is_success" = false
+        );
+        metric_rust_qp_init(Some(UNSUPPORTED_FEDERATION_VERSION));
+        assert_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            1,
+            "init.error_kind" = "unsupported_federation_version",
+            "init.is_success" = false
+        );
+        metric_rust_qp_init(Some(INTERNAL_INIT_ERROR));
+        assert_counter!(
+            "apollo.router.lifecycle.query_planner.init",
+            1,
+            "init.error_kind" = "internal",
+            "init.is_success" = false
+        );
+    }
+
+    #[test(tokio::test)]
+    async fn test_evaluated_plans_histogram() {
+        async {
+            let config = Arc::new(Configuration::default());
+            let schema = Arc::new(Schema::parse(EXAMPLE_SCHEMA, &config).unwrap());
+
+            let mut service =
+                QueryPlannerService::for_test(schema.clone(), config.clone()).unwrap();
+
+            let query = include_str!("testdata/query.graphql");
+            let document = Query::parse_document(query, None, &schema, &config).unwrap();
+
+            let _response = service
+                .ready()
+                .await
+                .unwrap()
+                .call(
+                    QueryPlannerRequest::builder()
+                        .query(query)
+                        .and_operation_name(document.operation.name.as_deref())
+                        .document(document)
+                        .compute_job_type(ComputeJobType::QueryPlanning)
+                        .metadata(CacheKeyMetadata::default())
+                        .plan_options(PlanOptions::default())
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            assert_histogram_exists!("apollo.router.query_planning.plan.evaluated_plans", u64);
+        }
+        .with_metrics()
+        .await;
+    }
+
+    async fn plan_example_query(config: Configuration) {
+        let config = Arc::new(config);
+        let schema = Arc::new(Schema::parse(EXAMPLE_SCHEMA, &config).unwrap());
+        let mut service = QueryPlannerService::for_test(schema.clone(), config.clone()).unwrap();
+        let query = include_str!("testdata/query.graphql");
+        let document = Query::parse_document(query, None, &schema, &config).unwrap();
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                QueryPlannerRequest::builder()
+                    .query(query)
+                    .and_operation_name(document.operation.name.as_deref())
+                    .document(document)
+                    .compute_job_type(ComputeJobType::QueryPlanning)
+                    .metadata(CacheKeyMetadata::default())
+                    .plan_options(PlanOptions::default())
+                    .build(),
+            )
+            .await
+            .expect("query plans");
+    }
+
+    #[test(tokio::test)]
+    async fn test_non_local_selections_histogram() {
+        async {
+            plan_example_query(Configuration::default()).await;
+
+            assert_histogram_exists!(
+                "apollo.router.query_planning.plan.non_local_selections",
+                u64
+            );
+            assert_histogram_count!("apollo.router.query_planning.plan.non_local_selections", 1);
+            assert_histogram_sum!("apollo.router.query_planning.plan.non_local_selections", 7);
+        }
+        .with_metrics()
+        .await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_fuel_histograms_with_incremental_planner() {
+        async {
+            let config = Configuration::from_str(indoc::indoc! {"
+                supergraph:
+                  query_planning:
+                    incremental_planner:
+                      enabled: true
+            "})
+            .expect("valid configuration");
+            plan_example_query(config).await;
+
+            assert_histogram_exists!("apollo.router.query_planning.plan.fuel_consumed", u64);
+            assert_histogram_exists!("apollo.router.query_planning.plan.fuel_remaining", u64);
+        }
+        .with_metrics()
+        .await;
+    }
+
+    #[test(tokio::test)]
+    async fn test_no_fuel_histograms_without_incremental_planner() {
+        async {
+            plan_example_query(Configuration::default()).await;
+
+            assert_histogram_not_exists!("apollo.router.query_planning.plan.fuel_consumed", u64);
+            assert_histogram_not_exists!("apollo.router.query_planning.plan.fuel_remaining", u64);
+        }
+        .with_metrics()
+        .await;
+    }
+
+    /// Captures u64 values recorded on spans after creation.
+    #[derive(Clone, Default)]
+    struct RecordedU64s(Arc<parking_lot::Mutex<HashMap<String, u64>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedU64s {
+        fn on_record(
+            &self,
+            _span: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor<'a>(&'a mut HashMap<String, u64>);
+            impl tracing_core::field::Visit for Visitor<'_> {
+                fn record_u64(&mut self, field: &tracing_core::Field, value: u64) {
+                    self.0.insert(field.name().to_string(), value);
+                }
+                fn record_debug(&mut self, _: &tracing_core::Field, _: &dyn std::fmt::Debug) {}
+            }
+            values.record(&mut Visitor(&mut self.0.lock()));
+        }
+    }
+
+    async fn recorded_on_query_planning_span(config: Configuration) -> HashMap<String, u64> {
+        use tracing_futures::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let recorded = RecordedU64s::default();
+        let subscriber = tracing_subscriber::Registry::default().with(recorded.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        plan_example_query(config)
+            .instrument(crate::services::supergraph::service::query_planning_span())
+            .await;
+        recorded.0.lock().clone()
+    }
+
+    #[test(tokio::test)]
+    async fn test_fuel_recorded_on_query_planning_span_with_incremental_planner() {
+        let config = Configuration::from_str(indoc::indoc! {"
+            supergraph:
+              query_planning:
+                incremental_planner:
+                  enabled: true
+                  fuel: 5000
+        "})
+        .expect("valid configuration");
+        let recorded = recorded_on_query_planning_span(config).await;
+
+        let consumed = recorded
+            .get("query_planning.fuel_consumed")
+            .expect("fuel consumed is recorded");
+        let remaining = recorded
+            .get("query_planning.fuel_remaining")
+            .expect("fuel remaining is recorded");
+        assert_eq!(consumed + remaining, 5000);
+    }
+
+    #[test(tokio::test)]
+    async fn test_no_fuel_on_query_planning_span_without_incremental_planner() {
+        let recorded = recorded_on_query_planning_span(Configuration::default()).await;
+
+        assert!(!recorded.contains_key("query_planning.fuel_consumed"));
+        assert!(!recorded.contains_key("query_planning.fuel_remaining"));
+    }
+}

@@ -1,0 +1,1104 @@
+mod headers;
+mod http_json_transport;
+mod keys;
+mod problem_location;
+mod source;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use apollo_compiler::Name;
+use apollo_compiler::Schema;
+use apollo_compiler::collections::HashSet;
+use apollo_compiler::collections::IndexMap;
+use apollo_compiler::collections::IndexSet;
+use apollo_compiler::executable::FieldSet;
+use apollo_compiler::schema::ExtendedType;
+use apollo_compiler::schema::Type;
+use apollo_compiler::validation::Valid;
+use keys::make_key_field_set_from_variables;
+use serde_json::Value;
+use shape::Shape;
+
+pub use self::headers::Header;
+pub(crate) use self::headers::HeaderParseError;
+pub use self::headers::HeaderSource;
+pub use self::headers::OriginatingDirective;
+pub use self::http_json_transport::HTTPMethod;
+pub use self::http_json_transport::HttpJsonTransport;
+pub use self::http_json_transport::MakeUriError;
+pub use self::http_json_transport::McpCall;
+pub use self::http_json_transport::StreamMode;
+pub use self::problem_location::ProblemLocation;
+pub use self::source::SourceName;
+use super::ConnectId;
+use super::JSONSelection;
+use super::PathSelection;
+use super::id::ConnectorPosition;
+use super::json_selection::VarPaths;
+use super::spec::connect::ConnectBatchArguments;
+use super::spec::connect::ConnectDirectiveArguments;
+use super::spec::errors::ErrorsArguments;
+use super::spec::source::SourceDirectiveArguments;
+use super::variable::Namespace;
+use super::variable::VariableReference;
+use crate::connectors::ConnectSpec;
+use crate::connectors::spec::ConnectLink;
+use crate::connectors::spec::extract_connect_directive_arguments;
+use crate::connectors::spec::extract_source_directive_arguments;
+use crate::error::FederationError;
+use crate::error::SingleFederationError;
+
+// --- Connector ---------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Connector {
+    pub id: ConnectId,
+    /// HTTP transport configuration. `None` for mapping-only connectors (where `http` is omitted).
+    pub transport: Option<HttpJsonTransport>,
+    pub selection: JSONSelection,
+    pub config: Option<CustomConfiguration>,
+    pub max_requests: Option<usize>,
+
+    /// The type of entity resolver to use for this connector
+    pub entity_resolver: Option<EntityResolver>,
+    /// Which version of the connect spec is this connector using?
+    pub spec: ConnectSpec,
+
+    /// All supertype-subtype(s) relationships from the source schema.
+    pub schema_subtypes_map: IndexMap<String, IndexSet<String>>,
+
+    /// The request headers referenced in the connectors request mapping
+    pub request_headers: HashSet<String>,
+    /// The request or response headers referenced in the connectors response mapping
+    pub response_headers: HashSet<String>,
+    /// Environment and context variable keys referenced in the connector
+    pub request_variable_keys: IndexMap<Namespace, IndexSet<String>>,
+    pub response_variable_keys: IndexMap<Namespace, IndexSet<String>>,
+
+    pub batch_settings: Option<ConnectBatchArguments>,
+
+    pub error_settings: ConnectorErrorsSettings,
+
+    /// The GraphQL type this field is declared to return. `None` when
+    /// unknown, e.g. for type-level connectors, which have no field
+    /// definition to inspect. Used at runtime (via `Type::is_list` /
+    /// `Type::is_non_null`) to detect shape mismatches between the connector
+    /// response and the expected field type.
+    pub output_type: Option<Type>,
+
+    /// A label for use in debugging and logging. Includes ID, transport method, and path.
+    pub label: Label,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorErrorsSettings {
+    pub message: Option<JSONSelection>,
+    pub source_extensions: Option<JSONSelection>,
+    pub connect_extensions: Option<JSONSelection>,
+    pub connect_is_success: Option<JSONSelection>,
+}
+
+impl ConnectorErrorsSettings {
+    fn from_directive(
+        connect_errors: Option<&ErrorsArguments>,
+        source_errors: Option<&ErrorsArguments>,
+        connect_is_success: Option<&JSONSelection>,
+    ) -> Self {
+        let message = connect_errors
+            .and_then(|e| e.message.as_ref())
+            .or_else(|| source_errors.and_then(|e| e.message.as_ref()))
+            .cloned();
+        let source_extensions = source_errors.and_then(|e| e.extensions.as_ref()).cloned();
+        let connect_extensions = connect_errors.and_then(|e| e.extensions.as_ref()).cloned();
+        let connect_is_success = connect_is_success.cloned();
+        Self {
+            message,
+            source_extensions,
+            connect_extensions,
+            connect_is_success,
+        }
+    }
+
+    pub fn variable_references(&self) -> impl Iterator<Item = VariableReference<Namespace>> + '_ {
+        self.message
+            .as_ref()
+            .into_iter()
+            .flat_map(|m| m.variable_references())
+            .chain(
+                self.source_extensions
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|m| m.variable_references()),
+            )
+            .chain(
+                self.connect_extensions
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|m| m.variable_references()),
+            )
+            .chain(
+                self.connect_is_success
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|m| m.variable_references()),
+            )
+    }
+
+    /// The static shape of the error-path contribution to the connector's
+    /// output: a union of the shapes of `errors.message`, `errors.extensions`
+    /// (both `@source` and `@connect` levels). Returns `None` when no error
+    /// mappings are configured.
+    pub fn shape(&self) -> Option<Shape> {
+        let parts: Vec<Shape> = [
+            self.message.as_ref(),
+            self.source_extensions.as_ref(),
+            self.connect_extensions.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|s| s.shape())
+        .collect();
+
+        match parts.len() {
+            0 => None,
+            1 => parts.into_iter().next(),
+            _ => Some(Shape::one(parts, [])),
+        }
+    }
+}
+
+pub type CustomConfiguration = Arc<HashMap<String, Value>>;
+
+/// Entity resolver type
+///
+/// A connector can be used as a potential entity resolver for a type, with
+/// extra validation rules based on the transport args and field position within
+/// a schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityResolver {
+    /// The user defined a connector on a field that acts as an entity resolver
+    Explicit,
+
+    /// The user defined a connector on a field of a type, so we need an entity resolver for that type
+    Implicit,
+
+    /// The user defined a connector on the type directly and uses the $batch variable
+    TypeBatch,
+
+    /// The user defined a connector on the type directly and uses the $this variable
+    TypeSingle,
+}
+
+impl Connector {
+    /// Get a map of connectors from an apollo_compiler::Schema.
+    ///
+    /// Note: the function assumes that we've checked that the schema is valid
+    /// before calling this function. We can't take a `Valid<Schema>` or `ValidFederationSchema`
+    /// because we use this code in validation, which occurs before we've augmented
+    /// the schema with types from `@link` directives.
+    pub fn from_schema(schema: &Schema, subgraph_name: &str) -> Result<Vec<Self>, FederationError> {
+        let Some(link) = ConnectLink::new(schema) else {
+            return Ok(Default::default());
+        };
+        let link = link.map_err(|message| SingleFederationError::UnknownLinkVersion {
+            message: message.message,
+        })?;
+
+        let source_arguments =
+            extract_source_directive_arguments(schema, &link.source_directive_name)?;
+
+        let connect_arguments =
+            extract_connect_directive_arguments(schema, &link.connect_directive_name)?;
+
+        connect_arguments
+            .into_iter()
+            .map(|args| {
+                Self::from_directives(schema, subgraph_name, link.spec, args, &source_arguments)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn from_directives(
+        schema: &Schema,
+        subgraph_name: &str,
+        spec: ConnectSpec,
+        connect: ConnectDirectiveArguments,
+        source_arguments: &[SourceDirectiveArguments],
+    ) -> Result<Self, FederationError> {
+        let source = connect
+            .source
+            .and_then(|name| source_arguments.iter().find(|s| s.name == name));
+        let source_name = source.map(|s| s.name.clone());
+
+        // Create our transport (absent for mapping-only connectors)
+        let source_http = source.map(|s| &s.http);
+        let transport = match (connect.http, connect.mcp) {
+            (Some(connect_http), _) => Some(HttpJsonTransport::from_directive(
+                connect_http,
+                source_http,
+                spec,
+            )?),
+            (None, Some(connect_mcp)) => Some(HttpJsonTransport::from_mcp_directive(
+                connect_mcp,
+                source.and_then(|s| Some((&s.http, s.mcp.as_ref()?))),
+                spec,
+            )?),
+            (None, None) => None,
+        };
+
+        // Get our batch and error settings
+        let batch_settings = connect.batch;
+        let connect_errors = connect.errors.as_ref();
+        let source_errors = source.and_then(|s| s.errors.as_ref());
+        // Use the connector setting if available, otherwise, use source setting
+        let is_success = connect
+            .is_success
+            .as_ref()
+            .or_else(|| source.and_then(|s| s.is_success.as_ref()));
+
+        let error_settings =
+            ConnectorErrorsSettings::from_directive(connect_errors, source_errors, is_success);
+
+        // Collect all variables and subselections used in the request mappings
+        let request_references: IndexSet<VariableReference<Namespace>> = transport
+            .as_ref()
+            .map(|t| t.variable_references().collect())
+            .unwrap_or_default();
+
+        // Collect all variables and subselections used in response mappings (including errors.message and errors.extensions)
+        let response_references: IndexSet<VariableReference<Namespace>> = connect
+            .selection
+            .variable_references()
+            .chain(error_settings.variable_references())
+            .collect();
+
+        // Store a map of variable names and the set of first-level of keys so we can
+        // more efficiently clone values for mappings (especially for $context and $env)
+        let request_variable_keys = extract_variable_key_references(request_references.iter());
+        let response_variable_keys = extract_variable_key_references(response_references.iter());
+
+        // Store a set of header names referenced in mappings (these are second-level keys)
+        let request_headers = extract_header_references(&request_references); // $request in request mappings
+        let response_headers = extract_header_references(&response_references); // $request or $response in response mappings
+
+        // Last couple of items here!
+        let entity_resolver = determine_entity_resolver(
+            &connect.position,
+            connect.entity,
+            schema,
+            &request_variable_keys,
+        );
+        let label = Label::new(
+            subgraph_name,
+            source_name.as_ref(),
+            transport.as_ref(),
+            entity_resolver.as_ref(),
+        );
+        let output_type = connect
+            .position
+            .field_definition(schema)
+            .map(|f| f.ty.clone());
+
+        let id = ConnectId {
+            subgraph_name: subgraph_name.to_string(),
+            source_name,
+            named: connect.connector_id,
+            directive: connect.position,
+        };
+
+        Ok(Connector {
+            id,
+            transport,
+            selection: connect.selection,
+            entity_resolver,
+            config: None,
+            max_requests: None,
+            spec,
+            schema_subtypes_map: Connector::subtypes_map_from_schema(schema),
+            request_headers,
+            response_headers,
+            request_variable_keys,
+            response_variable_keys,
+            batch_settings,
+            error_settings,
+            output_type,
+            label,
+        })
+    }
+
+    pub fn subtypes_map_from_schema(schema: &Schema) -> IndexMap<String, IndexSet<String>> {
+        let mut subtypes_map: IndexMap<String, IndexSet<String>> = IndexMap::default();
+
+        // Find any `implements` relationships in object or interface types.
+        for (name, ty) in schema.types.iter() {
+            match ty {
+                ExtendedType::Object(o) => {
+                    for supertype in &o.implements_interfaces {
+                        subtypes_map
+                            .entry(supertype.to_string())
+                            .or_default()
+                            .insert(name.to_string());
+                    }
+                }
+                ExtendedType::Interface(i) => {
+                    for supertype in &i.implements_interfaces {
+                        subtypes_map
+                            .entry(supertype.to_string())
+                            .or_default()
+                            .insert(name.to_string());
+                    }
+                }
+                ExtendedType::Union(u) => {
+                    for member in &u.members {
+                        subtypes_map
+                            .entry(u.name.to_string())
+                            .or_default()
+                            .insert(member.to_string());
+                    }
+                }
+                _ => {
+                    // No other types have .implements_interfaces
+                }
+            }
+        }
+
+        subtypes_map
+    }
+
+    pub(crate) fn variable_references(&self) -> impl Iterator<Item = VariableReference<Namespace>> {
+        let transport_refs = self
+            .transport
+            .as_ref()
+            .into_iter()
+            .flat_map(|t| t.variable_references());
+        let selection_refs = self
+            .selection
+            .external_var_paths()
+            .into_iter()
+            .flat_map(PathSelection::variable_reference);
+        transport_refs.chain(selection_refs)
+    }
+
+    /// Create a field set for a `@key` using `$args`, `$this`, or `$batch` variables.
+    pub fn resolvable_key(&self, schema: &Schema) -> Result<Option<Valid<FieldSet>>, String> {
+        match &self.entity_resolver {
+            None => Ok(None),
+            Some(EntityResolver::Explicit) => {
+                make_key_field_set_from_variables(
+                    schema,
+                    &self.id.directive.base_type_name(schema).ok_or_else(|| {
+                        format!("Missing field {}", self.id.directive.coordinate())
+                    })?,
+                    self.variable_references(),
+                    Namespace::Args,
+                )
+            }
+            Some(EntityResolver::Implicit) => {
+                make_key_field_set_from_variables(
+                    schema,
+                    &self.id.directive.parent_type_name().ok_or_else(|| {
+                        format!("Missing type {}", self.id.directive.coordinate())
+                    })?,
+                    self.variable_references(),
+                    Namespace::This,
+                )
+            }
+            Some(EntityResolver::TypeBatch) => {
+                make_key_field_set_from_variables(
+                    schema,
+                    &self.id.directive.base_type_name(schema).ok_or_else(|| {
+                        format!("Missing type {}", self.id.directive.coordinate())
+                    })?,
+                    self.variable_references(),
+                    Namespace::Batch,
+                )
+            }
+            Some(EntityResolver::TypeSingle) => {
+                make_key_field_set_from_variables(
+                    schema,
+                    &self.id.directive.base_type_name(schema).ok_or_else(|| {
+                        format!("Missing type {}", self.id.directive.coordinate())
+                    })?,
+                    self.variable_references(),
+                    Namespace::This,
+                )
+            }
+        }
+        .map_err(|err| {
+            format!(
+                "Failed to create key for connector {}: {}",
+                self.id.coordinate(),
+                err.errors
+                    .iter()
+                    .map(|d| d.error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })
+    }
+
+    /// Create an identifier for this connector that can be used for configuration and service identification
+    /// `source_name` will be `None` here when we are using a "sourceless" connector. In this situation, we'll use
+    /// the `synthetic_name` instead so that we have some kind of a unique identifier for this source.
+    pub fn source_config_key(&self) -> String {
+        if let Some(source_name) = &self.id.source_name {
+            format!("{}.{}", self.id.subgraph_name, source_name)
+        } else {
+            format!("{}.{}", self.id.subgraph_name, self.id.synthetic_name())
+        }
+    }
+
+    /// Get the name of the `@connect` directive associated with this [`Connector`] instance.
+    ///
+    /// The [`Name`] can be used to help locate the connector within a source file.
+    pub fn name(&self) -> Name {
+        match &self.id.directive {
+            ConnectorPosition::Field(field_position) => field_position.directive_name.clone(),
+            ConnectorPosition::Type(type_position) => type_position.directive_name.clone(),
+        }
+    }
+
+    /// Get the `id`` of the `@connect` directive associated with this [`Connector`] instance.
+    pub fn id(&self) -> String {
+        self.id.name()
+    }
+
+    /// Get the set of abstract type names from the schema subtypes map
+    pub fn abstract_types(&self) -> IndexSet<String> {
+        self.schema_subtypes_map.keys().cloned().collect()
+    }
+
+    /// The full static output shape of the connector — the shape of `selection`
+    /// unioned with the shape contributed by the error-path mappings
+    /// (`errors.message` and `errors.extensions`). When no error mappings are
+    /// configured, this is equivalent to `self.selection.shape()`.
+    ///
+    /// Returning the union lets downstream consumers (entity-key checking,
+    /// type walking) reason about both branches of an errors-as-data connector
+    /// rather than seeing only the success path.
+    pub fn output_shape(&self) -> Shape {
+        let selection_shape = self.selection.shape();
+        match self.error_settings.shape() {
+            Some(error_shape) => Shape::one([selection_shape, error_shape], []),
+            None => selection_shape,
+        }
+    }
+}
+
+/// A descriptive label for a connector, used for debugging and logging.
+#[derive(Debug, Clone)]
+pub struct Label(pub String);
+
+impl Label {
+    fn new(
+        subgraph_name: &str,
+        source: Option<&SourceName>,
+        transport: Option<&HttpJsonTransport>,
+        entity_resolver: Option<&EntityResolver>,
+    ) -> Self {
+        let source = source.map(SourceName::as_str).unwrap_or_default();
+        let batch = match entity_resolver {
+            Some(EntityResolver::TypeBatch) => "[BATCH] ",
+            _ => "",
+        };
+        let transport_label = transport
+            .map(|t| t.label())
+            .unwrap_or_else(|| "mappingOnly".to_string());
+        Self(format!("{batch}{subgraph_name}.{source} {transport_label}"))
+    }
+}
+
+impl From<&str> for Label {
+    fn from(label: &str) -> Self {
+        Self(label.to_string())
+    }
+}
+
+impl AsRef<str> for Label {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+fn determine_entity_resolver(
+    position: &ConnectorPosition,
+    entity: bool,
+    schema: &Schema,
+    request_variables: &IndexMap<Namespace, IndexSet<String>>,
+) -> Option<EntityResolver> {
+    match position {
+        ConnectorPosition::Field(_) => {
+            match (entity, position.on_root_type(schema)) {
+                (true, _) => Some(EntityResolver::Explicit), // Query.foo @connect(entity: true)
+                (_, false) => Some(EntityResolver::Implicit), // Foo.bar @connect
+                _ => None,
+            }
+        }
+        ConnectorPosition::Type(_) => {
+            if request_variables.contains_key(&Namespace::Batch) {
+                Some(EntityResolver::TypeBatch) // Foo @connect($batch)
+            } else {
+                Some(EntityResolver::TypeSingle) // Foo @connect($this)
+            }
+        }
+    }
+}
+
+/// Get any headers referenced in the variable references by looking at both Request and Response namespaces.
+fn extract_header_references(
+    variable_references: &IndexSet<VariableReference<Namespace>>,
+) -> HashSet<String> {
+    variable_references
+        .iter()
+        .flat_map(|var_ref| {
+            if var_ref.namespace.namespace != Namespace::Request
+                && var_ref.namespace.namespace != Namespace::Response
+            {
+                Vec::new()
+            } else {
+                var_ref
+                    .selection
+                    .get("headers")
+                    .map(|headers_subtrie| headers_subtrie.keys().cloned().collect())
+                    .unwrap_or_default()
+            }
+        })
+        .collect()
+}
+
+/// Create a map of variable namespaces like env and context to a set of the
+/// root keys referenced in the connector
+fn extract_variable_key_references<'a>(
+    references: impl Iterator<Item = &'a VariableReference<Namespace>>,
+) -> IndexMap<Namespace, IndexSet<String>> {
+    let mut variable_keys: IndexMap<Namespace, IndexSet<String>> = IndexMap::default();
+
+    for var_ref in references {
+        // make there there's a key for each namespace
+        let set = variable_keys
+            .entry(var_ref.namespace.namespace)
+            .or_default();
+
+        for key in var_ref.selection.keys() {
+            set.insert(key.to_string());
+        }
+    }
+
+    variable_keys
+}
+
+#[cfg(test)]
+mod tests {
+    use apollo_compiler::Schema;
+    use insta::assert_debug_snapshot;
+
+    use super::*;
+    use crate::ValidFederationSubgraphs;
+    use crate::schema::FederationSchema;
+    use crate::supergraph::extract_subgraphs_from_supergraph;
+
+    static SIMPLE_SUPERGRAPH: &str = include_str!("./tests/schemas/simple.graphql");
+    static SIMPLE_SUPERGRAPH_V0_2: &str = include_str!("./tests/schemas/simple_v0_2.graphql");
+
+    fn get_subgraphs(supergraph_sdl: &str) -> ValidFederationSubgraphs {
+        let schema = Schema::parse(supergraph_sdl, "supergraph.graphql").unwrap();
+        let supergraph_schema = FederationSchema::new(schema).unwrap();
+        extract_subgraphs_from_supergraph(&supergraph_schema, Some(true)).unwrap()
+    }
+
+    #[test]
+    fn test_from_schema() {
+        let subgraphs = get_subgraphs(SIMPLE_SUPERGRAPH);
+        let subgraph = subgraphs.get("connectors").unwrap();
+        let connectors = Connector::from_schema(subgraph.schema.schema(), "connectors").unwrap();
+        assert_debug_snapshot!(&connectors, @r#"
+        [
+            Connector {
+                id: ConnectId {
+                    subgraph_name: "connectors",
+                    source_name: Some(
+                        "json",
+                    ),
+                    named: None,
+                    directive: Field(
+                        ObjectOrInterfaceFieldDirectivePosition {
+                            field: Object(Query.users),
+                            directive_name: "connect",
+                            directive_index: 0,
+                        },
+                    ),
+                },
+                transport: Some(
+                    HttpJsonTransport {
+                        source_template: Some(
+                            StringTemplate {
+                                parts: [
+                                    Constant(
+                                        Constant {
+                                            value: "https://jsonplaceholder.typicode.com/",
+                                            location: 0..37,
+                                        },
+                                    ),
+                                ],
+                            },
+                        ),
+                        connect_template: StringTemplate {
+                            parts: [
+                                Constant(
+                                    Constant {
+                                        value: "/users",
+                                        location: 0..6,
+                                    },
+                                ),
+                            ],
+                        },
+                        method: Get,
+                        headers: [
+                            Header {
+                                name: "authtoken",
+                                source: From(
+                                    "x-auth-token",
+                                ),
+                            },
+                            Header {
+                                name: "user-agent",
+                                source: Value(
+                                    HeaderValue(
+                                        StringTemplate {
+                                            parts: [
+                                                Constant(
+                                                    Constant {
+                                                        value: "Firefox",
+                                                        location: 0..7,
+                                                    },
+                                                ),
+                                            ],
+                                        },
+                                    ),
+                                ),
+                            },
+                        ],
+                        body: None,
+                        source_path: None,
+                        source_query_params: None,
+                        connect_path: None,
+                        connect_query_params: None,
+                        stream: None,
+                        mcp: None,
+                    },
+                ),
+                selection: JSONSelection {
+                    inner: Named(
+                        SubSelection {
+                            selections: [
+                                NamedSelection {
+                                    prefix: None,
+                                    path: WithRange {
+                                        node: Path(
+                                            PathSelection {
+                                                path: WithRange {
+                                                    node: Key(
+                                                        WithRange {
+                                                            node: Field(
+                                                                "id",
+                                                            ),
+                                                            range: Some(
+                                                                0..2,
+                                                            ),
+                                                        },
+                                                        WithRange {
+                                                            node: Empty,
+                                                            range: Some(
+                                                                2..2,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    range: Some(
+                                                        0..2,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        range: Some(
+                                            0..2,
+                                        ),
+                                    },
+                                },
+                                NamedSelection {
+                                    prefix: None,
+                                    path: WithRange {
+                                        node: Path(
+                                            PathSelection {
+                                                path: WithRange {
+                                                    node: Key(
+                                                        WithRange {
+                                                            node: Field(
+                                                                "name",
+                                                            ),
+                                                            range: Some(
+                                                                3..7,
+                                                            ),
+                                                        },
+                                                        WithRange {
+                                                            node: Empty,
+                                                            range: Some(
+                                                                7..7,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    range: Some(
+                                                        3..7,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        range: Some(
+                                            3..7,
+                                        ),
+                                    },
+                                },
+                            ],
+                            range: Some(
+                                0..7,
+                            ),
+                        },
+                    ),
+                    spec: V0_1,
+                },
+                config: None,
+                max_requests: None,
+                entity_resolver: None,
+                spec: V0_1,
+                schema_subtypes_map: {
+                    "_Entity": {
+                        "User",
+                    },
+                },
+                request_headers: {},
+                response_headers: {},
+                request_variable_keys: {},
+                response_variable_keys: {},
+                batch_settings: None,
+                error_settings: ConnectorErrorsSettings {
+                    message: None,
+                    source_extensions: None,
+                    connect_extensions: None,
+                    connect_is_success: None,
+                },
+                output_type: Some(
+                    List(
+                        Named(
+                            "User",
+                        ),
+                    ),
+                ),
+                label: Label(
+                    "connectors.json http: GET /users",
+                ),
+            },
+            Connector {
+                id: ConnectId {
+                    subgraph_name: "connectors",
+                    source_name: Some(
+                        "json",
+                    ),
+                    named: None,
+                    directive: Field(
+                        ObjectOrInterfaceFieldDirectivePosition {
+                            field: Object(Query.posts),
+                            directive_name: "connect",
+                            directive_index: 0,
+                        },
+                    ),
+                },
+                transport: Some(
+                    HttpJsonTransport {
+                        source_template: Some(
+                            StringTemplate {
+                                parts: [
+                                    Constant(
+                                        Constant {
+                                            value: "https://jsonplaceholder.typicode.com/",
+                                            location: 0..37,
+                                        },
+                                    ),
+                                ],
+                            },
+                        ),
+                        connect_template: StringTemplate {
+                            parts: [
+                                Constant(
+                                    Constant {
+                                        value: "/posts",
+                                        location: 0..6,
+                                    },
+                                ),
+                            ],
+                        },
+                        method: Get,
+                        headers: [
+                            Header {
+                                name: "authtoken",
+                                source: From(
+                                    "x-auth-token",
+                                ),
+                            },
+                            Header {
+                                name: "user-agent",
+                                source: Value(
+                                    HeaderValue(
+                                        StringTemplate {
+                                            parts: [
+                                                Constant(
+                                                    Constant {
+                                                        value: "Firefox",
+                                                        location: 0..7,
+                                                    },
+                                                ),
+                                            ],
+                                        },
+                                    ),
+                                ),
+                            },
+                        ],
+                        body: None,
+                        source_path: None,
+                        source_query_params: None,
+                        connect_path: None,
+                        connect_query_params: None,
+                        stream: None,
+                        mcp: None,
+                    },
+                ),
+                selection: JSONSelection {
+                    inner: Named(
+                        SubSelection {
+                            selections: [
+                                NamedSelection {
+                                    prefix: None,
+                                    path: WithRange {
+                                        node: Path(
+                                            PathSelection {
+                                                path: WithRange {
+                                                    node: Key(
+                                                        WithRange {
+                                                            node: Field(
+                                                                "id",
+                                                            ),
+                                                            range: Some(
+                                                                0..2,
+                                                            ),
+                                                        },
+                                                        WithRange {
+                                                            node: Empty,
+                                                            range: Some(
+                                                                2..2,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    range: Some(
+                                                        0..2,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        range: Some(
+                                            0..2,
+                                        ),
+                                    },
+                                },
+                                NamedSelection {
+                                    prefix: None,
+                                    path: WithRange {
+                                        node: Path(
+                                            PathSelection {
+                                                path: WithRange {
+                                                    node: Key(
+                                                        WithRange {
+                                                            node: Field(
+                                                                "title",
+                                                            ),
+                                                            range: Some(
+                                                                3..8,
+                                                            ),
+                                                        },
+                                                        WithRange {
+                                                            node: Empty,
+                                                            range: Some(
+                                                                8..8,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    range: Some(
+                                                        3..8,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        range: Some(
+                                            3..8,
+                                        ),
+                                    },
+                                },
+                                NamedSelection {
+                                    prefix: None,
+                                    path: WithRange {
+                                        node: Path(
+                                            PathSelection {
+                                                path: WithRange {
+                                                    node: Key(
+                                                        WithRange {
+                                                            node: Field(
+                                                                "body",
+                                                            ),
+                                                            range: Some(
+                                                                9..13,
+                                                            ),
+                                                        },
+                                                        WithRange {
+                                                            node: Empty,
+                                                            range: Some(
+                                                                13..13,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    range: Some(
+                                                        9..13,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        range: Some(
+                                            9..13,
+                                        ),
+                                    },
+                                },
+                            ],
+                            range: Some(
+                                0..13,
+                            ),
+                        },
+                    ),
+                    spec: V0_1,
+                },
+                config: None,
+                max_requests: None,
+                entity_resolver: None,
+                spec: V0_1,
+                schema_subtypes_map: {
+                    "_Entity": {
+                        "User",
+                    },
+                },
+                request_headers: {},
+                response_headers: {},
+                request_variable_keys: {},
+                response_variable_keys: {},
+                batch_settings: None,
+                error_settings: ConnectorErrorsSettings {
+                    message: None,
+                    source_extensions: None,
+                    connect_extensions: None,
+                    connect_is_success: None,
+                },
+                output_type: Some(
+                    List(
+                        Named(
+                            "Post",
+                        ),
+                    ),
+                ),
+                label: Label(
+                    "connectors.json http: GET /posts",
+                ),
+            },
+        ]
+        "#);
+    }
+
+    #[test]
+    fn test_from_schema_v0_2() {
+        let subgraphs = get_subgraphs(SIMPLE_SUPERGRAPH_V0_2);
+        let subgraph = subgraphs.get("connectors").unwrap();
+        let connectors = Connector::from_schema(subgraph.schema.schema(), "connectors").unwrap();
+        assert_debug_snapshot!(&connectors);
+    }
+
+    // Tests for CNN-1095: errors-as-data output shape combines selection's
+    // shape with the error-path mappings' shape. The coworker-suggested
+    // `Shape::one([normal_shape, error_shape], [])` pattern is the foundation
+    // downstream consumers (entity-key checker, type walker) can build on.
+    mod output_shape {
+        use shape::ShapeCase;
+
+        use super::*;
+        use crate::connectors::JSONSelection;
+
+        #[test]
+        fn errors_settings_shape_is_none_when_no_mappings_configured() {
+            let settings = ConnectorErrorsSettings::default();
+            assert!(
+                settings.shape().is_none(),
+                "expected None when no error mappings are set"
+            );
+        }
+
+        #[test]
+        fn errors_settings_shape_unions_all_configured_mappings() {
+            let settings = ConnectorErrorsSettings {
+                message: Some(JSONSelection::parse("error.message").unwrap()),
+                source_extensions: Some(JSONSelection::parse("source_code: error.code").unwrap()),
+                connect_extensions: Some(JSONSelection::parse("code: error.code").unwrap()),
+                connect_is_success: Some(JSONSelection::parse("$status->eq(200)").unwrap()),
+            };
+            let shape = settings
+                .shape()
+                .expect("expected Some shape when message + extensions are configured");
+            assert!(
+                matches!(shape.case(), ShapeCase::One(_)),
+                "expected ShapeCase::One union of message + source/connect extensions, got: {shape:?}"
+            );
+        }
+
+        #[test]
+        fn connector_output_shape_unions_selection_with_errors() {
+            let subgraphs = get_subgraphs(SIMPLE_SUPERGRAPH);
+            let subgraph = subgraphs.get("connectors").unwrap();
+            let mut connectors =
+                Connector::from_schema(subgraph.schema.schema(), "connectors").unwrap();
+            let mut connector = connectors.remove(0);
+
+            // Attach errors-as-data settings so output_shape() produces a union.
+            connector.error_settings = ConnectorErrorsSettings {
+                message: Some(JSONSelection::parse("error.message").unwrap()),
+                source_extensions: None,
+                connect_extensions: Some(JSONSelection::parse("code: error.code").unwrap()),
+                connect_is_success: Some(JSONSelection::parse("$status->eq(200)").unwrap()),
+            };
+
+            let combined = connector.output_shape();
+            assert!(
+                matches!(combined.case(), ShapeCase::One(_)),
+                "expected ShapeCase::One union of selection + errors, got: {combined:?}"
+            );
+        }
+
+        #[test]
+        fn connector_output_shape_with_no_errors_equals_selection_shape() {
+            let subgraphs = get_subgraphs(SIMPLE_SUPERGRAPH);
+            let subgraph = subgraphs.get("connectors").unwrap();
+            let mut connectors =
+                Connector::from_schema(subgraph.schema.schema(), "connectors").unwrap();
+            let connector = connectors.remove(0);
+
+            // Default error_settings has no mappings, so output_shape() should
+            // be exactly selection.shape().
+            assert_eq!(
+                connector.output_shape(),
+                connector.selection.shape(),
+                "with no error mappings, output_shape should match selection.shape"
+            );
+        }
+    }
+}

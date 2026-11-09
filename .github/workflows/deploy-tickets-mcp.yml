@@ -1,0 +1,25 @@
+name: Deploy Tickets MCP to Cloud Run
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2.1.4
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy tickets-mcp
+        run: |
+          gcloud run deploy ${{vars.ACTOR}}-tickets-mcp \
+            --source ./tickets-mcp \
+            --platform managed --region us-central1 \
+            --allow-unauthenticated
