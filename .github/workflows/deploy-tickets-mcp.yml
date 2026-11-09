@@ -17,9 +17,20 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      - name: Configure Docker to use gcloud as a credential helper
+        run: gcloud auth configure-docker -q
+
+      # Build and push to gcr.io as deploy-website.yml does; `gcloud run deploy --source`
+      # needs Artifact Registry permissions this service account does not have.
+      - name: Build and push tickets-mcp image
+        run: |
+          docker build -t gcr.io/summit-enterprise-workshop/${{vars.ACTOR}}-tickets-mcp:latest .
+          docker push gcr.io/summit-enterprise-workshop/${{vars.ACTOR}}-tickets-mcp:latest
+        working-directory: ./tickets-mcp
+
       - name: Deploy tickets-mcp
         run: |
           gcloud run deploy ${{vars.ACTOR}}-tickets-mcp \
-            --source ./tickets-mcp \
+            --image gcr.io/summit-enterprise-workshop/${{vars.ACTOR}}-tickets-mcp:latest \
             --platform managed --region us-central1 \
             --allow-unauthenticated
