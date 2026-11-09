@@ -42,11 +42,15 @@ jobs:
         run: |
           echo "url=$(gcloud run services describe ${{vars.ACTOR}}-tickets-mcp --region us-central1 --format='value(status.url)')" >> $GITHUB_OUTPUT
 
+      # --command/--args are explicit: a previous deploy set `command` on this service, which overrides the
+      # image ENTRYPOINT, so the router would otherwise start without --config/--supergraph.
       # router-mcp is the router built from vendor/router (understands @connect(mcp:)). It is built
       # once (see readme) and shared; the supergraph is mounted from the secret above.
       - name: Depoy Apollo Router to Cloud Run
         run: |
           gcloud run deploy ${{vars.ACTOR}}-router --image gcr.io/summit-enterprise-workshop/router-mcp:latest \
+            --command=/dist/router \
+            --args="--supergraph,/dist/supergraph/supergraph.graphql,--config,/dist/config/router.yaml" \
             --set-secrets=/dist/config/router.yaml=${{vars.ACTOR}}:latest,/dist/supergraph/supergraph.graphql=${{vars.ACTOR}}-supergraph:latest \
             --set-env-vars "APOLLO_ROUTER_HOT_RELOAD=true,TICKETS_MCP_URL=${{steps.tickets.outputs.url}},APOLLO_KEY=${{ vars.TOKEN }},APOLLO_GRAPH_REF=${{vars.ACTOR}}${{env.GEN}}@current" --platform managed --region us-central1 \
             --allow-unauthenticated
