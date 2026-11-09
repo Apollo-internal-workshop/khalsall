@@ -88,8 +88,9 @@ Join us in person and participate in **this** workshop by registering to attend 
 It uses connect/v0.5 (preview), as does `orders-schema.graphql`, so the router and the composition plugin have to be
 the builds that understand `@connect(mcp:)`. The router is vendored under `vendor/router`. The composition plugin comes from the Apollo-internal `mdg-private/fedutils-build-plugins`, so it is not committed (this repo is public): `install-local-builds.sh` clones it into the git-ignored `vendor/fedutils-build-plugins/` and needs access to that repo.
 
-**Composition is local.** GraphOS can't compose `mcp:` yet, so do not publish `tickets` to Studio. Regenerate the
-committed `supergraph.graphql` whenever a subgraph schema changes:
+**Composition is local.** GraphOS can't compose `mcp:` yet, so the router runs on a locally composed supergraph, and Studio
+gets a plain-federation view of Tickets instead (`tickets-studio-schema.graphql`, no `@connect`; keep it in sync with
+`tickets-schema.graphql`). Regenerate the committed `supergraph.graphql` whenever a subgraph schema changes:
 
 ```sh
 ./install-local-builds.sh --no-build   # after the first build

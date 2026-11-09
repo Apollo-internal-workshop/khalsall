@@ -1,0 +1,27 @@
+# Studio-only view of the Tickets subgraph. It declares what is queryable but has no @connect/@source:
+# GraphOS can't compose connect/v0.5 `mcp:` yet. The router runs on tickets-schema.graphql (the connector
+# version) via the locally composed supergraph.graphql. Keep the types and fields here in sync with it.
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.12", import: ["@key", "@external", "@requires"])
+
+"""
+The Tickets MCP server only knows requesters by email. It extends User and
+needs the (possibly restricted) email to look up that user's tickets.
+"""
+type User @key(fields: "id") {
+  id: ID!
+  email: String! @external
+
+  "Support tickets filed by this user, via the `search_tickets` tool."
+  tickets: [Ticket] @requires(fields: "email")
+}
+
+"A support ticket. Tickets are looked up by the requester's email."
+type Ticket @key(fields: "id", resolvable: false) {
+  id: ID!
+  email: String!
+  subject: String!
+  status: String!
+  priority: String
+  orderId: ID
+}

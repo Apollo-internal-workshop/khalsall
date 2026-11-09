@@ -44,3 +44,11 @@ jobs:
             --name customers \
             --routing-url https://subgraph-customers-j3nprurqka-ue.a.run.app \
             --schema ./customers-schema.graphql
+
+      # Studio sees a plain-federation view of Tickets (no @connect); the router uses tickets-schema.graphql
+      - name: Rover Subgraph Publish Tickets
+        run: |
+          rover subgraph publish ${{vars.ACTOR}}${{ env.GEN }}@current \
+            --name tickets \
+            --routing-url http://tickets \
+            --schema ./tickets-studio-schema.graphql

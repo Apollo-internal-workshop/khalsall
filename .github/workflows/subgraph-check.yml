@@ -37,3 +37,10 @@ jobs:
           rover subgraph check ${{vars.ACTOR}}${{ env.GEN }}@current \
             --name customers \
             --schema ./customers-schema.graphql
+
+      # Studio sees a plain-federation view of Tickets (no @connect); the router uses tickets-schema.graphql
+      - name: Rover Subgraph Check Tickets
+        run: |
+          rover subgraph check ${{vars.ACTOR}}${{ env.GEN }}@current \
+            --name tickets \
+            --schema ./tickets-studio-schema.graphql
