@@ -2,7 +2,7 @@
 # GraphOS can't compose connect/v0.5 `mcp:` yet. The router runs on tickets-schema.graphql (the connector
 # version) via the locally composed supergraph.graphql. Keep the types and fields here in sync with it.
 extend schema
-  @link(url: "https://specs.apollo.dev/federation/v2.12", import: ["@key", "@external", "@requires"])
+  @link(url: "https://specs.apollo.dev/federation/v2.10", import: ["@key", "@external", "@requires"])
 
 """
 The Tickets MCP server only knows requesters by email. It extends User and

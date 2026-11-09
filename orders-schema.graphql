@@ -4,7 +4,7 @@ extend schema
     import: ["@key", "@tag", "@shareable", "@authenticated", "@requiresScopes"]
   )
   @link(
-    url: "https://specs.apollo.dev/connect/v0.3"
+    url: "https://specs.apollo.dev/connect/v0.2"
     import: ["@connect", "@source"]
   )
   @source(
