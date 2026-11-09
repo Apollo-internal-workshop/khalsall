@@ -1,7 +1,7 @@
 extend schema
   @link(
     url: "https://specs.apollo.dev/federation/v2.10"
-    import: ["@key", "@tag", "@shareable", "@authenticated", "@requiresScopes"]
+    import: ["@key", "@tag", "@shareable"]
   )
   @link(
     url: "https://specs.apollo.dev/connect/v0.2"
@@ -16,7 +16,7 @@ type Query {
   """
   Get a specific order by id. Meant to be used for a detailed view of an order
   """
-  order(id: ID!): Order @authenticated
+  order(id: ID!): Order
     @connect(
       source: "api"
       http: { GET: "/orders/{$args.id}" }
@@ -41,7 +41,7 @@ type Order @key(fields: "id") {
   """
   The user who made the purchase
   """
-  buyer: User! @requiresScopes(scopes: [["order:buyer"]])
+  buyer: User!
 
   """
   A list of all the items they purchased. This is the Variants, not the Products so we know exactly which

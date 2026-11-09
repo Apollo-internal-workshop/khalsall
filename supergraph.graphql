@@ -1,4 +1,4 @@
-schema @link(url: "https://specs.apollo.dev/link/v1.0") @link(url: "https://specs.apollo.dev/join/v0.6", for: EXECUTION) @link(url: "https://specs.apollo.dev/tag/v0.3") @link(url: "https://specs.apollo.dev/authenticated/v0.1", for: SECURITY) @link(url: "https://specs.apollo.dev/requiresScopes/v0.1", for: SECURITY) @link(url: "https://specs.apollo.dev/connect/v0.5", for: EXECUTION) @join__directive(name: "link", graphs: [ORDERS], args: {url: "https://specs.apollo.dev/connect/v0.2", import: ["@connect", "@source"]}) @join__directive(name: "link", graphs: [TICKETS], args: {url: "https://specs.apollo.dev/connect/v0.5", import: ["@connect", "@source"]}) @join__directive(name: "source", graphs: [ORDERS], args: {name: "api", http: {baseURL: "https://rest-api-j3nprurqka-uc.a.run.app/api"}}) @join__directive(name: "source", graphs: [TICKETS], args: {name: "tickets", http: {baseURL: "http://127.0.0.1:8081"}, mcp: {path: "/mcp"}}) {
+schema @link(url: "https://specs.apollo.dev/link/v1.0") @link(url: "https://specs.apollo.dev/join/v0.6", for: EXECUTION) @link(url: "https://specs.apollo.dev/tag/v0.3") @link(url: "https://specs.apollo.dev/connect/v0.5", for: EXECUTION) @join__directive(name: "link", graphs: [ORDERS], args: {url: "https://specs.apollo.dev/connect/v0.2", import: ["@connect", "@source"]}) @join__directive(name: "link", graphs: [TICKETS], args: {url: "https://specs.apollo.dev/connect/v0.5", import: ["@connect", "@source"]}) @join__directive(name: "source", graphs: [ORDERS], args: {name: "api", http: {baseURL: "https://rest-api-j3nprurqka-uc.a.run.app/api"}}) @join__directive(name: "source", graphs: [TICKETS], args: {name: "tickets", http: {baseURL: "http://127.0.0.1:8081"}, mcp: {path: "/mcp"}}) {
   query: Query
   subscription: Subscription
 }
@@ -20,10 +20,6 @@ directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
 directive @join__directive(graphs: [join__Graph!], name: String!, args: join__DirectiveArguments) repeatable on SCHEMA | OBJECT | INTERFACE | FIELD_DEFINITION
 
 directive @tag(name: String!) repeatable on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION | SCHEMA
-
-directive @authenticated on FIELD_DEFINITION | OBJECT | INTERFACE | SCALAR | ENUM
-
-directive @requiresScopes(scopes: [[requiresScopes__Scope!]!]!) on FIELD_DEFINITION | OBJECT | INTERFACE | SCALAR | ENUM
 
 enum link__Purpose {
   """
@@ -58,15 +54,13 @@ input join__ContextArgument {
   selection: join__FieldValue!
 }
 
-scalar requiresScopes__Scope
-
 type Query @join__type(graph: CUSTOMERS) @join__type(graph: ORDERS) @join__type(graph: PRODUCTS) @join__type(graph: TICKETS) {
   users: [User] @join__field(graph: CUSTOMERS)
   user(id: ID!): User @join__field(graph: CUSTOMERS)
   """
   Get a specific order by id. Meant to be used for a detailed view of an order
   """
-  order(id: ID!): Order @join__field(graph: ORDERS) @join__directive(name: "connect", graphs: [ORDERS], args: {source: "api", http: {GET: "/orders/{$args.id}"}, selection: "id\nbuyer: { id: $.customerId }\nitems: $.variantIds { id: $ }", entity: true}) @authenticated
+  order(id: ID!): Order @join__field(graph: ORDERS) @join__directive(name: "connect", graphs: [ORDERS], args: {source: "api", http: {GET: "/orders/{$args.id}"}, selection: "id\nbuyer: { id: $.customerId }\nitems: $.variantIds { id: $ }", entity: true})
   """
   Get all available products to shop for. Optionally provide some search filters
   """
@@ -132,7 +126,7 @@ type Order @join__type(graph: CUSTOMERS, key: "id", resolvable: false) @join__ty
   """
   id: ID!
   """The user who made the purchase"""
-  buyer: User! @join__field(graph: ORDERS) @requiresScopes(scopes: [["order:buyer"]])
+  buyer: User! @join__field(graph: ORDERS)
   """
   A list of all the items they purchased. This is the Variants, not the Products so we know exactly which
   product and which size/color/feature was bought
