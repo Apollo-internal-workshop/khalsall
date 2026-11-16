@@ -7,13 +7,13 @@ export interface Ticket {
   orderId: string | null;
 }
 
-// Seed data. Emails must match the Customers subgraph byte for byte, including
-// its literal " (customers subgraph)" suffix; order ids are from the orders REST API.
+// Seed data. Emails must match the Customers subgraph byte for byte;
+// order ids are from the orders REST API.
 // Demo persona: Kris Marrier (user 10, orders 1-3).
 export const TICKETS: Ticket[] = [
   {
     id: "T-1001",
-    email: "kris@gmail.com (customers subgraph)",
+    email: "kris@gmail.com",
     subject: "Package arrived damaged, requesting replacement",
     status: "open",
     priority: "high",
@@ -21,7 +21,7 @@ export const TICKETS: Ticket[] = [
   },
   {
     id: "T-1002",
-    email: "kris@gmail.com (customers subgraph)",
+    email: "kris@gmail.com",
     subject: "Question about loyalty points",
     status: "solved",
     priority: "low",
@@ -29,7 +29,7 @@ export const TICKETS: Ticket[] = [
   },
   {
     id: "T-2001",
-    email: "minna_amigon@yahoo.com (customers subgraph)",
+    email: "minna_amigon@yahoo.com",
     subject: "Wrong size shipped",
     status: "pending",
     priority: "normal",
