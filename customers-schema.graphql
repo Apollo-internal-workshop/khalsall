@@ -12,6 +12,10 @@ extend schema
 type Query {
   users: [User]
   user(id: ID!): User
+  """
+  Finds a user by their full name (first and last name, e.g. "Jane Doe"). Returns the first match, or null if none.
+  """
+  userByName(fullName: String!): User
 }
 
 """

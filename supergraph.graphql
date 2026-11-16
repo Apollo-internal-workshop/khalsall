@@ -58,6 +58,10 @@ type Query @join__type(graph: CUSTOMERS) @join__type(graph: ORDERS) @join__type(
   users: [User] @join__field(graph: CUSTOMERS)
   user(id: ID!): User @join__field(graph: CUSTOMERS)
   """
+  Finds a user by their full name (first and last name, e.g. "Jane Doe"). Returns the first match, or null if none.
+  """
+  userByName(fullName: String!): User @join__field(graph: CUSTOMERS)
+  """
   Get a specific order by id. Meant to be used for a detailed view of an order
   """
   order(id: ID!): Order @join__field(graph: ORDERS) @join__directive(name: "connect", graphs: [ORDERS], args: {source: "api", http: {GET: "/orders/{$args.id}"}, selection: "id\nbuyer: { id: $.customerId }\nitems: $.variantIds { id: $ }", entity: true})
